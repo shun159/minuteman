@@ -2,9 +2,12 @@
 // and one or more LAN interfaces. The B4 IPv6 address is supplied on the
 // command line; the AFTR's address is either supplied via -aftr or, if
 // omitted, discovered live via DHCPv6 (RFC 3736 Information-Request +
-// RFC 6334 OPTION_AFTR_NAME) and DNS. If -dhcpv6-pd is given, minuteman
-// also requests a delegated IPv6 prefix via DHCPv6-PD (RFC 3633) on the WAN
-// interface and assigns one /64 (carved from it) to each -lan interface.
+// RFC 6334 OPTION_AFTR_NAME) and DNS, falling back to HB46PP provisioning
+// (JAIPA's HTTP-based IPv4-over-IPv6 provisioning protocol, capability
+// dslite) when the DHCPv6 Reply carries no AFTR-Name. If -dhcpv6-pd is
+// given, minuteman also requests a delegated IPv6 prefix via DHCPv6-PD
+// (RFC 3633) on the WAN interface and assigns one /64 (carved from it) to
+// each -lan interface.
 package main
 
 import (
@@ -25,7 +28,20 @@ import (
 	"github.com/shun159/miniteman/internal/lanprefix"
 	"github.com/shun159/miniteman/pkg/aftrdiscovery"
 	"github.com/shun159/miniteman/pkg/datapath"
+	"github.com/shun159/miniteman/pkg/hb46pp"
 	"github.com/shun159/miniteman/pkg/prefixdelegation"
+	"github.com/shun159/miniteman/pkg/routeradvert"
+)
+
+// The HB46PP client identity sent as provisioning query parameters.
+// "acde48" is the AC-DE-48 OUI conventionally used in documentation and
+// examples (it's also what the HB46PP spec's own examples use) --
+// minuteman has no IEEE-assigned OUI of its own. VNEs use vendorid for
+// statistics, not authorization, so a documentation OUI is workable.
+const (
+	hb46ppVendorID = "acde48-minuteman"
+	hb46ppProduct  = "minuteman"
+	hb46ppVersion  = "0_1"
 )
 
 func main() {
@@ -80,6 +96,16 @@ func run() error {
 		return fmt.Errorf("attaching WAN interface: %w", err)
 	}
 	log.Printf("attached DS-Lite decap to %s (ifindex %d)", *wanIface, wanIfindex)
+
+	// AttachWAN just enabled IPv6 forwarding, and that transition makes the
+	// kernel purge every RA-learned default route -- without re-soliciting,
+	// the WAN has no route to the AFTR until the ISP's next unsolicited RA,
+	// potentially minutes away (see configureWANSysctls in pkg/datapath).
+	go func() {
+		if err := routeradvert.SolicitRouters(ctx, *wanIface); err != nil && ctx.Err() == nil {
+			log.Printf("soliciting router advertisements on %s: %v", *wanIface, err)
+		}
+	}()
 
 	wanNetIface, err := net.InterfaceByName(*wanIface)
 	if err != nil {
@@ -161,11 +187,14 @@ func runPrefixDelegation(ctx context.Context, wanIface string, lans cliconfig.LA
 
 // resolveAFTR returns aftrFlag parsed as an IPv6 address if non-empty,
 // otherwise discovers the AFTR live via DHCPv6 on wanIface (RFC 3736
-// Information-Request + RFC 6334 OPTION_AFTR_NAME, resolved via DNS). The
-// discovery call blocks (retrying per RFC 3315) until it succeeds or ctx is
-// cancelled -- there's no working DS-Lite path without an AFTR address, so
-// waiting (with visible retry behavior in the DHCPv6 client) is preferable
-// to an arbitrary timeout.
+// Information-Request + RFC 6334 OPTION_AFTR_NAME, resolved via DNS). If
+// the DHCPv6 Reply carries no AFTR-Name, it falls back to HB46PP
+// provisioning (capability dslite) using the DNS servers from that same
+// Reply, retrying the whole DHCPv6-then-HB46PP chain on HB46PP failure
+// with the HB46PP spec's backoff for the failure class. Discovery blocks
+// until it succeeds or ctx is cancelled -- there's no working DS-Lite path
+// without an AFTR address, so waiting (with visible retry behavior) is
+// preferable to an arbitrary timeout.
 func resolveAFTR(ctx context.Context, aftrFlag, wanIface string) (netip.Addr, error) {
 	if aftrFlag != "" {
 		aftr, err := netip.ParseAddr(aftrFlag)
@@ -176,11 +205,57 @@ func resolveAFTR(ctx context.Context, aftrFlag, wanIface string) (netip.Addr, er
 	}
 
 	log.Printf("no -aftr given, discovering AFTR via DHCPv6 on %s", wanIface)
-	result, err := aftrdiscovery.Discover(ctx, wanIface)
-	if err != nil {
-		return netip.Addr{}, fmt.Errorf("discovering AFTR: %w", err)
+	for {
+		result, err := aftrdiscovery.Discover(ctx, wanIface)
+		if err == nil {
+			log.Printf("discovered AFTR %s -> %s (DNS servers: %v)", result.AFTRName, result.AFTRAddr, result.DNSServers)
+			return result.AFTRAddr, nil
+		}
+		if !errors.Is(err, aftrdiscovery.ErrNoAFTRName) {
+			return netip.Addr{}, fmt.Errorf("discovering AFTR: %w", err)
+		}
+
+		// result is aftrdiscovery's documented partial result here: the
+		// Reply had DNS servers but no AFTR-Name.
+		log.Printf("DHCPv6 Reply carried no AFTR-Name, trying HB46PP provisioning (DNS servers: %v)", result.DNSServers)
+		aftr, err := discoverViaHB46PP(ctx, result.DNSServers)
+		if err == nil {
+			return aftr, nil
+		}
+
+		delay := hb46pp.RetryDelay(err)
+		log.Printf("HB46PP provisioning failed: %v (retrying discovery in %v)", err, delay.Round(time.Second))
+		select {
+		case <-ctx.Done():
+			return netip.Addr{}, ctx.Err()
+		case <-time.After(delay):
+		}
 	}
-	log.Printf("discovered AFTR %s -> %s (DNS servers: %v)", result.AFTRName, result.AFTRAddr, result.DNSServers)
+}
+
+// discoverViaHB46PP runs one HB46PP provisioning exchange advertising the
+// dslite capability and returns the AFTR address it yields. dnsServers
+// (from the DHCPv6 Reply) are the VNE's own resolvers, which is what the
+// 4over6.info TXT lookup must go through.
+func discoverViaHB46PP(ctx context.Context, dnsServers []netip.Addr) (netip.Addr, error) {
+	result, err := hb46pp.Discover(ctx, hb46pp.Config{
+		Client: hb46pp.ClientInfo{
+			VendorID:     hb46ppVendorID,
+			Product:      hb46ppProduct,
+			Version:      hb46ppVersion,
+			Capabilities: []string{"dslite"},
+		},
+		DNSServers: dnsServers,
+	})
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	if !result.AFTRAddr.IsValid() {
+		return netip.Addr{}, fmt.Errorf("provisioning server returned no DS-Lite parameters (offered order: %v)", result.Provisioning.Order)
+	}
+	log.Printf("HB46PP: provisioned by %q (%s): AFTR %s -> %s (refresh in %v)",
+		result.Provisioning.EnablerName, result.Provisioning.ServiceName,
+		result.AFTRName, result.AFTRAddr, result.RefreshInterval)
 	return result.AFTRAddr, nil
 }
 

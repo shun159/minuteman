@@ -2,11 +2,14 @@ package routeradvert
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net"
 	"net/netip"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // RFC 4861 §6.2.1 default Router Configuration Variables.
@@ -24,6 +27,16 @@ const (
 	minDelayBetweenRAs          = 3 * time.Second
 	maxRADelayTime              = 500 * time.Millisecond
 )
+
+// tentativeRetryInterval is how soon to retry a send that failed with
+// EADDRNOTAVAIL: the kernel returns that when the interface has no usable
+// source address, which right after Serve starts means the link-local is
+// still tentative -- DAD runs for ~1s whenever the link (re)comes up, and
+// both an XDP attach bouncing the link and the LAN address assignment
+// happen immediately before Serve in this project's startup sequence.
+// Transient by nature, so retry on roughly DAD's timescale rather than
+// treating it as fatal.
+const tentativeRetryInterval = 1 * time.Second
 
 // Config carries the CPE-specific values that vary per LAN interface;
 // everything else (timing, flags, hop limits) follows RFC 4861's
@@ -80,6 +93,10 @@ func Serve(ctx context.Context, ifaceName string, cfg Config) error {
 
 		case <-timer.C:
 			if err := conn.SendAdvertisement(buildRA(cfg, advDefaultLifetime, mac)); err != nil {
+				if errors.Is(err, unix.EADDRNOTAVAIL) {
+					next = time.Now().Add(tentativeRetryInterval) // see tentativeRetryInterval
+					continue
+				}
 				return fmt.Errorf("routeradvert: sending unsolicited RA on %s: %w", ifaceName, err)
 			}
 			lastSent = time.Now()
@@ -96,6 +113,9 @@ func Serve(ctx context.Context, ifaceName string, cfg Config) error {
 			}
 			time.Sleep(randInterval(0, maxRADelayTime)) // §10: avoid synchronized replies
 			if err := conn.SendAdvertisement(buildRA(cfg, advDefaultLifetime, mac)); err != nil {
+				if errors.Is(err, unix.EADDRNOTAVAIL) {
+					continue // still tentative; the pending unsolicited RA will cover this host
+				}
 				return fmt.Errorf("routeradvert: sending solicited RA on %s: %w", ifaceName, err)
 			}
 			lastSent = time.Now()

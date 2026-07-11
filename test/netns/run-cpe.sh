@@ -5,12 +5,14 @@
 #
 # Usage: sudo ./test/netns/run-cpe.sh [extra minuteman flags...]
 #
-# -aftr is intentionally omitted below: mm-isp's dnsmasq (see setup.sh)
-# serves a real RFC 6334 OPTION_AFTR_NAME + DNS record for it, so minuteman
-# discovers the AFTR itself via DHCPv6 exactly as it would against a real
-# ISP. Pass -aftr <addr> as an extra argument to override with a static
-# address instead (it's appended after the defaults below, and the later
-# occurrence of a flag wins).
+# -aftr is intentionally omitted below: mm-isp (see setup.sh) serves the
+# AFTR's address for whichever discovery mode the rig was built in -- RFC
+# 6334 OPTION_AFTR_NAME over stateless DHCPv6 by default, or the HB46PP
+# TXT-record/provisioning-server chain under MM_AFTR_DISCOVERY=hb46pp -- so
+# minuteman discovers it exactly as it would against a real ISP/VNE. Pass
+# -aftr <addr> as an extra argument to override with a static address
+# instead (it's appended after the defaults below, and the later occurrence
+# of a flag wins).
 #
 # -dhcpv6-pd is on by default too: mm-isp's Kea server (see setup.sh) delegates
 # a real DHCPv6-PD prefix, so minuteman acquires it, assigns the carved /64 to
