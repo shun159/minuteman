@@ -24,19 +24,26 @@ func writeSysctl(path, value string) error {
 // ifaceName specifically, which enabling net.ipv6.conf.all.forwarding
 // otherwise suppresses by default -- needed so SLAAC-assigned addresses
 // and RA-installed default routes keep being refreshed on the WAN link.
+// accept_ra=2 is written *before* forwarding so no RA arriving in between
+// gets dropped; note that the forwarding 0->1 transition itself still
+// makes the kernel purge every already-RA-learned default route
+// (rt6_purge_dflt_routers) regardless of accept_ra, so callers should
+// re-solicit afterwards (pkg/routeradvert.SolicitRouters) rather than
+// wait out the upstream router's unsolicited-RA interval with no default
+// route.
 //
 // net.ipv4.ip_forward and net.ipv6.conf.all.forwarding are process-wide
 // (there is no meaningful "only this interface" scope for them), so
 // calling this repeatedly (e.g. once per AttachWAN/AttachLAN call) is
 // harmless.
 func configureWANSysctls(wanIfaceName string) error {
+	if err := writeSysctl(filepath.Join("/proc/sys/net/ipv6/conf", wanIfaceName, "accept_ra"), "2"); err != nil {
+		return err
+	}
 	if err := writeSysctl("/proc/sys/net/ipv4/ip_forward", "1"); err != nil {
 		return err
 	}
 	if err := writeSysctl("/proc/sys/net/ipv6/conf/all/forwarding", "1"); err != nil {
-		return err
-	}
-	if err := writeSysctl(filepath.Join("/proc/sys/net/ipv6/conf", wanIfaceName, "accept_ra"), "2"); err != nil {
 		return err
 	}
 	return nil

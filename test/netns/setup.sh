@@ -3,9 +3,21 @@
 # Requires root (network namespaces, veth, iptables) and dnsmasq.
 #
 # Usage: sudo ./test/netns/setup.sh
+#        sudo MM_AFTR_DISCOVERY=hb46pp ./test/netns/setup.sh
+#
+# MM_AFTR_DISCOVERY selects how mm-isp publishes the AFTR's address:
+#   dhcpv6 (default) -- Kea serves RFC 6334 OPTION_AFTR_NAME over stateless
+#                       DHCPv6, exercising minuteman's pkg/aftrdiscovery path.
+#   hb46pp           -- Kea withholds option 64; dnsmasq instead serves the
+#                       4over6.info discovery TXT record and a provisioning
+#                       HTTP server (python3 http.server) answers with the
+#                       DS-Lite JSON, exercising minuteman's pkg/hb46pp
+#                       fallback path (DHCPv6 Reply without AFTR-Name ->
+#                       HB46PP).
 #
 # After this completes, run minuteman as the B4 with test/netns/run-cpe.sh,
-# then test end-to-end connectivity with test/netns/smoketest.sh.
+# then test end-to-end connectivity with test/netns/smoketest.sh (it reads
+# the mode this script recorded and asserts the matching discovery checks).
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -15,6 +27,15 @@ if [[ $EUID -ne 0 ]]; then
     echo "must run as root" >&2
     exit 1
 fi
+
+AFTR_DISCOVERY="${MM_AFTR_DISCOVERY:-dhcpv6}"
+case "$AFTR_DISCOVERY" in
+dhcpv6 | hb46pp) ;;
+*)
+    echo "error: MM_AFTR_DISCOVERY must be 'dhcpv6' or 'hb46pp' (got '$AFTR_DISCOVERY')" >&2
+    exit 1
+    ;;
+esac
 
 # veth TX checksum/GSO/TSO/SG offloads leave TCP segments with an unfinalized
 # (CHECKSUM_PARTIAL) checksum, on the assumption that a real NIC (or the
@@ -57,6 +78,11 @@ fi
 if ! command -v kea-dhcp6 >/dev/null 2>&1; then
     echo "error: kea-dhcp6 not found in PATH (needed for the DHCPv6-PD server in mm-isp)." >&2
     echo "  Try: sudo pacman -S kea" >&2
+    exit 1
+fi
+
+if [[ "$AFTR_DISCOVERY" == hb46pp ]] && ! command -v python3 >/dev/null 2>&1; then
+    echo "error: python3 not found in PATH (needed for the HB46PP provisioning HTTP server in mm-isp)." >&2
     exit 1
 fi
 
@@ -129,6 +155,12 @@ enable-ra
 dhcp-range=::,constructor:$VETH_ISP_CPE,ra-only
 address=/$AFTR_FQDN/${CORE_AFTR_ADDR%/*}
 EOF
+# In HB46PP mode dnsmasq additionally answers the discovery TXT lookup on
+# 4over6.info -- in a real deployment that answer comes from the VNE's own
+# full-service resolvers, which is exactly what mm-isp's dnsmasq plays here.
+if [[ "$AFTR_DISCOVERY" == hb46pp ]]; then
+    echo "txt-record=4over6.info,v=v6mig-1 url=$HB46PP_URL t=a" >>"$DNSMASQ_CONF"
+fi
 netns_exec "$NETNS_ISP" dnsmasq --conf-file="$DNSMASQ_CONF" --pid-file="$DNSMASQ_PIDFILE"
 
 # Only now -- with mm-isp's RA server already up and answering, per the
@@ -137,11 +169,22 @@ netns_exec "$NETNS_ISP" dnsmasq --conf-file="$DNSMASQ_CONF" --pid-file="$DNSMASQ
 # socket-opening check (unlike dnsmasq's) requires RUNNING, so this also
 # needs to happen before Kea starts below.
 netns_exec "$NETNS_CPE" ip link set "$VETH_CPE_ISP" up
-# $WAN_ISP_ADDR's link-local address is tentative (DAD-pending) for a brief
-# moment right after an interface comes up; Kea's socket-opening code (unlike
-# dnsmasq's) doesn't retry the bind if it's still tentative, so give DAD a
-# moment to finish before Kea tries to bind to it.
-sleep 2
+# v-isp-cpe's link-local address is tentative (DAD-pending) for a moment
+# right after an interface comes up; Kea's socket-opening code (unlike
+# dnsmasq's) doesn't retry the bind if it's still tentative, and it fails
+# hard (DHCP6_OPEN_SOCKETS_FAILED) rather than recovering later. Wait for
+# DAD to actually finish rather than sleeping a fixed amount -- a fixed
+# "sleep 2" here turned out to lose the race often enough to matter.
+for _ in $(seq 1 50); do
+    if ! netns_exec "$NETNS_ISP" ip -6 addr show dev "$VETH_ISP_CPE" | grep -q tentative; then
+        break
+    fi
+    sleep 0.2
+done
+if netns_exec "$NETNS_ISP" ip -6 addr show dev "$VETH_ISP_CPE" | grep -q tentative; then
+    echo "error: $VETH_ISP_CPE addresses still tentative (DAD stuck?) after 10s" >&2
+    exit 1
+fi
 
 # Kea DHCPv6 server: answers both Information-Request (RFC 3736 -- DNS
 # servers + RFC 6334 OPTION_AFTR_NAME, dnsmasq's old job, requested via
@@ -153,6 +196,15 @@ sleep 2
 # gets $PD_POOL_PREFIX every fresh run.
 aftr_name_hex_nocolons="$(encode_dns_name "$AFTR_FQDN" | tr -d ':')"
 pd_pool_addr="${PD_POOL_PREFIX%/*}"
+# In HB46PP mode Kea withholds OPTION_AFTR_NAME (that's the whole point of
+# the mode: a DHCPv6 Reply without option 64 is what makes minuteman fall
+# back to HB46PP), while still serving dns-servers -- HB46PP's TXT lookup
+# needs a resolver, and minuteman feeds it the one from this same Reply.
+kea_option_data="{ \"name\": \"dns-servers\", \"data\": \"${WAN_ISP_ADDR%/*}\" }"
+if [[ "$AFTR_DISCOVERY" == dhcpv6 ]]; then
+    kea_option_data+=",
+      { \"code\": 64, \"space\": \"dhcp6\", \"csv-format\": false, \"data\": \"$aftr_name_hex_nocolons\" }"
+fi
 cat >"$KEA_CONF" <<EOF
 {
   "Dhcp6": {
@@ -168,8 +220,7 @@ cat >"$KEA_CONF" <<EOF
     "preferred-lifetime": 3600,
     "valid-lifetime": 7200,
     "option-data": [
-      { "name": "dns-servers", "data": "${WAN_ISP_ADDR%/*}" },
-      { "code": 64, "space": "dhcp6", "csv-format": false, "data": "$aftr_name_hex_nocolons" }
+      $kea_option_data
     ],
     "subnet6": [
       {
@@ -199,6 +250,41 @@ if ! kill -0 "$(cat "$KEA_PIDFILE")" 2>/dev/null; then
     cat "$KEA_LOG" >&2 2>/dev/null || true
     exit 1
 fi
+
+if [[ "$AFTR_DISCOVERY" == hb46pp ]]; then
+    echo "== mm-isp: HB46PP provisioning server =="
+    # The provisioning response, served as a static file: python3's
+    # http.server drops the query string when mapping a request to a file,
+    # so "GET /rule.cgi?vendorid=...&capability=dslite" serves this file
+    # as-is -- good enough for a rig whose client always asks for dslite.
+    # The aftr value is the FQDN (not the address) so the HB46PP path also
+    # exercises the same DNS resolution step the DHCPv6 path does.
+    mkdir -p "$HB46PP_WWWDIR"
+    cat >"$HB46PP_WWWDIR/rule.cgi" <<EOF
+{
+  "enabler_name": "Minuteman Test VNE",
+  "service_name": "netns rig DS-Lite",
+  "ttl": 86400,
+  "order": [ "dslite" ],
+  "dslite": {
+    "aftr": "$AFTR_FQDN"
+  }
+}
+EOF
+    # Binding to the WAN-side address works here (unlike Kea, which needed
+    # the DAD wait above) only because that same wait has already passed.
+    ip netns exec "$NETNS_ISP" python3 -m http.server "$HB46PP_PORT" \
+        --bind "${WAN_ISP_ADDR%/*}" --directory "$HB46PP_WWWDIR" \
+        >"$HB46PP_HTTP_LOG" 2>&1 &
+    echo $! >"$HB46PP_HTTP_PIDFILE"
+    sleep 1
+    if ! kill -0 "$(cat "$HB46PP_HTTP_PIDFILE")" 2>/dev/null; then
+        echo "error: HB46PP http.server exited immediately; see $HB46PP_HTTP_LOG" >&2
+        cat "$HB46PP_HTTP_LOG" >&2 2>/dev/null || true
+        exit 1
+    fi
+fi
+echo "$AFTR_DISCOVERY" >"$AFTR_DISCOVERY_MODE_FILE"
 
 echo "== mm-cpe: B4 element (minuteman runs here) =="
 # ip_forward/net.ipv6.conf.all.forwarding=1 (required for bpf_fib_lookup() in

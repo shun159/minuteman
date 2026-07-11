@@ -14,7 +14,11 @@ The DS-Lite (RFC 6333) B4-element datapath is implemented and attaches/runs agai
 (verified against veth pairs: XDP programs load, pass the kernel verifier, and process live traffic).
 AFTR discovery is also implemented: a from-scratch, stdlib-only DHCPv6 client (RFC 3736 Information-Request
 + RFC 6334 `OPTION_AFTR_NAME`, resolved via DNS) runs in-process when `-aftr` is omitted — no external
-DHCP/DNS client daemon is spawned, consistent with the project's no-sidecar goal. DHCPv6 Prefix Delegation
+DHCP/DNS client daemon is spawned, consistent with the project's no-sidecar goal. When the DHCPv6 Reply
+carries no AFTR-Name, discovery now falls back to HB46PP (the JAIPA-standardized "HTTP-Based IPv4 over
+IPv6 Provisioning Protocol", `pkg/hb46pp` — see Architecture below): the fallback advertises
+`capability=dslite` and feeds the resulting `dslite.aftr` into the same DS-Lite setup, so minuteman works
+against both DHCPv6-provisioning and HB46PP-provisioning VNEs with no per-provider configuration. DHCPv6 Prefix Delegation
 (RFC 3633) is also implemented behind `-dhcpv6-pd`: `pkg/dhcpv6` grew a generic stateful exchange (Solicit/
 Request/Renew/Rebind/Release) that `pkg/prefixdelegation` drives to acquire and maintain a delegated prefix,
 and `internal/lanprefix` carves one `/64` per `-lan` interface from it and assigns it via hand-rolled
@@ -22,7 +26,7 @@ netlink (`golang.org/x/sys/unix`, no netlink library or `ip` exec). `internal/la
 Router Advertisements (RFC 4861) out each `-lan` interface via the new `pkg/routeradvert` package, so LAN
 clients can SLAAC an address out of the assigned `/64` themselves — LAN clients get both the DS-Lite IPv4
 path and native IPv6 out of the delegated prefix. `internal/` holds `cliconfig` (CLI flag parsing) and
-`lanprefix` (DHCPv6-PD LAN policy, including RA serving); `pkg/dhcpv6`/`pkg/aftrdiscovery`/
+`lanprefix` (DHCPv6-PD LAN policy, including RA serving); `pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/
 `pkg/prefixdelegation`/`pkg/routeradvert` are the reusable protocol packages.
 
 Not yet implemented: NDProxy (RFC 4389). The current model assumes the ISP supports DHCPv6-PD and
@@ -35,18 +39,19 @@ Solicitations on the WAN link on behalf of LAN hosts). Supporting that model wou
 piece of state this project hasn't needed before: learning which addresses actually exist on the LAN
 (via NS/NA snooping) so the WAN-side proxy replies only for real hosts.
 
-Also not yet implemented: HB46PP (the JAIPA-standardized "HTTP-Based IPv4 over IPv6 Provisioning
-Protocol", see https://github.com/v6pc/v6mig-prov/blob/master/spec.md), which many real Japanese
-home-router vendors use instead of (or alongside) DHCPv6-based discovery: a DNS TXT lookup on
-`4over6.info` locates a provisioning server; an HTTP(S) GET to it (query params include a `capability`
-list like `dslite,map_e,map_t,lw4o6,464xlat,ipip`) returns a JSON body with an `order`-ranked list of
-migration technologies the VNE supports and per-technology parameters (`dslite.aftr` maps directly onto
-what `pkg/aftrdiscovery` gets via DHCPv6 today; `map_e`/`map_t`/`lw4o6`/`464xlat`/`ipip` all carry
-parameters for technologies this project doesn't implement at all yet). This is a more foundational gap
-than NDProxy or MAP-E individually: it's the VNE-agnostic discovery layer that would let a single
-`capability=dslite` HB46PP client work against any JAIPA-compliant VNE without per-provider
-configuration, the same way `pkg/aftrdiscovery` already avoids needing a hardcoded `-aftr` — and it's
-the natural place to plug in parameters for whichever new migration technology gets implemented next.
+Also not yet implemented: the migration technologies other than DS-Lite that an HB46PP response can
+describe (`map_e`/`map_t`/`lw4o6`/`464xlat`/`ipip`). `pkg/hb46pp` already decodes the response's
+`order`-ranked technology list and preserves those technologies' parameter objects raw
+(`json.RawMessage` fields on `hb46pp.Provisioning`), so implementing one of them means adding its typed
+parameter struct there, its datapath, and extending `cmd/minuteman`'s policy beyond the current
+dslite-only capability request. Also not acted on yet: periodic re-discovery — both
+`aftrdiscovery.Result` and `hb46pp.Result` report their refresh interval (RFC 4242's, and HB46PP's
+`ttl`/20-24h default, respectively), and `hb46pp.Result.Provisioning.Token` is decoded but never echoed
+back on a later request, but `cmd/minuteman` discovers once at startup and never re-runs discovery.
+Implementing this needs more than a timer: RFC 3315 says re-discovery should also trigger on the WAN
+address changing, and the harder part is applying a *changed* AFTR to the live datapath safely (today
+`SetB4Config` is only ever called once, before the datapath is considered "up") without disrupting
+in-flight softwire traffic.
 
 ## Build commands
 
@@ -82,18 +87,26 @@ to exercise the datapath end-to-end without physical hardware:
 
 ```sh
 sudo ./test/netns/setup.sh       # builds the namespaces/veths/routing/NAT
-sudo ./test/netns/run-cpe.sh     # runs bin/minuteman as the B4 inside mm-cpe (discovers the AFTR via DHCPv6)
+sudo ./test/netns/run-cpe.sh     # runs bin/minuteman as the B4 inside mm-cpe (discovers the AFTR live)
 sudo ./test/netns/smoketest.sh   # starts minuteman itself + pings/curls end-to-end
 sudo ./test/netns/teardown.sh    # tears everything down (always safe to re-run)
 ```
 
 `common.sh` holds every namespace/interface/address name in one place; the other scripts source it rather
-than repeating the topology. `mm-isp` runs dnsmasq as combined RA + stateless DHCPv6 (RFC 3736) server,
-serving DNS and a real RFC 6334 `OPTION_AFTR_NAME` (hand-encoded in `common.sh`'s `encode_dns_name`, since
-dnsmasq has no built-in encoder for it) that resolves to the AFTR's tunnel address. `run-cpe.sh` and
-`smoketest.sh` deliberately omit `-aftr` so minuteman's own `pkg/aftrdiscovery` discovers it live against
-this dnsmasq — pass `-aftr <addr>` as an extra argument to either script to override with a static address
-instead.
+than repeating the topology. `mm-isp` runs dnsmasq for RA + DNS and Kea for DHCPv6 (stateless RFC 3736
+service and DHCPv6-PD — only one process can bind port 547, and dnsmasq has no PD support). How the AFTR's
+address is published is selectable at setup time via `MM_AFTR_DISCOVERY`:
+- `dhcpv6` (default): Kea serves a real RFC 6334 `OPTION_AFTR_NAME` (hand-encoded in `common.sh`'s
+  `encode_dns_name`, since neither server has a built-in encoder for it) that dnsmasq's DNS resolves to the
+  AFTR's tunnel address, exercising `pkg/aftrdiscovery`.
+- `hb46pp`: Kea withholds option 64, so minuteman's discovery falls back to HB46PP — dnsmasq serves the
+  `4over6.info` discovery TXT record pointing at a `python3 -m http.server` in `mm-isp` that serves the
+  provisioning JSON as a static `rule.cgi` file (python's handler ignores the query string, so minuteman's
+  real query parameters are accepted and simply unread), exercising `pkg/hb46pp` end-to-end. `setup.sh`
+  records the mode in `$RUNDIR/aftr-discovery-mode` so `smoketest.sh` asserts the matching discovery checks.
+
+`run-cpe.sh` and `smoketest.sh` deliberately omit `-aftr` so minuteman discovers it live against the rig —
+pass `-aftr <addr>` as an extra argument to either script to override with a static address instead.
 
 Two things worth knowing if you touch these scripts:
 - `mm-cpe` needs both `net.ipv4.ip_forward=1` and `net.ipv6.conf.all.forwarding=1`, or `bpf_fib_lookup()` in
@@ -104,17 +117,16 @@ Two things worth knowing if you touch these scripts:
 - mm-isp's dnsmasq must be started, and mm-cpe's WAN link brought up, in that order — Linux only retries
   Router Solicitation a few times right after an interface comes up, so if the RA server isn't listening yet
   the CPE gives up and never gets a default route; `setup.sh` sequences this deliberately, don't reorder it.
-  Likewise the `dhcp-range=::,constructor:<iface>,ra-stateless` form is required (not bare `::`) or dnsmasq
+  Likewise the `dhcp-range=::,constructor:<iface>,ra-only` form is required (not bare `::`) or dnsmasq
   never actually replies to Router Solicitations despite logging that RA is enabled.
 
 The AFTR's decap step uses a kernel `ip6tnl` (mode `ipip6`) device, which needs the `ip6_tunnel` module.
 `setup.sh` checks for it up front with a specific diagnostic for the common Arch situation where a kernel
 package upgrade has replaced `/lib/modules/<old-version>/` before a reboot, leaving the currently *running*
 kernel without a matching module directory (`uname -r` disagrees with what's on disk) — reboot to fix that.
-Everything except that one step (namespaces, addressing, FIB routing, RA/DHCPv6/AFTR-Name, minuteman's own
-`pkg/aftrdiscovery` client actually resolving `fd00:2::2` against this rig's dnsmasq, and minuteman's encap
-path — verified via matching TX/RX interface counters and `Encap`/`FIBSuccess`/`RedirectWAN` stats all
-incrementing 1:1 with pings sent) has been verified working end-to-end in this state.
+The full smoketest (AFTR discovery, DHCPv6-PD + RA/SLAAC, and the DS-Lite data path end-to-end through
+the AFTR's decap+NAPT44 to the simulated internet and back, ICMP and TCP) has been verified passing from
+a fresh setup in both discovery modes — `dhcpv6` and `hb46pp`.
 
 ## Code style
 
@@ -161,7 +173,12 @@ incrementing 1:1 with pings sent) has been verified working end-to-end in this s
     `bpf_fib_lookup()` returns `BPF_FIB_LKUP_RET_FWD_DISABLED`) and re-enable `accept_ra=2` on the WAN
     interface specifically (needed to keep accepting Router Advertisements once forwarding is on, so
     SLAAC/RA-installed default routes keep getting refreshed) — callers don't need to configure this
-    externally.
+    externally. `accept_ra=2` is deliberately written *before* forwarding, but the forwarding 0→1
+    transition still makes the kernel purge every already-RA-learned default route regardless
+    (`rt6_purge_dflt_routers`), leaving the WAN with no route to the AFTR until the ISP's next unsolicited
+    RA — which is why `cmd/minuteman` fires `pkg/routeradvert.SolicitRouters` right after `AttachWAN` (the
+    fix for an end-to-end failure actually observed in the netns rig: encap's FIB lookup failed for every
+    packet until dnsmasq's next periodic RA, minutes later).
   - `config.go` — `SetB4Config(B4Config)`, `SetLANConfig(ifindex uint32, LANConfig)`; also registers each
     attached ifindex as a valid `bpf_redirect_map()` target in `tx_ports` (self-mapped ifindex → ifindex).
   - `stats.go` — `Stats()` sums the `PERCPU_ARRAY` counters across CPUs into a plain `Stats` struct. The
@@ -192,7 +209,40 @@ incrementing 1:1 with pings sent) has been verified working end-to-end in this s
   rejected, not followed), `resolve.go` resolves it to an address via a `net.Resolver` dialed against the
   DNS servers from the same DHCPv6 Reply (`OPTION_DNS_SERVERS`), `discover.go`'s `Discover()` orchestrates
   both and returns the resolved address plus RFC 4242's refresh interval (reported, not acted on —
-  periodic re-discovery is a `cmd/minuteman`-level policy decision, not yet implemented).
+  periodic re-discovery is a `cmd/minuteman`-level policy decision, not yet implemented). When the Reply
+  carries no `OPTION_AFTR_NAME`, `Discover` returns the sentinel `ErrNoAFTRName` *together with* a partial
+  `Result` (DNS servers + refresh interval only — the one both-non-nil case, documented on the sentinel) so
+  callers can feed what the Reply did carry into another discovery mechanism; `cmd/minuteman` feeds it into
+  `pkg/hb46pp`.
+- **`pkg/hb46pp/`** — client for HB46PP, the JAIPA-standardized "HTTP-Based IPv4 over IPv6 Provisioning
+  Protocol" (v6mig-1, https://github.com/v6pc/v6mig-prov/blob/master/spec.md), the VNE-agnostic discovery
+  layer many Japanese VNEs use instead of DHCPv6 AFTR-Name. `txt.go` finds the provisioning server via a
+  TXT lookup on the well-known `4over6.info` (parsing `v=v6mig-1 url=... t=a|b`; the answer is VNE-specific,
+  which is why lookups must go through the WAN-learned resolvers, and NXDOMAIN/NODATA/unparseable gets the
+  distinct sentinel `ErrNotProvisioned` — "this VNE doesn't do HB46PP" vs. a transient failure). `t=a|b` is
+  enforced as a scheme constraint per spec §3.2's four connection methods: t=b requires https with normal
+  certificate validation; t=a permits *either* http or https-without-verification (`ServerInfo.ValidateCert`
+  carries which), since the spec's only directional rule is that a plain-http URL must be paired with t=a,
+  not the converse. `request.go` builds/validates the query parameters (vendorid/product/version/
+  capability/token, each with the spec's format rules, emitted in the spec's example order rather than
+  `url.Values`' alphabetical order). `response.go` decodes the JSON body: `dslite.aftr` gets a typed struct;
+  the other technologies' parameter objects (`map_e`/`map_t`/`lw4o6`/`464xlat`/`ipip`) are preserved as
+  `json.RawMessage` for whichever gets implemented next; `order: []` (spec-valid — "no method available for
+  this client") is distinguished from the field being absent (spec-invalid) via Go's own nil-vs-empty-slice
+  `json.Unmarshal` behavior, no wire-type indirection needed. `fetchProvisioning` follows *only* the spec's
+  307-to-another-server redirect (`newHTTPClient`'s `CheckRedirect` disables `http.Client`'s own broader
+  default policy, which also treats 301/302/303/308 as redirects — a meaning this protocol doesn't define —
+  so `fetchProvisioning`'s loop, capped at `maxRedirects`, is the only redirect-following that happens), and
+  rejects a redirect target that isn't https when the original record was t=b. Response bodies over
+  `maxResponseBytes` are rejected outright (not silently truncated-and-decoded), and any non-whitespace data
+  left after the JSON object is also rejected. `transport.go` builds the IPv6-only HTTP client (the spec
+  requires IPv6-only access: hostnames resolve via AAAA only, dials are `tcp6` only) and the
+  resolver-dialed-against-specific-servers helper (mirrors `pkg/aftrdiscovery`'s unexported `dialServers`).
+  `discover.go`'s `Discover()` runs the whole chain single-shot — TXT → GET → decode → resolve `dslite.aftr`
+  when present (a missing dslite object is *not* a Discover error, since callers may request several
+  capabilities) — and `retry.go`'s `RetryDelay(err)` maps a failure to the spec's jittered backoff window
+  (1–3h for `ErrNotProvisioned`, 1–10min for transient DNS, 10–30min for HTTP/JSON) so the retry *policy*
+  stays with the caller, matching `aftrdiscovery`'s reported-not-acted-on stance.
 - **`pkg/prefixdelegation/`** — RFC 3633-specific logic on top of `pkg/dhcpv6`, mirroring
   `pkg/aftrdiscovery`'s shape: `options.go` decodes/encodes `OPTION_IA_PD` and its nested `IAPREFIX`/
   `STATUS_CODE` suboptions (via `dhcpv6.ParseSubOptions`, since IA_PD's suboption TLV format is
@@ -206,8 +256,11 @@ incrementing 1:1 with pings sent) has been verified working end-to-end in this s
   refresh interval: a lease that's never renewed actually expires and breaks LAN connectivity, so this
   drives RFC 3315's full renewal ladder (Renew at T1 → Rebind at T2 on failure → fresh `Acquire` on failure)
   indefinitely, calling back into the caller on every change, and sends a best-effort `Release` on shutdown.
-- **`pkg/routeradvert/`** — RFC 4861 (Neighbor Discovery) logic covering only what a CPE needs to advertise
-  a prefix for SLAAC: sending Router Advertisements, not the full NDP message set. `message.go`/`options.go`
+- **`pkg/routeradvert/`** — RFC 4861 (Neighbor Discovery) logic covering only what a CPE needs: sending
+  Router Advertisements on the LAN side, plus (`solicit.go`) sending Router Solicitations upstream on the
+  WAN side — `SolicitRouters` transmits §6.3.7's host cadence (3 RSes, 4s apart) and lets the kernel
+  process the RAs that come back; it exists to promptly restore the default route the forwarding-enable
+  purge removes (see `pkg/datapath` above). Not the full NDP message set. `message.go`/`options.go`
   are the wire codec (manual byte-slice framing, matching `pkg/dhcpv6`'s style) for the RA fixed header and
   the two NDP options this package builds, `PrefixInformation` (§4.6.2) and `SourceLinkLayerAddress`
   (§4.6.1); Marshal-only, since this package never needs to decode an RA or an RS's body, only detect that
@@ -221,14 +274,28 @@ incrementing 1:1 with pings sent) has been verified working end-to-end in this s
   actual RFC 4861 §6.2/§10 timing — a fast initial burst of RAs, settling into a jittered periodic
   cadence, plus rate-limited replies to inbound Router Solicitations — ending with a best-effort final
   `RouterLifetime=0` RA when `ctx` is cancelled (§6.2.5's graceful-shutdown signal), mirroring
-  `prefixdelegation.Maintain`'s blocks-until-cancelled shape.
+  `prefixdelegation.Maintain`'s blocks-until-cancelled shape. A send failing with `EADDRNOTAVAIL` is
+  retried on DAD's ~1s timescale (`tentativeRetryInterval`) rather than treated as fatal: it means the
+  interface's link-local source is still tentative, which genuinely happens in minuteman's startup
+  sequence (XDP attach can bounce the link, and the LAN address assignment lands immediately before
+  `Serve` starts) and used to kill the RA worker for good, leaving LAN clients with no SLAAC.
+  `SolicitRouters` (`solicit.go`) shares this same retry (`sendRetryingTentative`) for exactly the same
+  reason — it's fired right after `AttachWAN`'s own forwarding-flip, which can itself still have the WAN
+  link's address tentative.
 - **`cmd/minuteman/main.go`** — thin CLI entrypoint. Flags: `-wan`, `-b4`, `-aftr` (optional — see below),
   repeatable `-lan iface=gatewayIP[,mtu]`, `-wan-dst-mac` (fallback only), `-stats-interval`, `-dhcpv6-pd`
-  (opt-in prefix delegation). Flag-value parsing (`LANSpec`/`LANSpecList`, MAC parsing) lives in
-  `internal/cliconfig`, not in `main.go` itself. `resolveAFTR()` returns `-aftr` parsed directly if given,
-  otherwise blocks on `pkg/aftrdiscovery.Discover` using the same lifecycle context as `SIGINT`/`SIGTERM`
-  handling (no artificial timeout — indefinite RFC 3315 retry is correct here, since there's no working
-  DS-Lite path without an AFTR anyway). When `-dhcpv6-pd` is set, `runPrefixDelegation()` similarly blocks
+  (opt-in prefix delegation), `-hb46pp-vendor-id`/`-hb46pp-product`/`-hb46pp-version` (HB46PP client-identity
+  query parameters — see below; default to the documentation OUI `acde48` since minuteman has no IEEE OUI,
+  overridable since a VNE may key rollout/workaround decisions off them, not just statistics). Flag-value
+  parsing (`LANSpec`/`LANSpecList`, MAC parsing) lives in `internal/cliconfig`, not in `main.go` itself.
+  `resolveAFTR()` returns `-aftr` parsed directly if given, otherwise blocks on `pkg/aftrdiscovery.Discover`
+  using the same lifecycle context as `SIGINT`/`SIGTERM` handling (no artificial timeout — indefinite
+  RFC 3315 retry is correct here, since there's no working DS-Lite path without an AFTR anyway). On
+  `aftrdiscovery.ErrNoAFTRName` it falls back to `hb46pp.Discover` (capability `dslite` only, DNS servers
+  from the partial DHCPv6 result, client identity from the three `-hb46pp-*` flags bundled into an
+  `hb46ppIdentity`), looping the whole DHCPv6→HB46PP chain with `hb46pp.RetryDelay`-paced sleeps on HB46PP
+  failure — same block-until-success-or-ctx-cancel stance, but at the spec's backoff cadence so a real
+  VNE's provisioning server isn't hammered. When `-dhcpv6-pd` is set, `runPrefixDelegation()` similarly blocks
   on `pkg/prefixdelegation.Acquire`, then applies the initial LAN assignment via
   `internal/lanprefix.Reconcile` synchronously (before the datapath is considered "up"), syncs an
   `internal/lanprefix.RAManager` against the result (starting one `pkg/routeradvert.Serve` goroutine per
@@ -241,7 +308,7 @@ incrementing 1:1 with pings sent) has been verified working end-to-end in this s
   on a timer) — it never touches `cilium/ebpf` or BPF map layouts directly.
 - **`internal/cliconfig`** — parses `minuteman`'s flag values (`LANSpec`, `ParseLANSpec`, `LANSpecList`
   implementing `flag.Value`, `ParseMAC`) into typed values for `main.go` to hand to `pkg/datapath`. Thin
-  CLI-flag glue only, not a home for protocol logic (that's `pkg/dhcpv6`/`pkg/aftrdiscovery`/
+  CLI-flag glue only, not a home for protocol logic (that's `pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/
   `pkg/prefixdelegation`).
 - **`internal/lanprefix`** — the DHCPv6-PD *policy* layer: what to do with a delegated prefix, as opposed to
   the protocol client itself (`pkg/prefixdelegation`). `carve.go`'s `SubnetFor(delegated, index)`/
@@ -266,7 +333,8 @@ incrementing 1:1 with pings sent) has been verified working end-to-end in this s
 When implementing new functionality, follow this split: per-packet fast-path logic goes in
 `bpf/datapath.bpf.c`; anything that needs `cilium/ebpf` or knows about BPF map layouts goes in
 `pkg/datapath`; generic protocol/wire-format code goes in its own `pkg/` package the way
-`pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/prefixdelegation`/`pkg/routeradvert` do; CLI-specific glue and policy
+`pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/`pkg/prefixdelegation`/`pkg/routeradvert` do; CLI-specific
+glue and policy
 decisions belong in `internal/` or `cmd/` (e.g. `internal/lanprefix`'s delegated-prefix-to-LAN-address and
 delegated-prefix-to-RA policy), calling into the `pkg/` packages rather than duplicating their logic.
 

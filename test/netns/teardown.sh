@@ -33,6 +33,13 @@ fi
 pkill -f "kea-dhcp6 -c $KEA_CONF" 2>/dev/null || true
 rm -f "$KEA_LOG"
 
+echo "== stopping HB46PP provisioning server (if any) =="
+if [[ -f "$HB46PP_HTTP_PIDFILE" ]]; then
+    kill "$(cat "$HB46PP_HTTP_PIDFILE")" 2>/dev/null || true
+    rm -f "$HB46PP_HTTP_PIDFILE"
+fi
+pkill -f "http.server $HB46PP_PORT" 2>/dev/null || true
+
 echo "== deleting namespaces (also removes veths/tunnels inside them) =="
 for ns in "${ALL_NETNS[@]}"; do
     ip netns del "$ns" 2>/dev/null || true

@@ -11,10 +11,13 @@
 #                                              DHCPv6 + AFTR-Name       MASQUERADE)              internet)
 #                                              per RFC 6334)
 #
-# mm-isp additionally serves the AFTR's address over DHCPv6 today only as
-# OPTION_AFTR_NAME (RFC 6334) + DNS, for future use once minuteman grows a
-# DHCPv6/AFTR-discovery client; minuteman itself is still configured via the
-# -b4/-aftr flags (see run-cpe.sh).
+# mm-isp serves the AFTR's address in one of two selectable ways (see
+# MM_AFTR_DISCOVERY in setup.sh): as RFC 6334 OPTION_AFTR_NAME over stateless
+# DHCPv6 (the default), or -- with the DHCPv6 option withheld -- via HB46PP
+# (JAIPA's v6mig-1 HTTP provisioning protocol: a 4over6.info TXT record
+# pointing at a provisioning HTTP server), exercising minuteman's fallback
+# discovery path. Either way minuteman discovers the AFTR itself; only -b4 is
+# statically configured (see run-cpe.sh).
 
 set -euo pipefail
 
@@ -83,6 +86,22 @@ KEA_CONF="$RUNDIR/kea-dhcp6.conf"
 # this can't live under $RUNDIR like the rest of this rig's runtime state;
 # teardown.sh removes this one file specifically instead.
 KEA_LOG="/var/log/kea/minuteman-netns-test.log"
+
+# HB46PP (MM_AFTR_DISCOVERY=hb46pp) rig pieces: dnsmasq serves a 4over6.info
+# TXT record ("v=v6mig-1 url=$HB46PP_URL t=a" -- t=a means plain http, no
+# TLS, which spares the rig a certificate authority) pointing at a python3
+# http.server in mm-isp that serves the provisioning JSON as a static
+# rule.cgi file (python's handler ignores the query string, so minuteman's
+# real vendorid/product/version/capability parameters are accepted and
+# simply unread). setup.sh records the selected mode in
+# $AFTR_DISCOVERY_MODE_FILE so smoketest.sh knows which discovery log lines
+# to assert.
+HB46PP_PORT=8046
+HB46PP_URL="http://[${WAN_ISP_ADDR%/*}]:$HB46PP_PORT/rule.cgi"
+HB46PP_WWWDIR="$RUNDIR/hb46pp-www"
+HB46PP_HTTP_PIDFILE="$RUNDIR/hb46pp-http.pid"
+HB46PP_HTTP_LOG="$RUNDIR/hb46pp-http.log"
+AFTR_DISCOVERY_MODE_FILE="$RUNDIR/aftr-discovery-mode"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MINUTEMAN_BIN="$REPO_ROOT/bin/minuteman"

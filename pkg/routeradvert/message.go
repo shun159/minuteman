@@ -2,8 +2,10 @@
 // Discovery for IP version 6) needed to act as an IPv6 router advertising a
 // prefix for SLAAC: sending Router Advertisements (both periodic unsolicited
 // and in response to inbound Router Solicitations) carrying a Prefix
-// Information Option. It does not implement any other NDP message type or
-// router behavior (no Neighbor Solicitation/Advertisement, no redirects).
+// Information Option, plus -- for a CPE's own WAN-facing host role -- sending
+// Router Solicitations upstream (SolicitRouters). It does not implement any
+// other NDP message type or router behavior (no Neighbor
+// Solicitation/Advertisement, no redirects).
 package routeradvert
 
 import (

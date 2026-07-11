@@ -1,8 +1,10 @@
 #!/bin/bash
 # End-to-end smoke test for the DS-Lite netns rig: pings and curls from the
 # simulated LAN client, through minuteman's B4 encap, the AFTR's decap+NAPT44,
-# to the simulated public internet host, and back. Also spot-checks that
-# mm-isp's stateless DHCPv6 + DNS correctly serve the RFC 6334 AFTR-Name.
+# to the simulated public internet host, and back. Also spot-checks AFTR
+# discovery in whichever mode setup.sh built the rig for (see its
+# MM_AFTR_DISCOVERY notes): the RFC 6334 AFTR-Name over stateless DHCPv6, or
+# the HB46PP TXT-record + provisioning-server fallback.
 #
 # Starts minuteman itself (if not already running) and stops it again on
 # exit, unless it detects an existing instance to leave alone.
@@ -83,13 +85,36 @@ else
     sleep 5
 fi
 
-echo "== RFC 6334 AFTR-Name / DNS discovery =="
-if [[ $started_minuteman -eq 1 ]]; then
-    check "minuteman discovered the AFTR via DHCPv6 (see $RUNDIR/minuteman.log)" \
-        grep -q "discovered AFTR $AFTR_FQDN -> ${CORE_AFTR_ADDR%/*}" "$RUNDIR/minuteman.log"
+aftr_mode=dhcpv6
+if [[ -f "$AFTR_DISCOVERY_MODE_FILE" ]]; then
+    aftr_mode="$(cat "$AFTR_DISCOVERY_MODE_FILE")"
+fi
+
+if [[ "$aftr_mode" == hb46pp ]]; then
+    echo "== HB46PP (v6mig-1) provisioning discovery =="
+    if [[ $started_minuteman -eq 1 ]]; then
+        check "minuteman fell back to HB46PP when the DHCPv6 Reply had no AFTR-Name (see $RUNDIR/minuteman.log)" \
+            grep -q "DHCPv6 Reply carried no AFTR-Name, trying HB46PP" "$RUNDIR/minuteman.log"
+        check "minuteman provisioned the AFTR via HB46PP" \
+            grep -q "HB46PP: provisioned by .*AFTR $AFTR_FQDN -> ${CORE_AFTR_ADDR%/*}" "$RUNDIR/minuteman.log"
+    fi
+    # Independent cross-checks against mm-isp's own servers, confirming the
+    # discovery chain minuteman is expected to have walked -- run regardless
+    # of whether we started minuteman ourselves.
+    check "mm-isp serves the 4over6.info discovery TXT record" \
+        bash -c "ip netns exec $NETNS_CPE dig @${WAN_ISP_ADDR%/*} -6 +short TXT 4over6.info | grep -q 'v=v6mig-1'"
+    check "the provisioning server answers with DS-Lite parameters" \
+        bash -c "ip netns exec $NETNS_CPE curl -sf -g '$HB46PP_URL?vendorid=acde48&product=smoketest&version=0&capability=dslite' | grep -q '\"aftr\"'"
+else
+    echo "== RFC 6334 AFTR-Name / DNS discovery =="
+    if [[ $started_minuteman -eq 1 ]]; then
+        check "minuteman discovered the AFTR via DHCPv6 (see $RUNDIR/minuteman.log)" \
+            grep -q "discovered AFTR $AFTR_FQDN -> ${CORE_AFTR_ADDR%/*}" "$RUNDIR/minuteman.log"
+    fi
 fi
 # Independent cross-check queried directly against mm-isp, to confirm the
-# server itself is serving the record minuteman is expected to have used --
+# server itself is serving the record minuteman is expected to have used
+# (both discovery modes resolve $AFTR_FQDN through this same dnsmasq) --
 # runs regardless of whether we started minuteman ourselves.
 check "mm-isp resolves $AFTR_FQDN to the AFTR's tunnel address" \
     bash -c "[[ \$(ip netns exec $NETNS_CPE dig @${WAN_ISP_ADDR%/*} -6 +short AAAA $AFTR_FQDN) == '${CORE_AFTR_ADDR%/*}' ]]"
