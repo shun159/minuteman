@@ -95,9 +95,9 @@ func Discover(ctx context.Context, cfg Config) (*Result, error) {
 
 	client := cfg.httpClient
 	if client == nil {
-		client = newHTTPClient(res)
+		client = newHTTPClient(res, server.ValidateCert)
 	}
-	prov, err := fetchProvisioning(ctx, client, reqURL)
+	prov, err := fetchProvisioning(ctx, client, reqURL, server.ValidateCert)
 	if err != nil {
 		return nil, err
 	}

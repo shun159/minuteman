@@ -33,16 +33,29 @@ import (
 	"github.com/shun159/miniteman/pkg/routeradvert"
 )
 
-// The HB46PP client identity sent as provisioning query parameters.
+// Default HB46PP client identity sent as provisioning query parameters,
+// overridable via -hb46pp-vendor-id/-hb46pp-product/-hb46pp-version.
 // "acde48" is the AC-DE-48 OUI conventionally used in documentation and
 // examples (it's also what the HB46PP spec's own examples use) --
-// minuteman has no IEEE-assigned OUI of its own. VNEs use vendorid for
-// statistics, not authorization, so a documentation OUI is workable.
+// minuteman has no IEEE-assigned OUI of its own. A VNE may use vendorid/
+// product/version for more than statistics (e.g. per-product rollout or
+// workaround decisions per the spec), which is why these are
+// configurable rather than permanently hardcoded to the documentation
+// values.
 const (
-	hb46ppVendorID = "acde48-minuteman"
-	hb46ppProduct  = "minuteman"
-	hb46ppVersion  = "0_1"
+	defaultHB46PPVendorID = "acde48-minuteman"
+	defaultHB46PPProduct  = "minuteman"
+	defaultHB46PPVersion  = "0_1"
 )
+
+// hb46ppIdentity bundles the HB46PP client-identity query parameters
+// (spec §3.2) so resolveAFTR/discoverViaHB46PP take one value instead of
+// three positional strings.
+type hb46ppIdentity struct {
+	vendorID string
+	product  string
+	version  string
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -52,13 +65,16 @@ func main() {
 
 func run() error {
 	var (
-		wanIface   = flag.String("wan", "", "WAN interface name (required)")
-		b4Addr     = flag.String("b4", "", "B4 IPv6 address, our side of the DS-Lite softwire (required)")
-		aftrAddr   = flag.String("aftr", "", "AFTR IPv6 address; if omitted, discovered via DHCPv6 (RFC 3736 + RFC 6334)")
-		wanDstMAC  = flag.String("wan-dst-mac", "", "fallback next-hop MAC on the WAN side, used only if FIB lookup can't resolve one")
-		statsEvery = flag.Duration("stats-interval", 10*time.Second, "how often to log datapath stats (0 disables)")
-		requestPD  = flag.Bool("dhcpv6-pd", false, "request a delegated IPv6 prefix via DHCPv6-PD (RFC 3633) on the WAN interface and assign one /64 per -lan interface from it")
-		lans       cliconfig.LANSpecList
+		wanIface       = flag.String("wan", "", "WAN interface name (required)")
+		b4Addr         = flag.String("b4", "", "B4 IPv6 address, our side of the DS-Lite softwire (required)")
+		aftrAddr       = flag.String("aftr", "", "AFTR IPv6 address; if omitted, discovered via DHCPv6 (RFC 3736 + RFC 6334)")
+		wanDstMAC      = flag.String("wan-dst-mac", "", "fallback next-hop MAC on the WAN side, used only if FIB lookup can't resolve one")
+		statsEvery     = flag.Duration("stats-interval", 10*time.Second, "how often to log datapath stats (0 disables)")
+		requestPD      = flag.Bool("dhcpv6-pd", false, "request a delegated IPv6 prefix via DHCPv6-PD (RFC 3633) on the WAN interface and assign one /64 per -lan interface from it")
+		hb46ppVendorID = flag.String("hb46pp-vendor-id", defaultHB46PPVendorID, "HB46PP vendorid query parameter sent during provisioning discovery fallback (vendor OUI, optionally -suffix)")
+		hb46ppProduct  = flag.String("hb46pp-product", defaultHB46PPProduct, "HB46PP product query parameter sent during provisioning discovery fallback")
+		hb46ppVersion  = flag.String("hb46pp-version", defaultHB46PPVersion, "HB46PP version query parameter sent during provisioning discovery fallback (digits/underscores only)")
+		lans           cliconfig.LANSpecList
 	)
 	flag.Var(&lans, "lan", "LAN interface as iface=gatewayIP[,mtu] (repeatable, required at least once)")
 	flag.Parse()
@@ -80,7 +96,8 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	aftr, err := resolveAFTR(ctx, *aftrAddr, *wanIface)
+	identity := hb46ppIdentity{vendorID: *hb46ppVendorID, product: *hb46ppProduct, version: *hb46ppVersion}
+	aftr, err := resolveAFTR(ctx, *aftrAddr, *wanIface, identity)
 	if err != nil {
 		return err
 	}
@@ -189,13 +206,13 @@ func runPrefixDelegation(ctx context.Context, wanIface string, lans cliconfig.LA
 // otherwise discovers the AFTR live via DHCPv6 on wanIface (RFC 3736
 // Information-Request + RFC 6334 OPTION_AFTR_NAME, resolved via DNS). If
 // the DHCPv6 Reply carries no AFTR-Name, it falls back to HB46PP
-// provisioning (capability dslite) using the DNS servers from that same
-// Reply, retrying the whole DHCPv6-then-HB46PP chain on HB46PP failure
-// with the HB46PP spec's backoff for the failure class. Discovery blocks
-// until it succeeds or ctx is cancelled -- there's no working DS-Lite path
-// without an AFTR address, so waiting (with visible retry behavior) is
-// preferable to an arbitrary timeout.
-func resolveAFTR(ctx context.Context, aftrFlag, wanIface string) (netip.Addr, error) {
+// provisioning (capability dslite, identified as identity) using the DNS
+// servers from that same Reply, retrying the whole DHCPv6-then-HB46PP
+// chain on HB46PP failure with the HB46PP spec's backoff for the failure
+// class. Discovery blocks until it succeeds or ctx is cancelled -- there's
+// no working DS-Lite path without an AFTR address, so waiting (with
+// visible retry behavior) is preferable to an arbitrary timeout.
+func resolveAFTR(ctx context.Context, aftrFlag, wanIface string, identity hb46ppIdentity) (netip.Addr, error) {
 	if aftrFlag != "" {
 		aftr, err := netip.ParseAddr(aftrFlag)
 		if err != nil {
@@ -218,7 +235,7 @@ func resolveAFTR(ctx context.Context, aftrFlag, wanIface string) (netip.Addr, er
 		// result is aftrdiscovery's documented partial result here: the
 		// Reply had DNS servers but no AFTR-Name.
 		log.Printf("DHCPv6 Reply carried no AFTR-Name, trying HB46PP provisioning (DNS servers: %v)", result.DNSServers)
-		aftr, err := discoverViaHB46PP(ctx, result.DNSServers)
+		aftr, err := discoverViaHB46PP(ctx, result.DNSServers, identity)
 		if err == nil {
 			return aftr, nil
 		}
@@ -237,12 +254,12 @@ func resolveAFTR(ctx context.Context, aftrFlag, wanIface string) (netip.Addr, er
 // dslite capability and returns the AFTR address it yields. dnsServers
 // (from the DHCPv6 Reply) are the VNE's own resolvers, which is what the
 // 4over6.info TXT lookup must go through.
-func discoverViaHB46PP(ctx context.Context, dnsServers []netip.Addr) (netip.Addr, error) {
+func discoverViaHB46PP(ctx context.Context, dnsServers []netip.Addr, identity hb46ppIdentity) (netip.Addr, error) {
 	result, err := hb46pp.Discover(ctx, hb46pp.Config{
 		Client: hb46pp.ClientInfo{
-			VendorID:     hb46ppVendorID,
-			Product:      hb46ppProduct,
-			Version:      hb46ppVersion,
+			VendorID:     identity.vendorID,
+			Product:      identity.product,
+			Version:      identity.version,
 			Capabilities: []string{"dslite"},
 		},
 		DNSServers: dnsServers,

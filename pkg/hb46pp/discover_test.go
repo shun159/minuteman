@@ -13,16 +13,24 @@ import (
 
 // newTestConfig wires a Discover Config against an httptest server: the
 // fake resolver's TXT record points at the server, and the server's own
-// (loopback, IPv4) client replaces the IPv6-only production one.
+// (loopback, IPv4) client replaces the IPv6-only production one -- with
+// the same CheckRedirect restriction newHTTPClient sets, so tests using
+// this helper still exercise fetchProvisioning's own 307-only redirect
+// handling instead of silently falling back to http.Client's broader
+// default (which also follows 301/302/303/308).
 func newTestConfig(srv *httptest.Server, res *fakeResolver) Config {
 	if res.txt == nil {
 		res.txt = map[string][]string{}
 	}
 	res.txt[discoveryDomain] = []string{"v=v6mig-1 url=" + srv.URL + "/rule.cgi t=a"}
+	client := srv.Client()
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
 	return Config{
 		Client:     validClient(),
 		resolver:   res,
-		httpClient: srv.Client(),
+		httpClient: client,
 	}
 }
 
@@ -118,6 +126,37 @@ func TestDiscoverFollowsRedirect(t *testing.T) {
 	}
 	if want := netip.MustParseAddr("2001:db8::2"); result.AFTRAddr != want {
 		t.Fatalf("AFTRAddr = %v, want %v", result.AFTRAddr, want)
+	}
+}
+
+func TestDiscoverDoesNotFollow308(t *testing.T) {
+	// The spec (§3.3) defines only 307 as a forward-to-another-server
+	// signal; a 308 (which http.Client's default policy would otherwise
+	// also follow) must be treated as just another non-200 status.
+	real := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("the 308's target must not be requested")
+	}))
+	defer real.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, real.URL+"/rule.cgi?"+r.URL.RawQuery, http.StatusPermanentRedirect)
+	}))
+	defer srv.Close()
+
+	if _, err := Discover(context.Background(), newTestConfig(srv, &fakeResolver{})); err == nil {
+		t.Fatal("Discover through a 308: want error, got nil")
+	}
+}
+
+func TestDiscoverTooManyRedirects(t *testing.T) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, srv.URL+"/rule.cgi?"+r.URL.RawQuery, http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+
+	_, err := Discover(context.Background(), newTestConfig(srv, &fakeResolver{}))
+	if err == nil {
+		t.Fatal("Discover with a redirect loop: want error, got nil")
 	}
 }
 

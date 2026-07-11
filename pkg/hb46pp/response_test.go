@@ -52,9 +52,7 @@ func TestDecodeProvisioningRequiredFields(t *testing.T) {
 		body string
 	}{
 		{"missing enabler_name", `{"service_name":"s","order":["dslite"]}`},
-		{"missing service_name", `{"enabler_name":"e","order":["dslite"]}`},
 		{"missing order", `{"enabler_name":"e","service_name":"s"}`},
-		{"empty order", `{"enabler_name":"e","service_name":"s","order":[]}`},
 		{"auth failed", `{"enabler_name":"e","service_name":"s","order":["dslite"],"auth":"bad"}`},
 		{"not json", `<html></html>`},
 	}
@@ -64,6 +62,47 @@ func TestDecodeProvisioningRequiredFields(t *testing.T) {
 				t.Fatalf("decodeProvisioning(%s) = nil error, want error", tt.body)
 			}
 		})
+	}
+}
+
+func TestDecodeProvisioningServiceNameOptional(t *testing.T) {
+	// Spec §3.4: non-NGN services must omit service_name entirely.
+	p, err := decodeProvisioning(strings.NewReader(`{"enabler_name":"e","order":["dslite"]}`))
+	if err != nil {
+		t.Fatalf("decodeProvisioning with no service_name: %v", err)
+	}
+	if p.ServiceName != "" {
+		t.Fatalf("ServiceName = %q, want empty", p.ServiceName)
+	}
+}
+
+func TestDecodeProvisioningTrailingWhitespaceIsValid(t *testing.T) {
+	// A trailing newline is common server padding, not trailing data.
+	_, err := decodeProvisioning(strings.NewReader(specExampleJSON + "\n"))
+	if err != nil {
+		t.Fatalf("decodeProvisioning with trailing newline: %v", err)
+	}
+}
+
+func TestDecodeProvisioningRejectsTrailingData(t *testing.T) {
+	_, err := decodeProvisioning(strings.NewReader(specExampleJSON + `{"enabler_name":"e2","service_name":"s2","order":[]}`))
+	if err == nil {
+		t.Fatal("decodeProvisioning with two concatenated JSON objects: want error, got nil")
+	}
+}
+
+func TestDecodeProvisioningEmptyOrderIsValid(t *testing.T) {
+	// Spec §3.3: order: [] is how a server says no method is available
+	// for this client -- a normal response, not a protocol error.
+	p, err := decodeProvisioning(strings.NewReader(`{"enabler_name":"e","service_name":"s","order":[]}`))
+	if err != nil {
+		t.Fatalf("decodeProvisioning with order:[]: %v", err)
+	}
+	if p.Order == nil || len(p.Order) != 0 {
+		t.Fatalf("Order = %#v, want a non-nil empty slice", p.Order)
+	}
+	if p.DSLite != nil {
+		t.Fatalf("DSLite = %+v, want nil", p.DSLite)
 	}
 }
 

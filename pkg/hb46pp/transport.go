@@ -2,6 +2,7 @@ package hb46pp
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
@@ -54,9 +55,12 @@ func dialServers(servers []netip.Addr) func(ctx context.Context, network, _ stri
 // newHTTPClient returns an http.Client for provisioning requests: the
 // spec requires the server be accessed over IPv6 only, so the dialer
 // resolves the URL host to AAAA records via res (never A) and dials
-// tcp6 exclusively. TLS uses normal certificate validation (see
-// ServerInfo.ValidateCert for why there's no skip-verify mode).
-func newHTTPClient(res resolver) *http.Client {
+// tcp6 exclusively. TLS uses normal certificate validation unless
+// validateCert is false -- the discovery TXT record's t=a, which the
+// spec permits for an https URL too, not just http (see
+// ServerInfo.ValidateCert) -- in which case verification is skipped, as
+// the VNE itself requested via that record.
+func newHTTPClient(res resolver, validateCert bool) *http.Client {
 	var d net.Dialer
 	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
@@ -88,8 +92,22 @@ func newHTTPClient(res resolver) *http.Client {
 		return nil, fmt.Errorf("hb46pp: dialing provisioning server %q: %w", host, lastErr)
 	}
 
+	transport := &http.Transport{DialContext: dial}
+	if !validateCert {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // t=a explicitly requests this, see ServerInfo.ValidateCert
+	}
+
 	return &http.Client{
-		Transport: &http.Transport{DialContext: dial},
+		Transport: transport,
 		Timeout:   httpTimeout,
+		// The spec (§3.3) defines only one redirect: a 307 to another
+		// provisioning server. http.Client's default policy also
+		// follows 301/302/303/308, which this protocol doesn't define
+		// a meaning for; disable it here so fetchProvisioning's own
+		// loop -- which knows about only 307 -- is the sole redirect
+		// handling.
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 }

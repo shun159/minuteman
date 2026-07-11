@@ -34,10 +34,11 @@ type ServerInfo struct {
 	URL string
 
 	// ValidateCert reflects the record's t= field: t=b (true) requires
-	// an https URL with normal certificate validation, t=a (false)
-	// requires a plain-http URL. This package never skips TLS
-	// verification -- t=a's "no validation" is expressed as http, not
-	// as unverified https.
+	// an https URL with normal certificate validation. t=a (false)
+	// means no certificate validation, which the spec (§3.2) allows for
+	// either a plain-http URL or an https URL accessed without
+	// verifying its certificate -- the latter is threaded through to
+	// newHTTPClient as InsecureSkipVerify.
 	ValidateCert bool
 }
 
@@ -73,8 +74,11 @@ func lookupServer(ctx context.Context, res resolver) (*ServerInfo, error) {
 //	v=v6mig-1 url=https://vne.example.jp/rule.cgi t=b
 //
 // v, url and t are required; unknown keys are ignored per the spec. The
-// t= field is validated against the URL scheme (t=a MUST be http, t=b
-// https).
+// t= field is validated against the URL scheme: t=b requires https
+// (§3.2's certificate-validated options); t=a permits either http or
+// https (§3.2's two no-validation options) -- the spec's only
+// directional rule is that a plain-http URL MUST be paired with t=a,
+// not that t=a implies http.
 func parseTXTRecord(record string) (*ServerInfo, error) {
 	kv := make(map[string]string)
 	for _, field := range strings.Fields(record) {
@@ -104,8 +108,8 @@ func parseTXTRecord(record string) (*ServerInfo, error) {
 
 	switch kv["t"] {
 	case "a":
-		if u.Scheme != "http" {
-			return nil, fmt.Errorf("hb46pp: TXT record has t=a (no certificate validation) but a %s url; t=a requires plain http", u.Scheme)
+		if u.Scheme != "http" && u.Scheme != "https" {
+			return nil, fmt.Errorf("hb46pp: TXT record has t=a (no certificate validation) but a %s url; t=a requires http or https", u.Scheme)
 		}
 		return &ServerInfo{URL: rawURL, ValidateCert: false}, nil
 	case "b":

@@ -2,6 +2,7 @@ package routeradvert
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"time"
@@ -78,9 +79,32 @@ func SolicitRouters(ctx context.Context, ifaceName string) error {
 			case <-time.After(rtrSolicitationInterval):
 			}
 		}
-		if err := unix.Sendto(fd, rs, 0, dst); err != nil {
+		if err := sendRetryingTentative(ctx, fd, rs, dst); err != nil {
 			return fmt.Errorf("routeradvert: sending Router Solicitation on %s: %w", ifaceName, err)
 		}
 	}
 	return nil
+}
+
+// sendRetryingTentative sends buf, retrying on EADDRNOTAVAIL -- the
+// interface's link-local source address is still tentative (DAD-pending),
+// which right after a link bounce (an XDP attach, or the caller's own
+// link-state change) resolves itself in about a second -- until it
+// succeeds, another error occurs, or ctx is cancelled. Mirrors Serve's
+// EADDRNOTAVAIL handling (see tentativeRetryInterval in advertise.go).
+func sendRetryingTentative(ctx context.Context, fd int, buf []byte, dst unix.Sockaddr) error {
+	for {
+		err := unix.Sendto(fd, buf, 0, dst)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, unix.EADDRNOTAVAIL) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(tentativeRetryInterval):
+		}
+	}
 }

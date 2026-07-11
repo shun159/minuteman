@@ -46,8 +46,12 @@ describe (`map_e`/`map_t`/`lw4o6`/`464xlat`/`ipip`). `pkg/hb46pp` already decode
 parameter struct there, its datapath, and extending `cmd/minuteman`'s policy beyond the current
 dslite-only capability request. Also not acted on yet: periodic re-discovery — both
 `aftrdiscovery.Result` and `hb46pp.Result` report their refresh interval (RFC 4242's, and HB46PP's
-`ttl`/20-24h default, respectively) but `cmd/minuteman` discovers once at startup and never re-runs
-discovery.
+`ttl`/20-24h default, respectively), and `hb46pp.Result.Provisioning.Token` is decoded but never echoed
+back on a later request, but `cmd/minuteman` discovers once at startup and never re-runs discovery.
+Implementing this needs more than a timer: RFC 3315 says re-discovery should also trigger on the WAN
+address changing, and the harder part is applying a *changed* AFTR to the live datapath safely (today
+`SetB4Config` is only ever called once, before the datapath is considered "up") without disrupting
+in-flight softwire traffic.
 
 ## Build commands
 
@@ -216,20 +220,29 @@ a fresh setup in both discovery modes — `dhcpv6` and `hb46pp`.
   TXT lookup on the well-known `4over6.info` (parsing `v=v6mig-1 url=... t=a|b`; the answer is VNE-specific,
   which is why lookups must go through the WAN-learned resolvers, and NXDOMAIN/NODATA/unparseable gets the
   distinct sentinel `ErrNotProvisioned` — "this VNE doesn't do HB46PP" vs. a transient failure). `t=a|b` is
-  enforced as a scheme constraint (t=a ⇒ http, t=b ⇒ https with normal verification) — there is deliberately
-  no skip-TLS-verify mode. `request.go` builds/validates the query parameters (vendorid/product/version/
+  enforced as a scheme constraint per spec §3.2's four connection methods: t=b requires https with normal
+  certificate validation; t=a permits *either* http or https-without-verification (`ServerInfo.ValidateCert`
+  carries which), since the spec's only directional rule is that a plain-http URL must be paired with t=a,
+  not the converse. `request.go` builds/validates the query parameters (vendorid/product/version/
   capability/token, each with the spec's format rules, emitted in the spec's example order rather than
   `url.Values`' alphabetical order). `response.go` decodes the JSON body: `dslite.aftr` gets a typed struct;
   the other technologies' parameter objects (`map_e`/`map_t`/`lw4o6`/`464xlat`/`ipip`) are preserved as
-  `json.RawMessage` for whichever gets implemented next. `transport.go` builds the IPv6-only HTTP client
-  (the spec requires IPv6-only access: hostnames resolve via AAAA only, dials are `tcp6` only) and the
+  `json.RawMessage` for whichever gets implemented next; `order: []` (spec-valid — "no method available for
+  this client") is distinguished from the field being absent (spec-invalid) via Go's own nil-vs-empty-slice
+  `json.Unmarshal` behavior, no wire-type indirection needed. `fetchProvisioning` follows *only* the spec's
+  307-to-another-server redirect (`newHTTPClient`'s `CheckRedirect` disables `http.Client`'s own broader
+  default policy, which also treats 301/302/303/308 as redirects — a meaning this protocol doesn't define —
+  so `fetchProvisioning`'s loop, capped at `maxRedirects`, is the only redirect-following that happens), and
+  rejects a redirect target that isn't https when the original record was t=b. Response bodies over
+  `maxResponseBytes` are rejected outright (not silently truncated-and-decoded), and any non-whitespace data
+  left after the JSON object is also rejected. `transport.go` builds the IPv6-only HTTP client (the spec
+  requires IPv6-only access: hostnames resolve via AAAA only, dials are `tcp6` only) and the
   resolver-dialed-against-specific-servers helper (mirrors `pkg/aftrdiscovery`'s unexported `dialServers`).
-  `discover.go`'s `Discover()` runs the whole chain single-shot — TXT → GET (redirects, including the
-  spec's 307 rule, follow `http.Client`'s default policy) → decode → resolve `dslite.aftr` when present
-  (a missing dslite object is *not* a Discover error, since callers may request several capabilities) —
-  and `retry.go`'s `RetryDelay(err)` maps a failure to the spec's jittered backoff window (1–3h for
-  `ErrNotProvisioned`, 1–10min for transient DNS, 10–30min for HTTP/JSON) so the retry *policy* stays with
-  the caller, matching `aftrdiscovery`'s reported-not-acted-on stance.
+  `discover.go`'s `Discover()` runs the whole chain single-shot — TXT → GET → decode → resolve `dslite.aftr`
+  when present (a missing dslite object is *not* a Discover error, since callers may request several
+  capabilities) — and `retry.go`'s `RetryDelay(err)` maps a failure to the spec's jittered backoff window
+  (1–3h for `ErrNotProvisioned`, 1–10min for transient DNS, 10–30min for HTTP/JSON) so the retry *policy*
+  stays with the caller, matching `aftrdiscovery`'s reported-not-acted-on stance.
 - **`pkg/prefixdelegation/`** — RFC 3633-specific logic on top of `pkg/dhcpv6`, mirroring
   `pkg/aftrdiscovery`'s shape: `options.go` decodes/encodes `OPTION_IA_PD` and its nested `IAPREFIX`/
   `STATUS_CODE` suboptions (via `dhcpv6.ParseSubOptions`, since IA_PD's suboption TLV format is
@@ -262,22 +275,27 @@ a fresh setup in both discovery modes — `dhcpv6` and `hb46pp`.
   cadence, plus rate-limited replies to inbound Router Solicitations — ending with a best-effort final
   `RouterLifetime=0` RA when `ctx` is cancelled (§6.2.5's graceful-shutdown signal), mirroring
   `prefixdelegation.Maintain`'s blocks-until-cancelled shape. A send failing with `EADDRNOTAVAIL` is
-  retried on DAD's ~1s timescale rather than treated as fatal: it means the interface's link-local source
-  is still tentative, which genuinely happens in minuteman's startup sequence (XDP attach can bounce the
-  link, and the LAN address assignment lands immediately before `Serve` starts) and used to kill the RA
-  worker for good, leaving LAN clients with no SLAAC.
+  retried on DAD's ~1s timescale (`tentativeRetryInterval`) rather than treated as fatal: it means the
+  interface's link-local source is still tentative, which genuinely happens in minuteman's startup
+  sequence (XDP attach can bounce the link, and the LAN address assignment lands immediately before
+  `Serve` starts) and used to kill the RA worker for good, leaving LAN clients with no SLAAC.
+  `SolicitRouters` (`solicit.go`) shares this same retry (`sendRetryingTentative`) for exactly the same
+  reason — it's fired right after `AttachWAN`'s own forwarding-flip, which can itself still have the WAN
+  link's address tentative.
 - **`cmd/minuteman/main.go`** — thin CLI entrypoint. Flags: `-wan`, `-b4`, `-aftr` (optional — see below),
   repeatable `-lan iface=gatewayIP[,mtu]`, `-wan-dst-mac` (fallback only), `-stats-interval`, `-dhcpv6-pd`
-  (opt-in prefix delegation). Flag-value parsing (`LANSpec`/`LANSpecList`, MAC parsing) lives in
-  `internal/cliconfig`, not in `main.go` itself. `resolveAFTR()` returns `-aftr` parsed directly if given,
-  otherwise blocks on `pkg/aftrdiscovery.Discover` using the same lifecycle context as `SIGINT`/`SIGTERM`
-  handling (no artificial timeout — indefinite RFC 3315 retry is correct here, since there's no working
-  DS-Lite path without an AFTR anyway). On `aftrdiscovery.ErrNoAFTRName` it falls back to
-  `hb46pp.Discover` (capability `dslite` only, DNS servers from the partial DHCPv6 result; the client
-  identity constants use the documentation OUI `acde48` since minuteman has no IEEE OUI), looping the whole
-  DHCPv6→HB46PP chain with `hb46pp.RetryDelay`-paced sleeps on HB46PP failure — same
-  block-until-success-or-ctx-cancel stance, but at the spec's backoff cadence so a real VNE's provisioning
-  server isn't hammered. When `-dhcpv6-pd` is set, `runPrefixDelegation()` similarly blocks
+  (opt-in prefix delegation), `-hb46pp-vendor-id`/`-hb46pp-product`/`-hb46pp-version` (HB46PP client-identity
+  query parameters — see below; default to the documentation OUI `acde48` since minuteman has no IEEE OUI,
+  overridable since a VNE may key rollout/workaround decisions off them, not just statistics). Flag-value
+  parsing (`LANSpec`/`LANSpecList`, MAC parsing) lives in `internal/cliconfig`, not in `main.go` itself.
+  `resolveAFTR()` returns `-aftr` parsed directly if given, otherwise blocks on `pkg/aftrdiscovery.Discover`
+  using the same lifecycle context as `SIGINT`/`SIGTERM` handling (no artificial timeout — indefinite
+  RFC 3315 retry is correct here, since there's no working DS-Lite path without an AFTR anyway). On
+  `aftrdiscovery.ErrNoAFTRName` it falls back to `hb46pp.Discover` (capability `dslite` only, DNS servers
+  from the partial DHCPv6 result, client identity from the three `-hb46pp-*` flags bundled into an
+  `hb46ppIdentity`), looping the whole DHCPv6→HB46PP chain with `hb46pp.RetryDelay`-paced sleeps on HB46PP
+  failure — same block-until-success-or-ctx-cancel stance, but at the spec's backoff cadence so a real
+  VNE's provisioning server isn't hammered. When `-dhcpv6-pd` is set, `runPrefixDelegation()` similarly blocks
   on `pkg/prefixdelegation.Acquire`, then applies the initial LAN assignment via
   `internal/lanprefix.Reconcile` synchronously (before the datapath is considered "up"), syncs an
   `internal/lanprefix.RAManager` against the result (starting one `pkg/routeradvert.Serve` goroutine per

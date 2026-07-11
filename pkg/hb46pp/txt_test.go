@@ -35,7 +35,11 @@ func TestParseTXTRecord(t *testing.T) {
 		{name: "missing url", record: "v=v6mig-1 t=b", wantErr: true},
 		{name: "missing t", record: "v=v6mig-1 url=https://a.example/x", wantErr: true},
 		{name: "bad t", record: "v=v6mig-1 url=https://a.example/x t=c", wantErr: true},
-		{name: "t=a with https", record: "v=v6mig-1 url=https://a.example/x t=a", wantErr: true},
+		{
+			name:   "t=a with https",
+			record: "v=v6mig-1 url=https://a.example/x t=a",
+			want:   ServerInfo{URL: "https://a.example/x", ValidateCert: false},
+		},
 		{name: "t=b with http", record: "v=v6mig-1 url=http://a.example/x t=b", wantErr: true},
 		{name: "url without host", record: "v=v6mig-1 url=https:///x t=b", wantErr: true},
 		{name: "empty", record: "", wantErr: true},

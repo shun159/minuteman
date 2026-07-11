@@ -1,8 +1,10 @@
 package hb46pp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -21,11 +23,15 @@ const (
 	defaultRefreshMax = 24 * time.Hour
 )
 
-// maxResponseBytes bounds how much of a provisioning response body is
-// read, as a defensive limit against a hostile or broken server. The
-// spec's per-field size limits put a legitimate response nowhere near
-// this.
+// maxResponseBytes bounds how large a provisioning response body may be;
+// fetchProvisioning rejects anything over this rather than silently
+// decoding just its first maxResponseBytes. The spec's per-field size
+// limits put a legitimate response nowhere near this.
 const maxResponseBytes = 1 << 20
+
+// maxRedirects bounds how many spec-defined 307 forwards fetchProvisioning
+// follows, guarding against a redirect loop between misconfigured servers.
+const maxRedirects = 5
 
 // Provisioning is a decoded provisioning response body (spec §3.3): the
 // VNE's order-ranked list of supported migration technologies plus
@@ -81,49 +87,89 @@ func (p *Provisioning) RefreshInterval() time.Duration {
 	return defaultRefreshMin + time.Duration(rand.Float64()*float64(defaultRefreshMax-defaultRefreshMin))
 }
 
-// fetchProvisioning GETs reqURL and decodes the JSON response. Redirects
-// (the spec's 307-to-another-server rule) are followed by the client's
-// default policy; 403/404 get a specific error since the spec assigns
-// them a meaning (the server doesn't recognize the request's source
-// address as one of its subscribers).
-func fetchProvisioning(ctx context.Context, client *http.Client, reqURL string) (*Provisioning, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("hb46pp: building request: %w", err)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("hb46pp: provisioning request: %w", err)
-	}
-	defer resp.Body.Close()
+// fetchProvisioning GETs reqURL and decodes the JSON response, following
+// only the spec's 307-to-another-server rule (§3.3) -- newHTTPClient
+// disables http.Client's own broader redirect-following (which also
+// treats 301/302/303/308 as redirects, a meaning this protocol doesn't
+// define) via CheckRedirect, so this loop is the only redirect handling
+// that happens. requireHTTPS, when true (the discovery TXT record's
+// t=b), rejects a redirect target that isn't https -- a certificate-
+// validated connection method shouldn't silently downgrade partway
+// through. 403/404 get a specific error since the spec assigns them a
+// meaning (the server doesn't recognize the request's source address as
+// one of its subscribers).
+func fetchProvisioning(ctx context.Context, client *http.Client, reqURL string, requireHTTPS bool) (*Provisioning, error) {
+	for range maxRedirects + 1 {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("hb46pp: building request: %w", err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("hb46pp: provisioning request: %w", err)
+		}
 
-	switch resp.StatusCode {
-	case http.StatusOK:
-	case http.StatusForbidden, http.StatusNotFound:
-		return nil, fmt.Errorf("hb46pp: provisioning server returned %s (it does not recognize this source address as a subscriber)", resp.Status)
-	default:
-		return nil, fmt.Errorf("hb46pp: provisioning server returned %s", resp.Status)
-	}
+		if resp.StatusCode == http.StatusTemporaryRedirect {
+			next, err := resp.Location()
+			resp.Body.Close()
+			if err != nil {
+				return nil, fmt.Errorf("hb46pp: 307 response has no usable Location: %w", err)
+			}
+			if requireHTTPS && next.Scheme != "https" {
+				return nil, fmt.Errorf("hb46pp: 307 redirected from a validated https server to a %s url, refusing", next.Scheme)
+			}
+			reqURL = next.String()
+			continue
+		}
 
-	return decodeProvisioning(io.LimitReader(resp.Body, maxResponseBytes))
+		switch resp.StatusCode {
+		case http.StatusOK:
+			defer resp.Body.Close()
+			body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
+			if err != nil {
+				return nil, fmt.Errorf("hb46pp: reading provisioning response: %w", err)
+			}
+			if len(body) > maxResponseBytes {
+				return nil, fmt.Errorf("hb46pp: provisioning response exceeds %d bytes", maxResponseBytes)
+			}
+			return decodeProvisioning(bytes.NewReader(body))
+		case http.StatusForbidden, http.StatusNotFound:
+			resp.Body.Close()
+			return nil, fmt.Errorf("hb46pp: provisioning server returned %s (it does not recognize this source address as a subscriber)", resp.Status)
+		default:
+			resp.Body.Close()
+			return nil, fmt.Errorf("hb46pp: provisioning server returned %s", resp.Status)
+		}
+	}
+	return nil, fmt.Errorf("hb46pp: too many 307 redirects (>%d)", maxRedirects)
 }
 
 // decodeProvisioning decodes and validates one provisioning response
-// body: the spec-required fields (enabler_name, service_name, order)
-// must be present, and the auth field, if present, must not report an
-// authentication failure.
+// body: enabler_name and order (spec §3.4) must be present, and the auth
+// field, if present, must not report an authentication failure.
+// service_name is not required here even though the spec doesn't mark it
+// option -- the same section says non-NGN services must omit it,
+// so it's only unconditionally present for NGN deployments. order: []
+// (a non-nil, empty slice -- json.Unmarshal distinguishes this from the
+// field being absent, which leaves Order nil) is spec-valid too: it's
+// how a server says no migration technology is available for this
+// client, not a malformed response. Any non-whitespace data after the
+// JSON object is rejected, so a technically-oversized response can't
+// masquerade as a smaller, well-formed one just because its first
+// maxResponseBytes happen to contain a complete, valid object.
 func decodeProvisioning(r io.Reader) (*Provisioning, error) {
+	dec := json.NewDecoder(r)
 	var p Provisioning
-	if err := json.NewDecoder(r).Decode(&p); err != nil {
+	if err := dec.Decode(&p); err != nil {
 		return nil, fmt.Errorf("hb46pp: decoding provisioning response: %w", err)
+	}
+	if err := dec.Decode(new(struct{})); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("hb46pp: provisioning response has trailing data after the JSON object")
 	}
 	if p.EnablerName == "" {
 		return nil, fmt.Errorf("hb46pp: provisioning response is missing enabler_name")
 	}
-	if p.ServiceName == "" {
-		return nil, fmt.Errorf("hb46pp: provisioning response is missing service_name")
-	}
-	if len(p.Order) == 0 {
+	if p.Order == nil {
 		return nil, fmt.Errorf("hb46pp: provisioning response is missing order")
 	}
 	if p.Auth == "bad" {
