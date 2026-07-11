@@ -63,8 +63,9 @@ AFTR_TUN=dslite0
 # resolved (also by that dnsmasq) to CORE_AFTR_ADDR.
 AFTR_FQDN=aftr.dslite.example.com
 
-# DHCPv6-PD (RFC 3633) pool served by Kea in mm-isp, on the same WAN link.
-# Kea's pd-pools is set to prefix-len == delegated-len (56 == 56): the whole
+# DHCPv6-PD (RFC 3633) pool served by Kea in mm-isp, on the same WAN link --
+# used when MM_WAN_MODEL=dhcpv6-pd (the default; see setup.sh). Kea's
+# pd-pools is set to prefix-len == delegated-len (56 == 56): the whole
 # pool *is* the one delegation this single-CPE rig ever hands out, so which
 # /56 mm-cpe receives is fully deterministic across runs (Kea's lease db is
 # in-memory/non-persistent, so a fresh setup.sh always starts from the same
@@ -102,6 +103,26 @@ HB46PP_WWWDIR="$RUNDIR/hb46pp-www"
 HB46PP_HTTP_PIDFILE="$RUNDIR/hb46pp-http.pid"
 HB46PP_HTTP_LOG="$RUNDIR/hb46pp-http.log"
 AFTR_DISCOVERY_MODE_FILE="$RUNDIR/aftr-discovery-mode"
+
+# WAN IPv6 provisioning model minuteman is started with -- orthogonal to
+# AFTR_DISCOVERY_MODE_FILE above (that selects how the *AFTR* is found; this
+# selects how the *LAN gets IPv6 reachability*). "dhcpv6-pd" (the default)
+# is the PD_POOL_PREFIX scenario above; "ndproxy" instead omits Kea's
+# pd-pools entirely and starts minuteman with -ndproxy, which learns
+# WAN_PREFIX itself via SLAAC (dnsmasq's RA on $VETH_ISP_CPE already
+# provides this regardless of mode) and extends it onto $VETH_CPE_HOST via
+# RFC 4389 proxying instead. setup.sh records the mode here so run-cpe.sh
+# and smoketest.sh start minuteman with the matching flag.
+WAN_MODEL_FILE="$RUNDIR/wan-model"
+
+# Whether minuteman is started with -dns-proxy -- a third, independent
+# toggle (orthogonal to both AFTR_DISCOVERY_MODE_FILE and WAN_MODEL_FILE):
+# it needs only a DNS server address, which mm-isp's Kea always hands out
+# via dns-servers option-data regardless of the other two axes. Off by
+# default (MM_DNS_PROXY unset or "0") so the common case stays exactly as
+# before; setup.sh records the choice here so run-cpe.sh/smoketest.sh add
+# -dns-proxy to the minuteman invocation only when asked.
+DNS_PROXY_ENABLED_FILE="$RUNDIR/dns-proxy-enabled"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MINUTEMAN_BIN="$REPO_ROOT/bin/minuteman"

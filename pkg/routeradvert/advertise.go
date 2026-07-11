@@ -42,10 +42,23 @@ const tentativeRetryInterval = 1 * time.Second
 // everything else (timing, flags, hop limits) follows RFC 4861's
 // recommended defaults.
 type Config struct {
-	// Prefix is advertised in a Prefix Information Option with both the
-	// On-Link and Autonomous flags set (RFC 4861 §4.6.2), so LAN clients
-	// both route through this router for it and SLAAC an address from it.
-	Prefix                           netip.Prefix
+	// Prefix is advertised in a Prefix Information Option with the
+	// Autonomous flag always set (RFC 4861 §4.6.2), so LAN clients SLAAC
+	// an address out of it.
+	Prefix netip.Prefix
+
+	// OnLink sets the Prefix Information Option's L flag. True (the
+	// DHCPv6-PD model's own distinct delegated /64: see
+	// internal/lanprefix) tells LAN clients the whole prefix is directly
+	// reachable, so they only route through this router for destinations
+	// outside it. False (the NDProxy model's shared WAN /64: see
+	// internal/wanextend) tells them the opposite -- route everything
+	// through this router regardless of destination -- which is what
+	// makes WAN-side NDProxy's answers the only way LAN-to-LAN and
+	// LAN-to-WAN reachability happens, per RFC 4389 rather than requiring
+	// LAN-side proxying too.
+	OnLink bool
+
 	ValidLifetime, PreferredLifetime time.Duration
 }
 
@@ -124,15 +137,16 @@ func Serve(ctx context.Context, ifaceName string, cfg Config) error {
 }
 
 // buildRA assembles a Router Advertisement carrying cfg's prefix (as a
-// Prefix Information Option, both L and A flags set) and mac (as a Source
-// Link-Layer Address option), with the given RouterLifetime.
+// Prefix Information Option, A flag always set and L set per cfg.OnLink)
+// and mac (as a Source Link-Layer Address option), with the given
+// RouterLifetime.
 func buildRA(cfg Config, lifetime time.Duration, mac net.HardwareAddr) *RouterAdvertisement {
 	return &RouterAdvertisement{
 		RouterLifetime: lifetime,
 		Options: Options{
 			NewPrefixInformation(PrefixInformation{
 				Prefix:            cfg.Prefix,
-				OnLink:            true,
+				OnLink:            cfg.OnLink,
 				Autonomous:        true,
 				ValidLifetime:     cfg.ValidLifetime,
 				PreferredLifetime: cfg.PreferredLifetime,

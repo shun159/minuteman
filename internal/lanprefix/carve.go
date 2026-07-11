@@ -1,6 +1,6 @@
 // Package lanprefix implements the CPE-policy decisions around a
 // DHCPv6-PD delegated prefix: carving one /64 per LAN interface out of it,
-// assigning an address from that /64 to the interface via netlink, and
+// assigning an address from that /64 to the interface via pkg/netlink, and
 // advertising it to LAN clients via Router Advertisements (RAManager) so
 // they can SLAAC an address out of it themselves.
 package lanprefix

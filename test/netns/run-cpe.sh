@@ -14,10 +14,16 @@
 # instead (it's appended after the defaults below, and the later occurrence
 # of a flag wins).
 #
-# -dhcpv6-pd is on by default too: mm-isp's Kea server (see setup.sh) delegates
-# a real DHCPv6-PD prefix, so minuteman acquires it, assigns the carved /64 to
-# -lan, and starts advertising it via Router Advertisements exactly as it
-# would against a real ISP.
+# -dhcpv6-pd or -ndproxy is passed depending on which MM_WAN_MODEL setup.sh
+# was run with (read from WAN_MODEL_FILE, defaulting to dhcpv6-pd if that
+# file is missing -- e.g. an old rig from before this flag existed):
+# dhcpv6-pd acquires a real delegated prefix from mm-isp's Kea server and
+# assigns the carved /64 to -lan; ndproxy instead learns the WAN's own SLAAC
+# /64 and extends it onto -lan via RFC 4389 proxying. Either way Router
+# Advertisements go out -lan exactly as they would against a real ISP.
+#
+# -dns-proxy is additionally passed if setup.sh was run with MM_DNS_PROXY=1
+# (read from DNS_PROXY_ENABLED_FILE).
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -38,9 +44,24 @@ if ! ip netns list | grep -q "^$NETNS_CPE"; then
     exit 1
 fi
 
+wan_model=dhcpv6-pd
+if [[ -f "$WAN_MODEL_FILE" ]]; then
+    wan_model="$(cat "$WAN_MODEL_FILE")"
+fi
+wan_model_flag="-dhcpv6-pd"
+if [[ "$wan_model" == ndproxy ]]; then
+    wan_model_flag="-ndproxy"
+fi
+
+dns_proxy_flags=()
+if [[ -f "$DNS_PROXY_ENABLED_FILE" && "$(cat "$DNS_PROXY_ENABLED_FILE")" == 1 ]]; then
+    dns_proxy_flags=(-dns-proxy)
+fi
+
 exec ip netns exec "$NETNS_CPE" "$MINUTEMAN_BIN" \
     -wan "$VETH_CPE_ISP" \
     -b4 "${WAN_CPE_ADDR%/*}" \
     -lan "$VETH_CPE_HOST=${LAN_CPE_ADDR%/*}" \
-    -dhcpv6-pd \
+    "$wan_model_flag" \
+    "${dns_proxy_flags[@]}" \
     "$@"

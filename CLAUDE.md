@@ -21,23 +21,45 @@ IPv6 Provisioning Protocol", `pkg/hb46pp` — see Architecture below): the fallb
 against both DHCPv6-provisioning and HB46PP-provisioning VNEs with no per-provider configuration. DHCPv6 Prefix Delegation
 (RFC 3633) is also implemented behind `-dhcpv6-pd`: `pkg/dhcpv6` grew a generic stateful exchange (Solicit/
 Request/Renew/Rebind/Release) that `pkg/prefixdelegation` drives to acquire and maintain a delegated prefix,
-and `internal/lanprefix` carves one `/64` per `-lan` interface from it and assigns it via hand-rolled
-netlink (`golang.org/x/sys/unix`, no netlink library or `ip` exec). `internal/lanprefix` also now drives
-Router Advertisements (RFC 4861) out each `-lan` interface via the new `pkg/routeradvert` package, so LAN
-clients can SLAAC an address out of the assigned `/64` themselves — LAN clients get both the DS-Lite IPv4
-path and native IPv6 out of the delegated prefix. `internal/` holds `cliconfig` (CLI flag parsing) and
-`lanprefix` (DHCPv6-PD LAN policy, including RA serving); `pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/
-`pkg/prefixdelegation`/`pkg/routeradvert` are the reusable protocol packages.
+and `internal/lanprefix` carves one `/64` per `-lan` interface from it and assigns it via `pkg/netlink`
+(hand-rolled `golang.org/x/sys/unix` netlink I/O, no netlink library or `ip` exec). `internal/lanprefix`
+also now drives Router Advertisements (RFC 4861) out each `-lan` interface via the `pkg/routeradvert`
+package, so LAN clients can SLAAC an address out of the assigned `/64` themselves — LAN clients get both
+the DS-Lite IPv4 path and native IPv6 out of the delegated prefix.
 
-Not yet implemented: NDProxy (RFC 4389). The current model assumes the ISP supports DHCPv6-PD and
-delegates a prefix distinct from the WAN link's own — real IPv6 routing between WAN and LAN (plain
-kernel forwarding, since `xdp_dslite_encap` passes all non-IPv4 traffic through untouched) is then
-sufficient, no proxying needed. Some ISPs/configurations instead hand out only a single `/64` on the WAN
-link with no PD, and expect the CPE to extend that same `/64` to the LAN via NDProxy (answering Neighbor
-Solicitations on the WAN link on behalf of LAN hosts). Supporting that model would need a new package
-(reusing `pkg/routeradvert/transport.go`'s raw ICMPv6 socket plumbing) plus, unlike RA sending, a new
-piece of state this project hasn't needed before: learning which addresses actually exist on the LAN
-(via NS/NA snooping) so the WAN-side proxy replies only for real hosts.
+NDProxy (RFC 4389) is also implemented, behind `-ndproxy`, for the alternative model some ISPs use instead
+of DHCPv6-PD: a single `/64` handed out on the WAN link itself, with the CPE expected to extend that same
+`/64` onto the LAN rather than being delegated a distinct prefix for it. `pkg/ndproxy` answers Neighbor
+Solicitations arriving on the WAN link on behalf of LAN hosts, but — unlike a passive-snooping proxy —
+only after actively verifying via a Neighbor Solicitation probe on the LAN side that the target host
+genuinely exists right now (`pkg/ndproxy.Serve`'s `proxyState` machine); `internal/wanextend` is the
+policy layer around it: `DiscoverPrefix` learns the WAN's own SLAAC `/64` via `pkg/netlink` and
+`WatchChanges` keeps polling for it changing afterwards (an ISP renumbering the WAN link), re-advertising
+it on every `-lan` interface with the On-Link flag cleared (`routeradvert.Config.OnLink`) so LAN clients
+route everything through the CPE rather than assuming direct link-layer reachability, and
+`HostRoutes` installs/removes a per-target `/128` route via `pkg/netlink` as `pkg/ndproxy.Serve` confirms
+or expires each target, so the kernel's own forwarding decision picks the right `-lan` interface when
+there's more than one. `-ndproxy` and `-dhcpv6-pd` are mutually exclusive (they're alternative WAN IPv6
+provisioning models, not composable).
+
+A DNS proxy (RFC 6333's B4 SHOULD) is also implemented, behind `-dns-proxy`, orthogonal to both of the
+above: `pkg/dnsproxy.Serve` listens on every `-lan` interface's gateway IP (port 53, UDP and TCP) and
+forwards each query verbatim to upstream DNS server(s) — `-dns-server`, or, if that's omitted, the DNS
+servers `resolveAFTR` already learned via the DHCPv6 Information-Request it performs for AFTR discovery
+(`aftrdiscovery.Result.DNSServers`) — relaying the answer back unmodified. The package never parses a DNS
+message at all, just relays bytes, so it's opaque to (and correct regardless of) whatever record types or
+EDNS0 options a query/answer carries. Forwarding goes out as an ordinary native-IPv6 socket call from the
+CPE's own process, so it structurally can't be routed through `xdp_dslite_encap`/`decap` (those only ever
+see LAN-originated IPv4 or WAN-arriving AFTR-tunneled traffic, neither of which this is) — verified live
+against the netns rig (see below) by capturing on the AFTR's own decap interface during a DNS-proxied
+query and confirming zero packets arrive there. `-dns-proxy` requires at least one DNS server from either
+source; `run()` fails fast at startup if none are available (e.g. `-aftr` was given directly, skipping
+DHCPv6 discovery entirely, and no `-dns-server` was given either).
+
+`internal/` holds `cliconfig` (CLI flag parsing), `lanprefix` (DHCPv6-PD LAN policy, including RA
+serving), and `wanextend` (NDProxy LAN policy, including RA serving and host-route management);
+`pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/`pkg/prefixdelegation`/`pkg/routeradvert`/`pkg/ndproxy`/
+`pkg/netlink`/`pkg/dnsproxy` are the reusable protocol packages.
 
 Also not yet implemented: the migration technologies other than DS-Lite that an HB46PP response can
 describe (`map_e`/`map_t`/`lw4o6`/`464xlat`/`ipip`). `pkg/hb46pp` already decodes the response's
@@ -105,6 +127,33 @@ address is published is selectable at setup time via `MM_AFTR_DISCOVERY`:
   real query parameters are accepted and simply unread), exercising `pkg/hb46pp` end-to-end. `setup.sh`
   records the mode in `$RUNDIR/aftr-discovery-mode` so `smoketest.sh` asserts the matching discovery checks.
 
+How the LAN gets IPv6 reachability is a separate, orthogonal choice, selectable via `MM_WAN_MODEL`:
+- `dhcpv6-pd` (default): Kea's `subnet6` includes a `pd-pools` entry delegating `PD_POOL_PREFIX`, and
+  `run-cpe.sh`/`smoketest.sh` start minuteman with `-dhcpv6-pd`, exercising `pkg/prefixdelegation` +
+  `internal/lanprefix` end-to-end (the existing DHCPv6-PD + RA/SLAAC checks below).
+- `ndproxy`: Kea's `subnet6` omits `pd-pools` entirely (this mode's whole premise is an ISP that hands out
+  no distinct delegation), and the scripts start minuteman with `-ndproxy` instead. `mm-isp`'s dnsmasq RA
+  on the WAN link (already running regardless of `MM_WAN_MODEL`, for both AFTR discovery and this) is what
+  minuteman's `internal/wanextend.DiscoverPrefix` learns `WAN_PREFIX` from; `smoketest.sh` then confirms the
+  actual RFC 4389 proxying behavior by having `mm-isp` — L2-adjacent to `mm-cpe`'s WAN link and itself the
+  origin of the on-link `WAN_PREFIX` RA there — ping `mm-host`'s SLAAC'd address directly: that only
+  succeeds if minuteman's `pkg/ndproxy` intercepted the resulting Neighbor Solicitation on the WAN link,
+  actively verified `mm-host` via an LAN-side probe, answered on its behalf, and `internal/wanextend
+  .HostRoutes` installed the resulting host route. `setup.sh` also disables RFC 4941 privacy addresses on
+  `mm-host` (`use_tempaddr=0`) so there's exactly one deterministic SLAAC address for `smoketest.sh` to
+  target this way. `setup.sh` records the mode in `$RUNDIR/wan-model` so `run-cpe.sh`/`smoketest.sh` start
+  minuteman with the matching flag and `smoketest.sh` asserts the matching checks.
+
+A third, independent toggle, `MM_DNS_PROXY` (`0` default or `1`), adds `-dns-proxy` to the minuteman
+invocation (`run-cpe.sh`/`smoketest.sh` read `$RUNDIR/dns-proxy-enabled`, matching the other two toggles'
+own state-file pattern). It needs only a DNS server address, which Kea's `dns-servers` option-data always
+provides regardless of `MM_AFTR_DISCOVERY`/`MM_WAN_MODEL`, so it composes with either. `smoketest.sh` has
+`mm-host` `dig` the AFTR-Name `A`/`AAAA` record — the same one `mm-isp` itself answers directly for the
+AFTR-discovery checks above — through minuteman's LAN gateway IP instead, over both UDP and TCP, and
+checks the answer matches; a live run also confirmed via `tcpdump -i dslite0` on `mm-aftr` that zero
+packets cross the softwire during a DNS-proxied query (see `pkg/dnsproxy`'s own entry in Architecture for
+why that's structurally guaranteed, not just empirically true this once).
+
 `run-cpe.sh` and `smoketest.sh` deliberately omit `-aftr` so minuteman discovers it live against the rig —
 pass `-aftr <addr>` as an extra argument to either script to override with a static address instead.
 
@@ -124,9 +173,13 @@ The AFTR's decap step uses a kernel `ip6tnl` (mode `ipip6`) device, which needs 
 `setup.sh` checks for it up front with a specific diagnostic for the common Arch situation where a kernel
 package upgrade has replaced `/lib/modules/<old-version>/` before a reboot, leaving the currently *running*
 kernel without a matching module directory (`uname -r` disagrees with what's on disk) — reboot to fix that.
-The full smoketest (AFTR discovery, DHCPv6-PD + RA/SLAAC, and the DS-Lite data path end-to-end through
-the AFTR's decap+NAPT44 to the simulated internet and back, ICMP and TCP) has been verified passing from
-a fresh setup in both discovery modes — `dhcpv6` and `hb46pp`.
+The full smoketest (AFTR discovery, LAN IPv6 reachability, and the DS-Lite data path end-to-end through
+the AFTR's decap+NAPT44 to the simulated internet and back, ICMP and TCP) has been verified passing from a
+fresh setup for `MM_AFTR_DISCOVERY=dhcpv6`/`hb46pp` (both against the `dhcpv6-pd` WAN model), for
+`MM_WAN_MODEL=dhcpv6-pd`/`ndproxy` (both against `dhcpv6` AFTR discovery), and for `MM_DNS_PROXY=1` (against
+`dhcpv6`/`dhcpv6-pd`, UDP and TCP both); the `hb46pp`×`ndproxy`×`MM_DNS_PROXY=1` corners haven't
+specifically been re-run since, though all three axes are independent code paths (AFTR discovery, LAN IPv6
+provisioning, and DNS forwarding) with no shared state.
 
 ## Code style
 
@@ -266,7 +319,7 @@ a fresh setup in both discovery modes — `dhcpv6` and `hb46pp`.
   (§4.6.1); Marshal-only, since this package never needs to decode an RA or an RS's body, only detect that
   an RS arrived (`isRouterSolicitation`). `transport.go`'s `Conn` hand-rolls a raw `AF_INET6`/`SOCK_RAW`/
   `IPPROTO_ICMPV6` socket (`golang.org/x/sys/unix`, no `golang.org/x/net/icmp` — same no-external-library
-  philosophy as `internal/lanprefix`'s netlink code), joining the All-Routers multicast group so it
+  philosophy as `pkg/netlink`), joining the All-Routers multicast group so it
   actually receives Router Solicitations, setting both hop limits to 255 (RFC 4861 §6.1.2's anti-spoofing
   requirement), and installing an `ICMP6_FILTER` so its read loop only wakes for Router Solicitation
   traffic (`ICMP6_FILTER`'s sockopt-name constant isn't exported by `x/sys/unix` on Linux, so it's vendored
@@ -281,14 +334,83 @@ a fresh setup in both discovery modes — `dhcpv6` and `hb46pp`.
   `Serve` starts) and used to kill the RA worker for good, leaving LAN clients with no SLAAC.
   `SolicitRouters` (`solicit.go`) shares this same retry (`sendRetryingTentative`) for exactly the same
   reason — it's fired right after `AttachWAN`'s own forwarding-flip, which can itself still have the WAN
-  link's address tentative.
+  link's address tentative. `Config.OnLink` sets the Prefix Information Option's L flag: true for
+  `internal/lanprefix`'s DHCPv6-PD model (the advertised `/64` really is distinct and on-link for that LAN
+  interface), false for `internal/wanextend`'s NDProxy model (the `/64` is shared with the WAN, so LAN
+  clients must route everything — not just off-prefix traffic — through the CPE, which is what makes
+  WAN-side NDProxy's answers the only way reachability happens rather than needing LAN-side proxying too).
+- **`pkg/ndproxy/`** — RFC 4389 (Neighbor Discovery Proxy) logic: answering Neighbor Solicitations on a WAN
+  link on behalf of LAN hosts, for the ISP model where the WAN's own `/64` is extended onto the LAN instead
+  of a distinct prefix being delegated (see `internal/wanextend`). Rather than passively snooping LAN
+  NS/NA traffic to learn which addresses exist (which would need `ALLMULTI` on every LAN interface and
+  trust stale state), it actively verifies: a WAN-side NS for an unknown target triggers an NS probe on the
+  LAN side, and only a real NA reply makes the proxy answer upstream — the same shape ndppd's "auto" mode
+  uses. `message.go` is the NS/NA wire codec (marshal-only for the proxy's own probes/replies, parse-only
+  for `Target Address` extraction — options are never decoded, since the proxy never needs a peer's
+  link-layer address). `conn.go` is the LAN-side raw `IPPROTO_ICMPV6` socket (filtered to one message type
+  via `ICMP6_FILTER`, vendored the same way `pkg/routeradvert` vendors it), sending probes and receiving
+  replies; `packet.go` is the WAN-side receiver, which can't use a raw ICMPv6 socket at all — a Neighbor
+  Solicitation is sent to the target's Solicited-Node multicast group, a different group per target
+  address, and the kernel drops multicast for groups never joined before a raw socket ever sees it — so it
+  uses a cooked `AF_PACKET` socket instead (matching ndppd's own approach) with `ALLMULTI` plus a
+  classic-BPF filter (`nsFilter`) so only Neighbor Solicitations ever reach userspace. `state.go`'s
+  `proxyState` is the pure decision logic (no I/O, an explicit `now time.Time` on every method instead of
+  reading the clock, so it's tested without real sockets or timers): which targets are mid-probe, which are
+  confirmed active (with a CPE-local `activeTTL`, not RFC-mandated, bounding how long a confirmation is
+  trusted before re-probing), and what `sweep()`'s periodic tick should retransmit, give up on, or expire.
+  `serve.go`'s `Serve(ctx, wanIface, lanIfaces, Config)` wires `conn`/`packetConn`/`proxyState` into a
+  running proxy — one `select` loop over the WAN NS channel, a fanned-in LAN NA channel (tagged with
+  source interface, since `conn` itself doesn't know its own name), and the sweep ticker. `Config.OnActive`/
+  `OnInactive` fire on activation/expiry so a caller can install/remove a host route (`internal/wanextend`
+  does); every channel send in this package is non-blocking/drop-on-full (`select`+`default`, matching
+  `packetConn.readSolicitations`'s original rationale: NDP retransmits, so a dropped message only delays
+  resolution, and a blocking send here would otherwise leak a goroutine past `Serve` returning). Deliberate
+  non-goals vs. full RFC 4389 (documented on the package itself): no cross-link DAD proxying, no
+  RA/Redirect proxying (the caller re-advertises the WAN prefix on the LAN with On-Link cleared instead),
+  no proxy-loop detection.
+- **`pkg/netlink/`** — minimal, hand-rolled `AF_NETLINK`/`NETLINK_ROUTE` client (`golang.org/x/sys/unix`,
+  no netlink library, matching `pkg/datapath/sysctl.go`'s `sysctl`-exec-avoidance the same way): the only
+  package that builds/parses netlink wire messages, used by both `internal/lanprefix` (address assignment)
+  and `internal/wanextend` (WAN-prefix discovery, host routes) — split out from `internal/lanprefix`'s
+  original private implementation once `internal/wanextend` needed the same mechanism. `message.go` builds
+  `RTM_NEWADDR`/`RTM_DELADDR`/`RTM_GETADDR`/`RTM_NEWROUTE`/`RTM_DELROUTE` requests and parses responses —
+  `walkMessages` splits a single `Recvfrom` buffer into individual messages (a dump response packs several
+  together), `parseIfAddrMsg` decodes an `RTM_NEWADDR` dump entry's `IFA_ADDRESS`/`IFA_LOCAL` attributes,
+  filtering to global scope (`RT_SCOPE_UNIVERSE`) since WAN-prefix discovery has no use for the WAN's own
+  link-local address. `socket.go`'s `Socket` is the actual send/receive I/O: `AddAddr`/`DelAddr` (`NLM_F_
+  REPLACE` makes `AddAddr` idempotent), `Addrs` (an `RTM_GETADDR` dump, looping `Recvfrom` until
+  `NLMSG_DONE`), `AddRoute`/`DelRoute` (a directly-attached route — `RTA_OIF` only, no `RTA_GATEWAY`, scope
+  `RT_SCOPE_LINK` — matching `ip route add <dst> dev <iface>`; `AddRoute` is `NLM_F_REPLACE`-idempotent
+  too).
+- **`pkg/dnsproxy/`** — the DNS proxy RFC 6333 recommends a DS-Lite B4 run (the B4 SHOULD act as a DNS
+  proxy for LAN clients): opaque byte-relay only, no DNS message parsing, caching, or rewriting of any
+  kind, so it's simple enough to have no unit tests of its own (like `pkg/ndproxy`/`pkg/routeradvert`'s raw
+  socket I/O, correctness here is exercised by `test/netns`, not `go test`). `serve.go`'s
+  `Serve(ctx, Config)` opens a UDP `net.ListenUDP` and TCP `net.ListenTCP` socket per `Config.ListenAddrs`
+  (port 53), closing every socket on `ctx.Done()` to unblock `serveUDP`/`serveTCP`'s read loops — the same
+  close-to-unblock shutdown pattern `pkg/ndproxy`'s `conn`/`packetConn` use. `udp.go`'s `serveUDP` spawns
+  one goroutine per received datagram (so one slow upstream never blocks the next query), trying
+  `Config.Upstreams` in order over a fresh one-shot `net.DialUDP` socket per query (deliberately not
+  pooled: a dedicated socket means a response can never be confused with a different concurrent query's,
+  and DNS-over-UDP is a single round trip anyway) bounded by `udpQueryTimeout`; every upstream failing just
+  drops the query, relying on the client's own resolver to retry, same as if this proxy weren't in the
+  path. `tcp.go`'s `relayTCP` is a full bidirectional byte-level `io.Copy` relay per accepted connection
+  rather than framing individual length-prefixed DNS-over-TCP messages — RFC 7766 §6.2.1 allows pipelining
+  multiple queries on one connection, which a byte relay handles for free without this package ever
+  needing to parse a message boundary.
 - **`cmd/minuteman/main.go`** — thin CLI entrypoint. Flags: `-wan`, `-b4`, `-aftr` (optional — see below),
   repeatable `-lan iface=gatewayIP[,mtu]`, `-wan-dst-mac` (fallback only), `-stats-interval`, `-dhcpv6-pd`
-  (opt-in prefix delegation), `-hb46pp-vendor-id`/`-hb46pp-product`/`-hb46pp-version` (HB46PP client-identity
-  query parameters — see below; default to the documentation OUI `acde48` since minuteman has no IEEE OUI,
-  overridable since a VNE may key rollout/workaround decisions off them, not just statistics). Flag-value
-  parsing (`LANSpec`/`LANSpecList`, MAC parsing) lives in `internal/cliconfig`, not in `main.go` itself.
-  `resolveAFTR()` returns `-aftr` parsed directly if given, otherwise blocks on `pkg/aftrdiscovery.Discover`
+  (opt-in prefix delegation), `-ndproxy` (opt-in RFC 4389 proxying, mutually exclusive with `-dhcpv6-pd` —
+  validated in `run()` before anything else happens), `-dns-proxy` (opt-in DNS proxy, orthogonal to both
+  IPv6-provisioning flags) with repeatable `-dns-server` to override its upstreams,
+  `-hb46pp-vendor-id`/`-hb46pp-product`/`-hb46pp-version`
+  (HB46PP client-identity query parameters — see below; default to the documentation OUI `acde48` since
+  minuteman has no IEEE OUI, overridable since a VNE may key rollout/workaround decisions off them, not just
+  statistics). Flag-value
+  parsing (`LANSpec`/`LANSpecList`, `AddrList`, MAC parsing) lives in `internal/cliconfig`, not in `main.go` itself.
+  `resolveAFTR()` returns `-aftr` parsed directly if given (in which case its second return, the DNS
+  servers `-dns-proxy` defaults to using, is nil — that path skips the DHCPv6 exchange entirely), otherwise
+  blocks on `pkg/aftrdiscovery.Discover`
   using the same lifecycle context as `SIGINT`/`SIGTERM` handling (no artificial timeout — indefinite
   RFC 3315 retry is correct here, since there's no working DS-Lite path without an AFTR anyway). On
   `aftrdiscovery.ErrNoAFTRName` it falls back to `hb46pp.Discover` (capability `dslite` only, DNS servers
@@ -302,41 +424,81 @@ a fresh setup in both discovery modes — `dhcpv6` and `hb46pp`.
   `-lan` interface, also tracked on the same `sync.WaitGroup`), then starts `pkg/prefixdelegation.Maintain`
   in a background goroutine (tracked on that `sync.WaitGroup` that `run()` waits on before returning, so a
   shutdown's best-effort `Release` and every RA worker's best-effort final advertisement all get a chance
-  to finish) with that same `Reconcile`+`RAManager.Sync` pair as its `onLeaseChange` callback. Otherwise
-  `main.go` just orchestrates
+  to finish) with that same `Reconcile`+`RAManager.Sync` pair as its `onLeaseChange` callback. When
+  `-ndproxy` is set instead, `runNDProxy()` is a thin wrapper that hands the `-lan` interface names straight
+  to `internal/wanextend.Serve`, which owns the whole flow itself (see that package's own entry below) and
+  registers every goroutine it starts on the same `sync.WaitGroup` as the `-dhcpv6-pd` path, for the same
+  shutdown-draining reason. If `-dns-proxy` is set, `runDNSProxy()` starts `pkg/dnsproxy.Serve` listening on
+  every `-lan` interface's gateway IP, forwarding to `-dns-server` if any were given or else the DNS servers
+  `resolveAFTR()` returned; `run()` fails fast before any of this if `-dns-proxy` is set but no DNS servers
+  are available from either source. Otherwise `main.go` just orchestrates
   `pkg/datapath.Loader` calls (`Load`/`AttachWAN`/`SetB4Config`/`AttachLAN`+`SetLANConfig` per `-lan`/`Stats`
   on a timer) — it never touches `cilium/ebpf` or BPF map layouts directly.
 - **`internal/cliconfig`** — parses `minuteman`'s flag values (`LANSpec`, `ParseLANSpec`, `LANSpecList`
-  implementing `flag.Value`, `ParseMAC`) into typed values for `main.go` to hand to `pkg/datapath`. Thin
+  implementing `flag.Value`, `AddrList` implementing `flag.Value` for a repeatable plain IP-address flag
+  like `-dns-server`, `ParseMAC`) into typed values for `main.go` to hand to `pkg/datapath`. Thin
   CLI-flag glue only, not a home for protocol logic (that's `pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/
   `pkg/prefixdelegation`).
 - **`internal/lanprefix`** — the DHCPv6-PD *policy* layer: what to do with a delegated prefix, as opposed to
   the protocol client itself (`pkg/prefixdelegation`). `carve.go`'s `SubnetFor(delegated, index)`/
   `AssignedAddress(subnet)` are pure functions (bit manipulation on a `netip.Prefix`'s first 8 bytes, no
   I/O) that carve one `/64` per `-lan` interface's position in the flag list out of the delegated prefix and
-  pick its `::1` address. `netlinkmsg.go` builds/parses raw `RTM_NEWADDR`/`RTM_DELADDR` netlink request and
-  `NLMSG_ERROR` ack bytes using `golang.org/x/sys/unix`'s existing wire-layout structs (`NlMsghdr`,
-  `IfAddrmsg`, `RtAttr`) — no netlink/rtnetlink *library* dependency, matching this project's no-sidecar,
-  no-external-process ethos (`pkg/datapath/sysctl.go` avoids `sysctl`/`ip` exec the same way). `netlink.go`
-  is the actual `AF_NETLINK`/`NETLINK_ROUTE` socket I/O; `NLM_F_REPLACE` on `addAddr` makes re-asserting an
-  unchanged address idempotent, matching `pkg/datapath`'s "safe to call repeatedly" configuration setters.
-  `reconcile.go`'s `Reconcile()` ties it together per LAN interface, removing a stale address first if a
-  renewal changed which `/64` it should have, and also returns each interface's `ValidLifetime`/
-  `PreferredLifetime` (taken from the delegated prefix, not derived) on the resulting `Assignment` for
-  `ra.go` to consume. `ra.go`'s `RAManager` drives one `pkg/routeradvert.Serve` goroutine per LAN interface
-  from those `Assignment`s: `Sync()` always restarts a LAN interface's worker on every call (not just when
-  its `Subnet` changes), since a Renew resets the lifetimes even when the subnet itself doesn't change and
-  a long-running `Serve` goroutine has no other way to pick that up — restarting is cheap, unlike
-  `Reconcile`'s netlink unchanged-skip optimization, which exists to avoid transient route churn that
-  restarting an RA sender doesn't have an equivalent of.
+  pick its `::1` address. `reconcile.go`'s `Reconcile()` opens a `pkg/netlink.Socket` and ties it together
+  per LAN interface, removing a stale address first (`DelAddr`) if a renewal changed which `/64` it should
+  have, then assigning the new one (`AddAddr`, `NLM_F_REPLACE`-idempotent) — skipping both calls entirely
+  when the subnet is unchanged since the last `Reconcile`, to avoid transient route churn — and also returns
+  each interface's `ValidLifetime`/`PreferredLifetime` (taken from the delegated prefix, not derived) on the
+  resulting `Assignment` for `ra.go` to consume. `ra.go`'s `RAManager` drives one `pkg/routeradvert.Serve`
+  goroutine per LAN interface from those `Assignment`s (`OnLink: true`, since a PD delegation really is
+  distinct per LAN interface): `Sync()` always restarts a LAN interface's worker on every call (not just
+  when its `Subnet` changes), since a Renew resets the lifetimes even when the subnet itself doesn't change
+  and a long-running `Serve` goroutine has no other way to pick that up — restarting is cheap, unlike
+  `Reconcile`'s netlink unchanged-skip optimization above, which exists to avoid churn restarting an RA
+  sender doesn't have an equivalent of.
+- **`internal/wanextend`** — the NDProxy *policy* layer, mirroring `internal/lanprefix`'s split from its
+  protocol client (`pkg/ndproxy`) but for the single-shared-WAN-`/64` model instead of a distinct PD
+  delegation. `discover.go`'s `DiscoverPrefix(ctx, wanIfindex)` blocks, polling `pkg/netlink.Socket.Addrs`
+  every `prefixPollInterval`, until the WAN interface has a global-scope SLAAC address to report (masked to
+  its network) — RA/SLAAC lands asynchronously sometime after `AttachWAN`/`SolicitRouters`, and there's
+  nothing to extend onto the LAN until it does. Unlike `internal/lanprefix`'s delegated prefix,
+  there's no DHCPv6-style T1/T2 renewal ladder to drive here — the kernel just manages its own address
+  lifetimes off whatever RAs happen to arrive — so re-learning is `WatchChanges(ctx, wanIfindex, current,
+  onChange)` instead: it re-polls every `watchPollInterval` (5 minutes, a CPE-local policy choice — WAN
+  renumbering is rare and RFC 4861 mandates no cadence for noticing it) and calls `onChange` only when a
+  reading is a genuine, valid difference from `current`; a transient read error or a momentarily-absent
+  global address (expected mid-renumbering) is not itself reported, so the last-known prefix keeps being
+  advertised until a real replacement is confirmed. That change/no-change decision is `nextWatchState`, split
+  out as a pure function precisely so it's unit-tested without a real clock or netlink socket
+  (`discover_test.go`) — the same rationale `pkg/ndproxy`'s `proxyState` takes an explicit `now` instead of
+  reading the clock. Neither `DiscoverPrefix` nor `WatchChanges` track `IFA_CACHEINFO`'s remaining
+  lifetimes, so `ra.go` re-advertises to the LAN with RFC 4861 §6.2.1's recommended default lifetimes
+  rather than the WAN RA's actual ones — a known simplification. `ra.go`'s `raManager` drives one
+  `pkg/routeradvert.Serve` goroutine per LAN interface, all broadcasting the same prefix (`OnLink: false`)
+  — unlike `internal/lanprefix.RAManager`, which advertises a distinct subnet per interface from an
+  `Assignment` list, NDProxy extends one shared prefix onto every LAN interface uniformly, so `sync()` takes
+  a single `netip.Prefix` rather than a per-interface list; it always restarts every worker on each call,
+  the same "restarting is cheap" reasoning `internal/lanprefix.RAManager.Sync` uses. `hostroutes.go`'s
+  `HostRoutes` wraps a `pkg/netlink.Socket` for the lifetime of one `pkg/ndproxy.Serve` run, matching its
+  `Config.OnActive`/`OnInactive` callback shapes: `Install` adds a `/128` route to a confirmed-active target
+  out its LAN interface (`AddRoute`, so the kernel's own forwarding decision picks the right `-lan`
+  interface when there's more than one — without it, WAN-side proxying alone doesn't tell the kernel which
+  LAN interface to actually forward through); `Remove` (`OnInactive` has no error return, unlike `OnActive`)
+  deletes it best-effort, logging rather than propagating a failure, since a route that outlives its target
+  is stale but harmless and gets overwritten (`NLM_F_REPLACE`) the next time `Install` runs for it.
+  `serve.go`'s `Serve(ctx, wanIface, wanIfindex, lanIfaces, wg)` is the single entry point `cmd/minuteman`
+  calls for `-ndproxy`: blocks on the initial `DiscoverPrefix` (nothing else can usefully start before
+  then, the same rationale `runPrefixDelegation` applies to its own initial `Acquire`), then starts
+  `pkg/ndproxy.Serve`, the initial `raManager.sync`, and a `WatchChanges` goroutine whose `onChange`
+  re-runs `raManager.sync` with the new prefix — every goroutine registered on the caller's `wg`.
 
 When implementing new functionality, follow this split: per-packet fast-path logic goes in
 `bpf/datapath.bpf.c`; anything that needs `cilium/ebpf` or knows about BPF map layouts goes in
 `pkg/datapath`; generic protocol/wire-format code goes in its own `pkg/` package the way
-`pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/`pkg/prefixdelegation`/`pkg/routeradvert` do; CLI-specific
-glue and policy
-decisions belong in `internal/` or `cmd/` (e.g. `internal/lanprefix`'s delegated-prefix-to-LAN-address and
-delegated-prefix-to-RA policy), calling into the `pkg/` packages rather than duplicating their logic.
+`pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/`pkg/prefixdelegation`/`pkg/routeradvert`/`pkg/ndproxy`/
+`pkg/netlink`/`pkg/dnsproxy` do; CLI-specific glue and policy decisions belong in `internal/` or `cmd/` (e.g.
+`internal/lanprefix`'s delegated-prefix-to-LAN-address and delegated-prefix-to-RA policy, or
+`internal/wanextend`'s WAN-prefix-discovery-to-RA and confirmed-target-to-host-route policy), calling into
+the `pkg/` packages rather than duplicating their logic.
 
 ## Design reference: gregw's XDP datapath
 

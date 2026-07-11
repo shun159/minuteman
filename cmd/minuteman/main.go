@@ -7,7 +7,10 @@
 // dslite) when the DHCPv6 Reply carries no AFTR-Name. If -dhcpv6-pd is
 // given, minuteman also requests a delegated IPv6 prefix via DHCPv6-PD
 // (RFC 3633) on the WAN interface and assigns one /64 (carved from it) to
-// each -lan interface.
+// each -lan interface. If -dns-proxy is given, minuteman also runs a DNS
+// proxy (RFC 6333's B4 SHOULD) on every -lan interface's gateway IP,
+// forwarding LAN clients' DNS queries directly over IPv6 instead of
+// through the DS-Lite softwire.
 package main
 
 import (
@@ -26,8 +29,10 @@ import (
 
 	"github.com/shun159/miniteman/internal/cliconfig"
 	"github.com/shun159/miniteman/internal/lanprefix"
+	"github.com/shun159/miniteman/internal/wanextend"
 	"github.com/shun159/miniteman/pkg/aftrdiscovery"
 	"github.com/shun159/miniteman/pkg/datapath"
+	"github.com/shun159/miniteman/pkg/dnsproxy"
 	"github.com/shun159/miniteman/pkg/hb46pp"
 	"github.com/shun159/miniteman/pkg/prefixdelegation"
 	"github.com/shun159/miniteman/pkg/routeradvert"
@@ -71,17 +76,25 @@ func run() error {
 		wanDstMAC      = flag.String("wan-dst-mac", "", "fallback next-hop MAC on the WAN side, used only if FIB lookup can't resolve one")
 		statsEvery     = flag.Duration("stats-interval", 10*time.Second, "how often to log datapath stats (0 disables)")
 		requestPD      = flag.Bool("dhcpv6-pd", false, "request a delegated IPv6 prefix via DHCPv6-PD (RFC 3633) on the WAN interface and assign one /64 per -lan interface from it")
+		ndProxy        = flag.Bool("ndproxy", false, "extend the WAN interface's own SLAAC /64 onto every -lan interface via RFC 4389 Neighbor Discovery Proxy, for ISPs that hand out a single WAN /64 with no DHCPv6-PD delegation (mutually exclusive with -dhcpv6-pd)")
+		dnsProxyOn     = flag.Bool("dns-proxy", false, "run a DNS proxy (RFC 6333's B4 SHOULD) on every -lan interface's gateway IP, port 53/UDP+TCP, forwarding queries directly over IPv6 to -dns-server (or the DHCPv6-learned DNS servers, if -dns-server is omitted) instead of through the DS-Lite softwire")
 		hb46ppVendorID = flag.String("hb46pp-vendor-id", defaultHB46PPVendorID, "HB46PP vendorid query parameter sent during provisioning discovery fallback (vendor OUI, optionally -suffix)")
 		hb46ppProduct  = flag.String("hb46pp-product", defaultHB46PPProduct, "HB46PP product query parameter sent during provisioning discovery fallback")
 		hb46ppVersion  = flag.String("hb46pp-version", defaultHB46PPVersion, "HB46PP version query parameter sent during provisioning discovery fallback (digits/underscores only)")
 		lans           cliconfig.LANSpecList
+		dnsServersFlag cliconfig.AddrList
 	)
 	flag.Var(&lans, "lan", "LAN interface as iface=gatewayIP[,mtu] (repeatable, required at least once)")
+	flag.Var(&dnsServersFlag, "dns-server", "upstream DNS server for -dns-proxy to forward to (repeatable, IPv6 recommended -- see -dns-proxy); defaults to the DNS servers learned via DHCPv6 during AFTR discovery if omitted")
 	flag.Parse()
 
 	if *wanIface == "" || *b4Addr == "" || len(lans) == 0 {
 		flag.Usage()
 		return errors.New("missing required flags: -wan, -b4, and at least one -lan")
+	}
+	if *requestPD && *ndProxy {
+		flag.Usage()
+		return errors.New("-dhcpv6-pd and -ndproxy are mutually exclusive WAN IPv6 provisioning models")
 	}
 
 	b4, err := netip.ParseAddr(*b4Addr)
@@ -97,9 +110,17 @@ func run() error {
 	defer stop()
 
 	identity := hb46ppIdentity{vendorID: *hb46ppVendorID, product: *hb46ppProduct, version: *hb46ppVersion}
-	aftr, err := resolveAFTR(ctx, *aftrAddr, *wanIface, identity)
+	aftr, discoveredDNSServers, err := resolveAFTR(ctx, *aftrAddr, *wanIface, identity)
 	if err != nil {
 		return err
+	}
+
+	dnsServers := discoveredDNSServers
+	if len(dnsServersFlag) > 0 {
+		dnsServers = dnsServersFlag
+	}
+	if *dnsProxyOn && len(dnsServers) == 0 {
+		return errors.New("-dns-proxy needs at least one DNS server: none were learned via DHCPv6 (likely because -aftr was given directly, skipping DHCPv6 discovery) and none were given via -dns-server")
 	}
 
 	dp, err := datapath.Load()
@@ -145,13 +166,21 @@ func run() error {
 		}
 	}
 
-	var pdWG sync.WaitGroup
+	var bgWG sync.WaitGroup
 	if *requestPD {
-		if err := runPrefixDelegation(ctx, *wanIface, lans, &pdWG); err != nil {
+		if err := runPrefixDelegation(ctx, *wanIface, lans, &bgWG); err != nil {
 			return err
 		}
 	}
-	defer pdWG.Wait()
+	if *ndProxy {
+		if err := runNDProxy(ctx, *wanIface, wanIfindex, lans, &bgWG); err != nil {
+			return err
+		}
+	}
+	if *dnsProxyOn {
+		runDNSProxy(ctx, lans, dnsServers, &bgWG)
+	}
+	defer bgWG.Wait()
 
 	logStatsUntilDone(ctx, dp, *statsEvery)
 	return nil
@@ -202,6 +231,46 @@ func runPrefixDelegation(ctx context.Context, wanIface string, lans cliconfig.LA
 	return nil
 }
 
+// runNDProxy delegates the whole -ndproxy CPE policy to
+// internal/wanextend.Serve: learning the WAN interface's own SLAAC /64,
+// re-advertising it on every -lan interface with the On-Link flag cleared
+// (see routeradvert.Config.OnLink's doc) and keeping that advertisement in
+// sync if the WAN prefix later changes, and running pkg/ndproxy.Serve on
+// wanIface to answer WAN-side Neighbor Solicitations for LAN hosts it
+// actively verifies exist. wanextend.Serve registers every goroutine it
+// starts on wg, so run() waits for their shutdown-triggered final RAs and
+// socket cleanup before returning.
+func runNDProxy(ctx context.Context, wanIface string, wanIfindex uint32, lans cliconfig.LANSpecList, wg *sync.WaitGroup) error {
+	lanIfaces := make([]string, len(lans))
+	for i, spec := range lans {
+		lanIfaces[i] = spec.Iface
+	}
+	return wanextend.Serve(ctx, wanIface, int(wanIfindex), lanIfaces, wg)
+}
+
+// runDNSProxy starts pkg/dnsproxy.Serve listening on every -lan interface's
+// gateway IP, forwarding to dnsServers, tracked on wg so run() waits for
+// its sockets to close on shutdown. Unlike runPrefixDelegation/runNDProxy,
+// this can't fail at startup in a way worth surfacing synchronously (the
+// listen addresses are already-validated -lan gateway IPs; a bind failure
+// would mean something else is already using port 53 on one of them, which
+// Serve itself logs), so it doesn't return an error.
+func runDNSProxy(ctx context.Context, lans cliconfig.LANSpecList, dnsServers []netip.Addr, wg *sync.WaitGroup) {
+	listenAddrs := make([]netip.Addr, len(lans))
+	for i, spec := range lans {
+		listenAddrs[i] = spec.GatewayIP
+	}
+
+	log.Printf("DNS proxy: listening on %v, forwarding to %v", listenAddrs, dnsServers)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := dnsproxy.Serve(ctx, dnsproxy.Config{ListenAddrs: listenAddrs, Upstreams: dnsServers}); err != nil {
+			log.Printf("DNS proxy ended unexpectedly: %v", err)
+		}
+	}()
+}
+
 // resolveAFTR returns aftrFlag parsed as an IPv6 address if non-empty,
 // otherwise discovers the AFTR live via DHCPv6 on wanIface (RFC 3736
 // Information-Request + RFC 6334 OPTION_AFTR_NAME, resolved via DNS). If
@@ -212,13 +281,18 @@ func runPrefixDelegation(ctx context.Context, wanIface string, lans cliconfig.LA
 // class. Discovery blocks until it succeeds or ctx is cancelled -- there's
 // no working DS-Lite path without an AFTR address, so waiting (with
 // visible retry behavior) is preferable to an arbitrary timeout.
-func resolveAFTR(ctx context.Context, aftrFlag, wanIface string, identity hb46ppIdentity) (netip.Addr, error) {
+//
+// The second return is the DNS servers learned along the way (RFC 3646
+// OPTION_DNS_SERVERS from the same DHCPv6 Reply), for -dns-proxy to use as
+// its default upstreams -- nil when aftrFlag was given directly, since
+// that path skips the DHCPv6 exchange entirely.
+func resolveAFTR(ctx context.Context, aftrFlag, wanIface string, identity hb46ppIdentity) (netip.Addr, []netip.Addr, error) {
 	if aftrFlag != "" {
 		aftr, err := netip.ParseAddr(aftrFlag)
 		if err != nil {
-			return netip.Addr{}, fmt.Errorf("parsing -aftr: %w", err)
+			return netip.Addr{}, nil, fmt.Errorf("parsing -aftr: %w", err)
 		}
-		return aftr, nil
+		return aftr, nil, nil
 	}
 
 	log.Printf("no -aftr given, discovering AFTR via DHCPv6 on %s", wanIface)
@@ -226,10 +300,10 @@ func resolveAFTR(ctx context.Context, aftrFlag, wanIface string, identity hb46pp
 		result, err := aftrdiscovery.Discover(ctx, wanIface)
 		if err == nil {
 			log.Printf("discovered AFTR %s -> %s (DNS servers: %v)", result.AFTRName, result.AFTRAddr, result.DNSServers)
-			return result.AFTRAddr, nil
+			return result.AFTRAddr, result.DNSServers, nil
 		}
 		if !errors.Is(err, aftrdiscovery.ErrNoAFTRName) {
-			return netip.Addr{}, fmt.Errorf("discovering AFTR: %w", err)
+			return netip.Addr{}, nil, fmt.Errorf("discovering AFTR: %w", err)
 		}
 
 		// result is aftrdiscovery's documented partial result here: the
@@ -237,14 +311,14 @@ func resolveAFTR(ctx context.Context, aftrFlag, wanIface string, identity hb46pp
 		log.Printf("DHCPv6 Reply carried no AFTR-Name, trying HB46PP provisioning (DNS servers: %v)", result.DNSServers)
 		aftr, err := discoverViaHB46PP(ctx, result.DNSServers, identity)
 		if err == nil {
-			return aftr, nil
+			return aftr, result.DNSServers, nil
 		}
 
 		delay := hb46pp.RetryDelay(err)
 		log.Printf("HB46PP provisioning failed: %v (retrying discovery in %v)", err, delay.Round(time.Second))
 		select {
 		case <-ctx.Done():
-			return netip.Addr{}, ctx.Err()
+			return netip.Addr{}, nil, ctx.Err()
 		case <-time.After(delay):
 		}
 	}

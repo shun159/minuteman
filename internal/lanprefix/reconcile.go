@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/netip"
 	"time"
+
+	"github.com/shun159/miniteman/pkg/netlink"
 )
 
 // Assignment records which /64 subnet and address this project has assigned
@@ -40,7 +42,7 @@ type Assignment struct {
 // Reconcile call can retry them) unless opening the netlink socket itself
 // fails.
 func Reconcile(delegated netip.Prefix, validLifetime, preferredLifetime time.Duration, lanIfaces []string, prev []Assignment) ([]Assignment, error) {
-	sock, err := openNetlinkSocket()
+	sock, err := netlink.Open()
 	if err != nil {
 		return nil, err
 	}
@@ -60,7 +62,7 @@ func Reconcile(delegated netip.Prefix, validLifetime, preferredLifetime time.Dur
 	return result, errors.Join(errs...)
 }
 
-func reconcileOne(sock *netlinkSocket, delegated netip.Prefix, validLifetime, preferredLifetime time.Duration, index int, ifaceName string, prev []Assignment) (Assignment, error) {
+func reconcileOne(sock *netlink.Socket, delegated netip.Prefix, validLifetime, preferredLifetime time.Duration, index int, ifaceName string, prev []Assignment) (Assignment, error) {
 	subnet, err := SubnetFor(delegated, index)
 	if err != nil {
 		return Assignment{Iface: ifaceName}, err
@@ -88,12 +90,12 @@ func reconcileOne(sock *netlinkSocket, delegated netip.Prefix, validLifetime, pr
 
 	if index < len(prev) && prev[index].Subnet.IsValid() {
 		old := prev[index]
-		if err := sock.delAddr(iface.Index, old.Address, old.Subnet.Bits()); err != nil {
+		if err := sock.DelAddr(iface.Index, old.Address, old.Subnet.Bits()); err != nil {
 			return a, fmt.Errorf("removing stale address %s: %w", old.Address, err)
 		}
 	}
 
-	if err := sock.addAddr(iface.Index, addr, subnet.Bits()); err != nil {
+	if err := sock.AddAddr(iface.Index, addr, subnet.Bits()); err != nil {
 		return a, fmt.Errorf("assigning address %s: %w", addr, err)
 	}
 	return a, nil

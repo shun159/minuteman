@@ -74,7 +74,12 @@ func (m *RAManager) start(ctx context.Context, a Assignment, wg *sync.WaitGroup)
 		defer wg.Done()
 		defer close(done)
 		err := routeradvert.Serve(workerCtx, a.Iface, routeradvert.Config{
-			Prefix:            a.Subnet,
+			Prefix: a.Subnet,
+			// DHCPv6-PD delegates this /64 distinctly to this LAN
+			// interface, so it really is on-link for it -- unlike
+			// internal/wanextend's NDProxy model, which shares one
+			// prefix across WAN and LAN and must clear this.
+			OnLink:            true,
 			ValidLifetime:     a.ValidLifetime,
 			PreferredLifetime: a.PreferredLifetime,
 		})

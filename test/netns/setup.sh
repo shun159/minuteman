@@ -4,6 +4,8 @@
 #
 # Usage: sudo ./test/netns/setup.sh
 #        sudo MM_AFTR_DISCOVERY=hb46pp ./test/netns/setup.sh
+#        sudo MM_WAN_MODEL=ndproxy ./test/netns/setup.sh
+#        sudo MM_DNS_PROXY=1 ./test/netns/setup.sh
 #
 # MM_AFTR_DISCOVERY selects how mm-isp publishes the AFTR's address:
 #   dhcpv6 (default) -- Kea serves RFC 6334 OPTION_AFTR_NAME over stateless
@@ -15,9 +17,23 @@
 #                       fallback path (DHCPv6 Reply without AFTR-Name ->
 #                       HB46PP).
 #
+# MM_WAN_MODEL selects how the LAN gets IPv6 reachability -- orthogonal to
+# MM_AFTR_DISCOVERY, which only concerns the DS-Lite IPv4 path:
+#   dhcpv6-pd (default) -- Kea delegates PD_POOL_PREFIX via DHCPv6-PD,
+#                          exercising minuteman's pkg/prefixdelegation path.
+#   ndproxy              -- Kea offers no PD; minuteman instead learns
+#                          WAN_PREFIX itself via SLAAC and extends it onto
+#                          the LAN via RFC 4389 proxying, exercising
+#                          pkg/ndproxy/internal/wanextend.
+#
+# MM_DNS_PROXY selects whether minuteman is started with -dns-proxy,
+# independently of both of the above ("0"/unset (default) or "1"):
+# exercises pkg/dnsproxy, forwarding LAN clients' DNS queries to mm-isp's
+# DNS server directly over IPv6 rather than through the DS-Lite softwire.
+#
 # After this completes, run minuteman as the B4 with test/netns/run-cpe.sh,
-# then test end-to-end connectivity with test/netns/smoketest.sh (it reads
-# the mode this script recorded and asserts the matching discovery checks).
+# then test end-to-end connectivity with test/netns/smoketest.sh (both read
+# the modes this script recorded and act/assert accordingly).
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -33,6 +49,24 @@ case "$AFTR_DISCOVERY" in
 dhcpv6 | hb46pp) ;;
 *)
     echo "error: MM_AFTR_DISCOVERY must be 'dhcpv6' or 'hb46pp' (got '$AFTR_DISCOVERY')" >&2
+    exit 1
+    ;;
+esac
+
+WAN_MODEL="${MM_WAN_MODEL:-dhcpv6-pd}"
+case "$WAN_MODEL" in
+dhcpv6-pd | ndproxy) ;;
+*)
+    echo "error: MM_WAN_MODEL must be 'dhcpv6-pd' or 'ndproxy' (got '$WAN_MODEL')" >&2
+    exit 1
+    ;;
+esac
+
+DNS_PROXY="${MM_DNS_PROXY:-0}"
+case "$DNS_PROXY" in
+0 | 1) ;;
+*)
+    echo "error: MM_DNS_PROXY must be '0' or '1' (got '$DNS_PROXY')" >&2
     exit 1
     ;;
 esac
@@ -107,6 +141,14 @@ ip link add "$VETH_AFTR_INET" netns "$NETNS_AFTR" type veth peer name "$VETH_INE
 
 echo "== mm-host: LAN client =="
 netns_exec "$NETNS_HOST" ip addr add "$LAN_HOST_ADDR" dev "$VETH_HOST_CPE"
+# Privacy extensions (RFC 4941) off, on both the interface and the
+# namespace-wide default: SLAAC would otherwise also generate a random
+# temporary address alongside the stable EUI-64 one, and smoketest.sh's
+# NDProxy checks need a single, deterministic address to target -- set
+# before the link goes up so no temporary address is ever generated in the
+# first place.
+netns_exec "$NETNS_HOST" sysctl -qw net.ipv6.conf.default.use_tempaddr=0
+netns_exec "$NETNS_HOST" sysctl -qw net.ipv6.conf."$VETH_HOST_CPE".use_tempaddr=0
 netns_exec "$NETNS_HOST" ip link set "$VETH_HOST_CPE" up
 netns_exec "$NETNS_HOST" ip route add default via "${LAN_CPE_ADDR%/*}"
 disable_veth_offloads "$NETNS_HOST" "$VETH_HOST_CPE"
@@ -186,14 +228,18 @@ if netns_exec "$NETNS_ISP" ip -6 addr show dev "$VETH_ISP_CPE" | grep -q tentati
     exit 1
 fi
 
-# Kea DHCPv6 server: answers both Information-Request (RFC 3736 -- DNS
-# servers + RFC 6334 OPTION_AFTR_NAME, dnsmasq's old job, requested via
+# Kea DHCPv6 server: answers Information-Request (RFC 3736 -- DNS servers +
+# RFC 6334 OPTION_AFTR_NAME, dnsmasq's old job, requested via
 # pkg/aftrdiscovery's own OPTION_ORO so no "always-send" config is needed)
-# and DHCPv6-PD (RFC 3633, via pd-pools) on the same link. The pd-pools
-# entry has prefix-len == delegated-len (PD_DELEGATED_BITS): the pool *is*
-# the one delegation this single-CPE rig ever hands out (see common.sh), so
-# with Kea's in-memory/non-persistent lease-database, mm-cpe deterministically
-# gets $PD_POOL_PREFIX every fresh run.
+# on the same link always, and DHCPv6-PD (RFC 3633, via pd-pools) only in
+# dhcpv6-pd mode -- ndproxy mode's whole premise is an ISP that doesn't
+# delegate a distinct prefix, so Kea offers no pd-pools there and minuteman
+# (started with -ndproxy, see run-cpe.sh/smoketest.sh) never requests one.
+# The pd-pools entry, when present, has prefix-len == delegated-len
+# (PD_DELEGATED_BITS): the pool *is* the one delegation this single-CPE rig
+# ever hands out (see common.sh), so with Kea's in-memory/non-persistent
+# lease-database, mm-cpe deterministically gets $PD_POOL_PREFIX every fresh
+# run.
 aftr_name_hex_nocolons="$(encode_dns_name "$AFTR_FQDN" | tr -d ':')"
 pd_pool_addr="${PD_POOL_PREFIX%/*}"
 # In HB46PP mode Kea withholds OPTION_AFTR_NAME (that's the whole point of
@@ -205,6 +251,13 @@ if [[ "$AFTR_DISCOVERY" == dhcpv6 ]]; then
     kea_option_data+=",
       { \"code\": 64, \"space\": \"dhcp6\", \"csv-format\": false, \"data\": \"$aftr_name_hex_nocolons\" }"
 fi
+kea_subnet6="{ \"id\": 1, \"subnet\": \"$WAN_PREFIX\", \"interface\": \"$VETH_ISP_CPE\""
+if [[ "$WAN_MODEL" == dhcpv6-pd ]]; then
+    kea_subnet6+=", \"pd-pools\": [
+          { \"prefix\": \"$pd_pool_addr\", \"prefix-len\": $PD_DELEGATED_BITS, \"delegated-len\": $PD_DELEGATED_BITS }
+        ]"
+fi
+kea_subnet6+=" }"
 cat >"$KEA_CONF" <<EOF
 {
   "Dhcp6": {
@@ -223,14 +276,7 @@ cat >"$KEA_CONF" <<EOF
       $kea_option_data
     ],
     "subnet6": [
-      {
-        "id": 1,
-        "subnet": "$WAN_PREFIX",
-        "interface": "$VETH_ISP_CPE",
-        "pd-pools": [
-          { "prefix": "$pd_pool_addr", "prefix-len": $PD_DELEGATED_BITS, "delegated-len": $PD_DELEGATED_BITS }
-        ]
-      }
+      $kea_subnet6
     ],
     "loggers": [
       {
@@ -285,6 +331,8 @@ EOF
     fi
 fi
 echo "$AFTR_DISCOVERY" >"$AFTR_DISCOVERY_MODE_FILE"
+echo "$WAN_MODEL" >"$WAN_MODEL_FILE"
+echo "$DNS_PROXY" >"$DNS_PROXY_ENABLED_FILE"
 
 echo "== mm-cpe: B4 element (minuteman runs here) =="
 # ip_forward/net.ipv6.conf.all.forwarding=1 (required for bpf_fib_lookup() in
