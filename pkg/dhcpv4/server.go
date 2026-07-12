@@ -4,79 +4,115 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
+	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// Serve runs the DHCPv4 server on every interface in cfgs until ctx is
-// cancelled, at which point every socket is closed and Serve returns nil. A
-// non-nil return means cfgs was empty, an interface's pool config was
-// invalid, or opening a packet socket failed outright -- all startup
-// failures worth surfacing before the datapath is considered up.
-//
-// Each interface gets its own goroutine, packet socket, and lease Pool;
-// there is no shared state between interfaces, so no locking is needed
-// (each Pool is touched only by its own goroutine).
-func Serve(ctx context.Context, cfgs []InterfaceConfig) error {
+// conn is the per-interface socket I/O serveOne needs; packetConn is the
+// production implementation, and tests substitute a fake so serveOne's
+// error handling can be exercised without a raw socket.
+type conn interface {
+	recv() (*Message, error)
+	send(reply *Message, dstIP netip.Addr, dstMAC net.HardwareAddr) error
+	Close() error
+}
+
+type worker struct {
+	cfg  InterfaceConfig
+	pool *Pool
+	conn conn
+}
+
+// Server is a configured, ready-to-run DHCPv4 server: New has already
+// validated every interface's pool and opened its packet socket.
+type Server struct {
+	workers []worker
+}
+
+// New validates every interface's pool and opens its packet socket
+// synchronously, returning any failure — an invalid/non-IPv4 subnet, a
+// missing interface, a socket/bind/filter error — to the caller instead of
+// letting it surface only in a log line from a background goroutine (so a
+// misconfigured -dhcpv4 fails minuteman's startup rather than leaving it
+// running with no DHCP service). On any failure every already-opened socket
+// is closed.
+func New(cfgs []InterfaceConfig) (*Server, error) {
 	if len(cfgs) == 0 {
-		return fmt.Errorf("dhcpv4: no interfaces configured")
+		return nil, fmt.Errorf("dhcpv4: no interfaces configured")
 	}
-
-	type worker struct {
-		cfg  InterfaceConfig
-		pool *Pool
-		conn *packetConn
-	}
-
-	var workers []worker
-	closeAll := func() {
-		for _, w := range workers {
-			w.conn.Close()
-		}
-	}
+	s := &Server{}
 	for _, cfg := range cfgs {
 		pool, err := NewPool(cfg.Subnet, cfg.ServerIP, cfg.LeaseTime)
 		if err != nil {
-			closeAll()
-			return err
+			s.closeAll()
+			return nil, err
 		}
-		conn, err := listenPacket(cfg.Iface, cfg.ServerIP)
+		c, err := listenPacket(cfg.Iface, cfg.ServerIP)
 		if err != nil {
-			closeAll()
-			return err
+			s.closeAll()
+			return nil, err
 		}
-		workers = append(workers, worker{cfg: cfg, pool: pool, conn: conn})
+		s.workers = append(s.workers, worker{cfg: cfg, pool: pool, conn: c})
 	}
+	return s, nil
+}
 
-	var wg sync.WaitGroup
-	for _, w := range workers {
+func (s *Server) closeAll() {
+	for _, w := range s.workers {
+		w.conn.Close()
+	}
+}
+
+// Serve runs each interface's receive/handle/reply loop until ctx is
+// cancelled (returning nil after closing every socket) or one loop hits a
+// runtime read error, which it returns — a single interface's DHCP failing
+// is surfaced, not swallowed. The read errors that closing the sockets on
+// shutdown itself provokes are suppressed via the shuttingDown flag.
+func (s *Server) Serve(ctx context.Context) error {
+	var (
+		wg           sync.WaitGroup
+		shuttingDown atomic.Bool
+		errCh        = make(chan error, len(s.workers))
+	)
+	for _, w := range s.workers {
 		wg.Add(1)
 		go func(w worker) {
 			defer wg.Done()
-			serveOne(w.cfg, w.pool, w.conn)
+			if err := serveOne(w.cfg, w.pool, w.conn); err != nil && !shuttingDown.Load() {
+				errCh <- fmt.Errorf("dhcpv4: %s: %w", w.cfg.Iface, err)
+			}
 		}(w)
 	}
 
-	<-ctx.Done()
-	closeAll() // unblocks every serveOne's recv
+	var runErr error
+	select {
+	case <-ctx.Done():
+	case runErr = <-errCh:
+	}
+	shuttingDown.Store(true)
+	s.closeAll()
 	wg.Wait()
-	return nil
+	return runErr
 }
 
-// serveOne is one interface's receive/handle/reply loop, running until its
-// socket is closed.
-func serveOne(cfg InterfaceConfig, pool *Pool, conn *packetConn) {
+// serveOne is one interface's receive/handle/reply loop. It returns the read
+// error that ends it (Server.Serve decides whether that's a benign shutdown
+// or a failure to report).
+func serveOne(cfg InterfaceConfig, pool *Pool, c conn) error {
 	for {
-		req, err := conn.recv()
+		req, err := c.recv()
 		if err != nil {
-			return // socket closed
+			return err
 		}
 		reply := handle(cfg, pool, req, time.Now())
 		if reply == nil {
 			continue
 		}
 		dstIP, dstMAC := destination(reply)
-		if err := conn.send(reply, dstIP, dstMAC); err != nil {
+		if err := c.send(reply, dstIP, dstMAC); err != nil {
 			log.Printf("dhcpv4: sending %s to %s on %s: %v",
 				replyType(reply), dstIP, cfg.Iface, err)
 		}

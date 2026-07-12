@@ -34,13 +34,11 @@ func TestOfferIsStickyPerClient(t *testing.T) {
 	p := newTestPool(t)
 	now := time.Now()
 	first, _ := p.Offer("client-a", noIP, now)
-	// A different client is offered a different address...
 	other, _ := p.Offer("client-b", noIP, now)
 	if other == first {
 		t.Fatalf("two clients offered the same address %v", first)
 	}
-	// ...and the first client, re-DISCOVERing, gets its original address back.
-	again, _ := p.Offer("client-a", noIP, now.Add(time.Minute))
+	again, _ := p.Offer("client-a", noIP, now.Add(time.Second))
 	if again != first {
 		t.Fatalf("re-Offer = %v, want the original %v", again, first)
 	}
@@ -55,46 +53,79 @@ func TestOfferHonoursFreeRequestedAddress(t *testing.T) {
 	}
 }
 
-func TestCommitFreeAddressSucceeds(t *testing.T) {
-	p := newTestPool(t)
-	want := netip.MustParseAddr("192.168.1.77")
-	ip, ok := p.Commit("client-a", want, time.Now())
-	if !ok || ip != want {
-		t.Fatalf("Commit = %v/%v, want %v/true (post-restart recovery)", ip, ok, want)
-	}
-}
-
-func TestCommitAddressHeldByAnotherClientNAKs(t *testing.T) {
-	p := newTestPool(t)
-	now := time.Now()
-	ip, _ := p.Offer("client-a", noIP, now)
-	if _, ok := p.Commit("client-b", ip, now); ok {
-		t.Fatalf("Commit of client-a's address by client-b: want NAK (ok=false)")
-	}
-}
-
-func TestCommitRejectsReservedAndOutOfSubnet(t *testing.T) {
-	p := newTestPool(t)
-	now := time.Now()
-	for _, bad := range []string{"192.168.1.1", "192.168.1.0", "192.168.1.255", "10.0.0.5"} {
-		if _, ok := p.Commit("c", netip.MustParseAddr(bad), now); ok {
-			t.Errorf("Commit(%s): want NAK (ok=false)", bad)
-		}
-	}
-}
-
-func TestExpiredLeaseIsReclaimed(t *testing.T) {
+func TestOfferedAddressIsReleasedAfterOfferHold(t *testing.T) {
 	p := newTestPool(t)
 	now := time.Now()
 	ip, _ := p.Offer("client-a", noIP, now)
 
-	// Before expiry, another client can't take it.
-	if _, ok := p.Commit("client-b", ip, now.Add(30*time.Minute)); ok {
-		t.Fatal("Commit of an unexpired lease by another client should NAK")
+	// Within the offer hold, the address is reserved: another client is
+	// offered a different one.
+	other, _ := p.Offer("client-b", noIP, now.Add(offerHoldTime/2))
+	if other == ip {
+		t.Fatalf("offered address %v handed to a second client before its offer expired", ip)
 	}
-	// After expiry, it's free for someone else.
-	if _, ok := p.Commit("client-b", ip, now.Add(2*time.Hour)); !ok {
-		t.Fatal("Commit of an expired lease by another client should succeed")
+
+	// After the (short) offer hold, an un-committed offer is reclaimed --
+	// not held for the full lease.
+	if free := p.isFree(ip, "client-c", now.Add(offerHoldTime+time.Second)); !free {
+		t.Fatalf("offer for %v not reclaimed after offerHoldTime (%v)", ip, offerHoldTime)
+	}
+	if offerHoldTime >= p.duration {
+		t.Fatalf("offerHoldTime %v should be much shorter than the lease %v", offerHoldTime, p.duration)
+	}
+}
+
+func TestBindingReflectsOfferThenCommit(t *testing.T) {
+	p := newTestPool(t)
+	now := time.Now()
+	if _, ok := p.Binding("client-a", now); ok {
+		t.Fatal("Binding for an unknown client should be false")
+	}
+	ip, _ := p.Offer("client-a", noIP, now)
+	if b, ok := p.Binding("client-a", now); !ok || b != ip {
+		t.Fatalf("Binding after Offer = %v/%v, want %v/true", b, ok, ip)
+	}
+	// A committed lease outlives the offer hold, an un-committed offer doesn't.
+	p.Commit("client-a", ip, now)
+	if b, ok := p.Binding("client-a", now.Add(offerHoldTime+time.Minute)); !ok || b != ip {
+		t.Fatalf("Binding after Commit = %v/%v, want %v/true well past the offer hold", b, ok, ip)
+	}
+}
+
+func TestCancelOfferReleasesOnlyUncommitted(t *testing.T) {
+	p := newTestPool(t)
+	now := time.Now()
+
+	// An offer can be cancelled (client selected another server).
+	ip, _ := p.Offer("client-a", noIP, now)
+	p.CancelOffer("client-a")
+	if _, ok := p.Binding("client-a", now); ok {
+		t.Fatal("CancelOffer left the offer in place")
+	}
+	if !p.isFree(ip, "client-b", now) {
+		t.Fatal("cancelled offer's address is not free again")
+	}
+
+	// A committed lease must NOT be cancellable this way.
+	ip2, _ := p.Offer("client-c", noIP, now)
+	p.Commit("client-c", ip2, now)
+	p.CancelOffer("client-c")
+	if b, ok := p.Binding("client-c", now); !ok || b != ip2 {
+		t.Fatal("CancelOffer wrongly dropped a committed lease")
+	}
+}
+
+func TestExpiredCommittedLeaseIsReclaimed(t *testing.T) {
+	p := newTestPool(t)
+	now := time.Now()
+	ip, _ := p.Offer("client-a", noIP, now)
+	p.Commit("client-a", ip, now)
+
+	if p.isFree(ip, "client-b", now.Add(30*time.Minute)) {
+		t.Fatal("an unexpired committed lease should not be free for another client")
+	}
+	if !p.isFree(ip, "client-b", now.Add(2*time.Hour)) {
+		t.Fatal("an expired committed lease should be free for another client")
 	}
 }
 
@@ -102,8 +133,9 @@ func TestReleaseFreesAddress(t *testing.T) {
 	p := newTestPool(t)
 	now := time.Now()
 	ip, _ := p.Offer("client-a", noIP, now)
+	p.Commit("client-a", ip, now)
 	p.Release("client-a", ip)
-	if _, ok := p.Commit("client-b", ip, now); !ok {
+	if !p.isFree(ip, "client-b", now) {
 		t.Fatal("released address should be immediately reusable")
 	}
 }
@@ -112,27 +144,48 @@ func TestReleaseIgnoresWrongClient(t *testing.T) {
 	p := newTestPool(t)
 	now := time.Now()
 	ip, _ := p.Offer("client-a", noIP, now)
+	p.Commit("client-a", ip, now)
 	p.Release("client-b", ip) // not client-b's lease -> no-op
-	if _, ok := p.Commit("client-b", ip, now); ok {
+	if p.isFree(ip, "client-b", now) {
 		t.Fatal("a client must not be able to release another client's lease")
 	}
 }
 
-func TestDeclinedAddressIsNeverReoffered(t *testing.T) {
+func TestDeclineOnlyQuarantinesOwnedAddress(t *testing.T) {
+	p := newTestPool(t)
+	now := time.Now()
+	ipA, _ := p.Offer("client-a", noIP, now)
+	p.Commit("client-a", ipA, now)
+
+	// client-b declines an address it doesn't hold (client-a's): must be
+	// ignored -- no quarantine, client-a keeps its lease.
+	p.Decline("client-b", ipA, now)
+	if !p.allocatable(ipA, now) {
+		t.Fatal("a client declining an address it doesn't hold quarantined it anyway (pool poisoning)")
+	}
+	if b, ok := p.Binding("client-a", now); !ok || b != ipA {
+		t.Fatal("an unrelated decline dropped the real owner's lease")
+	}
+
+	// The real owner declining its own address quarantines it.
+	p.Decline("client-a", ipA, now)
+	if p.allocatable(ipA, now) {
+		t.Fatal("a client's decline of its own address did not quarantine it")
+	}
+}
+
+func TestDeclineQuarantineIsTimeBounded(t *testing.T) {
 	p := newTestPool(t)
 	now := time.Now()
 	ip, _ := p.Offer("client-a", noIP, now)
-	p.Decline("client-a", ip)
+	p.Commit("client-a", ip, now)
+	p.Decline("client-a", ip, now)
 
-	// It must not come back, even to the same client, and even much later.
-	for i := range 300 {
-		next, ok := p.Offer("client-a", noIP, now.Add(time.Duration(i)*time.Hour))
-		if !ok {
-			break
-		}
-		if next == ip {
-			t.Fatalf("declined address %v was offered again", ip)
-		}
+	if p.allocatable(ip, now.Add(declineQuarantine/2)) {
+		t.Fatal("declined address became allocatable before the quarantine elapsed")
+	}
+	if !p.allocatable(ip, now.Add(declineQuarantine+time.Second)) {
+		t.Fatal("declined address never returned to the pool (permanent quarantine)")
 	}
 }
 

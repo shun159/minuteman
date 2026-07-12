@@ -59,8 +59,9 @@ DHCPv6 discovery entirely, and no `-dns-server` was given either).
 A DHCPv4 server (RFC 2131/2132) is also implemented, behind `-dhcpv4`, orthogonal to all of the above: it
 hands LAN clients the private IPv4 address the DS-Lite softwire carries (`pkg/dhcpv4`). Each `-lan`
 interface serves its own subnet — taken from the `-lan` value's optional `/prefixlen` (default `/24`) — with
-its gateway IP as the offered router and (by default) DNS server, pointing clients at this CPE, i.e.
-`-dns-proxy`; `-dhcpv4-dns` overrides the DNS offered. The advertised interface MTU (option 26) is the WAN
+its gateway IP as the offered router. The DNS server offered (option 6) is `-dhcpv4-dns` if given, else the
+gateway when `-dns-proxy` is running to answer there, else nothing (rather than pointing clients at a port
+nothing listens on). The advertised interface MTU (option 26) is the WAN
 MTU minus the 40-byte DS-Lite tunnel overhead (or the explicit `-lan` MTU if set), so LAN clients size
 packets to fit the softwire. Getting DHCP to the server needed a *datapath* change: a DHCP DISCOVER/REQUEST
 is sent to the limited-broadcast address, and `xdp_dslite_encap` (attached to the LAN interface, running
@@ -431,18 +432,33 @@ paths (AFTR discovery, LAN IPv6 provisioning, DNS forwarding, LAN IPv4 provision
   needing to parse a message boundary.
 - **`pkg/dhcpv4/`** — the LAN-side DHCPv4 *server* (RFC 2131/2132) minuteman runs behind `-dhcpv4` to hand
   its LAN clients the private IPv4 the DS-Lite softwire carries. Server only, and only the directly-attached
-  single-subnet-per-interface case a home CPE serves (no BOOTP relay/`giaddr` forwarding, no shared
-  networks, no restart persistence — an in-memory pool). Follows the same pure-vs-I/O split as `pkg/ndproxy`:
-  `message.go`/`options.go` are the BOOTP + magic-cookie + option TLV wire codec; `lease.go`'s `Pool` is the
-  address allocator (sticky-per-client offers, lowest-free allocation, expiry, RELEASE/DECLINE), pure with
-  an explicit `now time.Time` like `ndproxy`'s `proxyState`; `handler.go`'s `handle` is the pure DORA +
-  RELEASE/DECLINE/INFORM decision (request → reply message, or nil to stay silent) — all three unit-tested
-  with no sockets. `packet.go` is the raw AF_PACKET I/O (a DHCP server can't use an ordinary UDP socket: it
-  must reply to a client that has no IP/ARP entry yet and honour the broadcast flag), building/parsing
-  IPv4+UDP itself (with checksums) and a classic-BPF filter for UDP dport 67, the same cooked-`SOCK_DGRAM`
-  approach `pkg/ndproxy`'s `packet.go` uses; `server.go`'s `Serve(ctx, []InterfaceConfig)` runs one
-  goroutine + socket + `Pool` per LAN interface. See the `xdp_dslite_encap` `is_non_unicast_dst` bypass
-  above for why the datapath had to change before any of this could receive a packet.
+  single-subnet-per-interface case a home CPE serves (no BOOTP relay — a `giaddr != 0` request is rejected,
+  not mis-answered — no shared networks, no restart persistence: an in-memory pool). Follows the same
+  pure-vs-I/O split as `pkg/ndproxy`: `message.go`/`options.go` are the BOOTP + magic-cookie + option TLV
+  wire codec (`Options.Marshal` splits a value past 255 bytes across repeated option instances per RFC 3396
+  rather than truncating a length byte); `lease.go`'s `Pool` is the address allocator, pure with an explicit
+  `now time.Time` like `ndproxy`'s `proxyState`. The pool distinguishes an *offered* binding (held only for
+  the short `offerHoldTime`, so a DISCOVER that never turns into a REQUEST — a client that chose another
+  server, or a spoofed one — can't tie up an address for the full lease) from a *committed* one (`Offer`
+  vs. `Commit`), quarantines a DHCPDECLINEd address only if the declining client actually held it and only
+  for a bounded `declineQuarantine` (so a client can't poison the pool with addresses it was never leased),
+  and exposes `Binding`/`CancelOffer` so the handler can make RFC-correct decisions. `handler.go`'s `handle`
+  is the pure request→reply (or nil) decision: it distinguishes RFC 2131 §4.3.2's three DHCPREQUEST
+  substates by which of server-id/requested-IP/ciaddr are set, ACKs a REQUEST only for the address this
+  server actually offered or leased the client (a REQUEST from a client it has no record of — including a
+  returning client's INIT-REBOOT after a restart wiped the pool — gets silence, not an ACK of a free
+  address, so independent servers on one segment coexist; the client falls back to DISCOVER), validates the
+  server-id on RELEASE/DECLINE, and leaves `siaddr` zero (it's the next-bootstrap-server field, not the
+  server id). All three files are unit-tested with no sockets. `packet.go` is the raw AF_PACKET I/O (a DHCP
+  server can't use an ordinary UDP socket: it must reply to a client that has no IP/ARP entry yet and honour
+  the broadcast flag), building/parsing IPv4+UDP itself (with checksums) and a classic-BPF filter for UDP
+  dport 67, the same cooked-`SOCK_DGRAM` approach `pkg/ndproxy`'s `packet.go` uses. `server.go`'s
+  `New([]InterfaceConfig)` validates every pool and opens every socket *synchronously* (so a bad subnet or a
+  socket failure fails `cmd/minuteman`'s startup instead of surfacing only in a background log line), and the
+  returned `*Server`'s `Serve(ctx)` runs one goroutine + `Pool` per interface, propagating a worker's runtime
+  read error rather than swallowing it (a fake `conn` makes that testable). See the `xdp_dslite_encap`
+  `is_non_unicast_dst` bypass above for why the datapath had to change before any of this could receive a
+  packet.
 - **`cmd/minuteman/main.go`** — thin CLI entrypoint. Flags: `-wan`, `-b4`, `-aftr` (optional — see below),
   repeatable `-lan iface=gatewayIP[/prefixlen][,mtu]` (the `/prefixlen`, default `/24`, is the DHCPv4
   subnet), `-wan-dst-mac` (fallback only), `-stats-interval`, `-dhcpv6-pd`
@@ -479,10 +495,12 @@ paths (AFTR discovery, LAN IPv6 provisioning, DNS forwarding, LAN IPv4 provision
   every `-lan` interface's gateway IP, forwarding to `-dns-server` if any were given or else the DNS servers
   `resolveAFTR()` returned; `run()` fails fast before any of this if `-dns-proxy` is set but no DNS servers
   are available from either source. If `-dhcpv4` is set, `runDHCPv4()` builds one `pkg/dhcpv4.InterfaceConfig`
-  per `-lan` (subnet from its `/prefixlen`, gateway as router and — unless `-dhcpv4-dns` overrides — DNS,
-  MTU = the `-lan` MTU or else the WAN MTU minus the 40-byte tunnel overhead) and starts `pkg/dhcpv4.Serve`;
-  all these background goroutines are tracked on the same `sync.WaitGroup`. Otherwise `main.go` just
-  orchestrates
+  per `-lan` (subnet from its `/prefixlen`, gateway as router; DNS = `-dhcpv4-dns`, else the gateway when
+  `-dns-proxy` runs, else omitted; MTU = the `-lan` MTU or else the WAN MTU minus the 40-byte tunnel
+  overhead, dropped if below the IPv4 minimum) and constructs the server with `pkg/dhcpv4.New` *synchronously*
+  so a bad subnet or socket failure fails startup, then runs it; `run()` also rejects a `-dhcpv4-lease`
+  shorter than `minDHCPv4Lease`. All these background goroutines are tracked on the same `sync.WaitGroup`.
+  Otherwise `main.go` just orchestrates
   `pkg/datapath.Loader` calls (`Load`/`AttachWAN`/`SetB4Config`/`AttachLAN`+`SetLANConfig` per `-lan`/`Stats`
   on a timer) — it never touches `cilium/ebpf` or BPF map layouts directly.
 - **`internal/cliconfig`** — parses `minuteman`'s flag values (`LANSpec` — now also carrying the optional

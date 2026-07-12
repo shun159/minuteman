@@ -48,6 +48,18 @@ import (
 // softwire without relying on in-path PMTUD.
 const tunnelOverhead = 40
 
+// minDHCPv4Lease is the shortest lease -dhcpv4-lease may set. Below roughly
+// this, the RFC 2131 §4.4.5 renewal timers (T1 = lease/2, T2 = 7/8 lease)
+// stop being distinct whole seconds, and such short leases would hammer the
+// server with renewals regardless; it's a misconfiguration floor, not a
+// protocol constant.
+const minDHCPv4Lease = time.Minute
+
+// dhcpMinMTU is RFC 791's minimum IPv4 MTU (68 bytes) and RFC 2132 §5.1's
+// floor for the Interface MTU option; a computed/configured MTU below it is
+// dropped rather than advertised.
+const dhcpMinMTU = 68
+
 // Default HB46PP client identity sent as provisioning query parameters,
 // overridable via -hb46pp-vendor-id/-hb46pp-product/-hb46pp-version.
 // "acde48" is the AC-DE-48 OUI conventionally used in documentation and
@@ -99,7 +111,7 @@ func run() error {
 	)
 	flag.Var(&lans, "lan", "LAN interface as iface=gatewayIP[/prefixlen][,mtu] (repeatable, required at least once)")
 	flag.Var(&dnsServersFlag, "dns-server", "upstream DNS server for -dns-proxy to forward to (repeatable, IPv6 recommended -- see -dns-proxy); defaults to the DNS servers learned via DHCPv6 during AFTR discovery if omitted")
-	flag.Var(&dhcpv4DNSFlag, "dhcpv4-dns", "IPv4 DNS server to advertise to DHCPv4 clients (repeatable, with -dhcpv4); defaults to each -lan interface's own gateway IP (i.e. this CPE, pointing clients at -dns-proxy)")
+	flag.Var(&dhcpv4DNSFlag, "dhcpv4-dns", "IPv4 DNS server to advertise to DHCPv4 clients (repeatable, with -dhcpv4); if unset, the -lan gateway IP is advertised when -dns-proxy is running to answer there, otherwise no DNS is advertised")
 	flag.Parse()
 
 	if *wanIface == "" || *b4Addr == "" || len(lans) == 0 {
@@ -140,6 +152,9 @@ func run() error {
 		if !a.Is4() {
 			return fmt.Errorf("-dhcpv4-dns %s must be an IPv4 address (DHCPv4 option 6 carries only IPv4 DNS servers)", a)
 		}
+	}
+	if *dhcpv4On && *dhcpv4Lease < minDHCPv4Lease {
+		return fmt.Errorf("-dhcpv4-lease must be at least %v (shorter leases don't yield valid T1/T2 renewal timers)", minDHCPv4Lease)
 	}
 
 	dp, err := datapath.Load()
@@ -200,7 +215,7 @@ func run() error {
 		runDNSProxy(ctx, lans, dnsServers, &bgWG)
 	}
 	if *dhcpv4On {
-		if err := runDHCPv4(ctx, lans, dhcpv4DNSFlag, wanNetIface.MTU, *dhcpv4Lease, &bgWG); err != nil {
+		if err := runDHCPv4(ctx, lans, dhcpv4DNSFlag, *dnsProxyOn, wanNetIface.MTU, *dhcpv4Lease, &bgWG); err != nil {
 			return err
 		}
 	}
@@ -295,29 +310,43 @@ func runDNSProxy(ctx context.Context, lans cliconfig.LANSpecList, dnsServers []n
 	}()
 }
 
-// runDHCPv4 builds a pkg/dhcpv4.InterfaceConfig for every -lan interface and
-// starts the DHCPv4 server, tracked on wg. Each interface serves its own
-// subnet (from -lan's /prefixlen), offers its gateway IP as router and (by
-// default) DNS -- pointing clients at the CPE, i.e. -dns-proxy -- and
-// advertises an interface MTU sized for the DS-Lite softwire: the -lan MTU
-// if set, else the WAN MTU minus the 40-byte tunnel overhead. A -lan without
-// an IPv4 subnet (an IPv6-only gateway) is a fatal misconfiguration under
-// -dhcpv4.
-func runDHCPv4(ctx context.Context, lans cliconfig.LANSpecList, dnsOverride []netip.Addr, wanMTU int, lease time.Duration, wg *sync.WaitGroup) error {
+// runDHCPv4 builds a pkg/dhcpv4.InterfaceConfig for every -lan interface,
+// constructs the server synchronously (so an invalid subnet or a socket
+// failure fails run() rather than surfacing only in a log line), and starts
+// it on wg. Each interface serves its own subnet (from -lan's /prefixlen),
+// offers its gateway IP as router, and advertises an interface MTU sized for
+// the DS-Lite softwire: the -lan MTU if set, else the WAN MTU minus the
+// 40-byte tunnel overhead (dropped if that falls below the IPv4 minimum). A
+// -lan without an IPv4 subnet (an IPv6-only gateway) is rejected.
+//
+// The DNS server offered (option 6) is dnsOverride (-dhcpv4-dns) if given,
+// else this CPE's gateway when -dns-proxy is running to answer at it; with
+// neither, no DNS is advertised at all rather than pointing clients at a port
+// nothing listens on.
+func runDHCPv4(ctx context.Context, lans cliconfig.LANSpecList, dnsOverride []netip.Addr, dnsProxyOn bool, wanMTU int, lease time.Duration, wg *sync.WaitGroup) error {
 	var cfgs []dhcpv4.InterfaceConfig
 	for _, spec := range lans {
-		if !spec.Subnet.IsValid() {
+		if !spec.Subnet.IsValid() || !spec.Subnet.Addr().Is4() {
 			return fmt.Errorf("-dhcpv4: LAN interface %s has no IPv4 subnet (its -lan gateway %s is not IPv4)", spec.Iface, spec.GatewayIP)
 		}
 
 		dns := dnsOverride
-		if len(dns) == 0 {
-			dns = []netip.Addr{spec.GatewayIP} // point clients at this CPE (see -dns-proxy)
+		switch {
+		case len(dns) > 0:
+			// use the operator's explicit -dhcpv4-dns
+		case dnsProxyOn:
+			dns = []netip.Addr{spec.GatewayIP} // point clients at this CPE's -dns-proxy
+		default:
+			log.Printf("DHCPv4: advertising no DNS server on %s (enable -dns-proxy or set -dhcpv4-dns)", spec.Iface)
 		}
 
 		mtu := spec.MTU
 		if mtu == 0 && wanMTU > tunnelOverhead {
 			mtu = wanMTU - tunnelOverhead
+		}
+		if mtu != 0 && (mtu < dhcpMinMTU || mtu > 0xffff) {
+			log.Printf("DHCPv4: computed MTU %d out of range on %s, not advertising option 26", mtu, spec.Iface)
+			mtu = 0
 		}
 
 		cfgs = append(cfgs, dhcpv4.InterfaceConfig{
@@ -328,14 +357,19 @@ func runDHCPv4(ctx context.Context, lans cliconfig.LANSpecList, dnsOverride []ne
 			MTU:        uint16(mtu),
 			LeaseTime:  lease,
 		})
-		log.Printf("DHCPv4: serving %s on %s (router/DNS %s, lease %v, MTU %d)",
-			spec.Subnet, spec.Iface, spec.GatewayIP, lease, mtu)
+		log.Printf("DHCPv4: serving %s on %s (router %s, DNS %v, lease %v, MTU %d)",
+			spec.Subnet, spec.Iface, spec.GatewayIP, dns, lease, mtu)
+	}
+
+	srv, err := dhcpv4.New(cfgs)
+	if err != nil {
+		return fmt.Errorf("starting DHCPv4 server: %w", err)
 	}
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := dhcpv4.Serve(ctx, cfgs); err != nil {
+		if err := srv.Serve(ctx); err != nil {
 			log.Printf("DHCPv4 server ended unexpectedly: %v", err)
 		}
 	}()

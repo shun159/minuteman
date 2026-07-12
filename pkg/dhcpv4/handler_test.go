@@ -32,6 +32,25 @@ func clientReq(mt MessageType, opts ...Option) *Message {
 	}
 }
 
+// doDORA runs a DISCOVER + SELECTING-REQUEST for the default client and
+// returns the acquired address.
+func doDORA(t *testing.T, cfg InterfaceConfig, pool *Pool, now time.Time) netip.Addr {
+	t.Helper()
+	offer := handle(cfg, pool, clientReq(Discover), now)
+	if offer == nil {
+		t.Fatal("no OFFER")
+	}
+	ack := handle(cfg, pool, clientReq(Request,
+		NewAddr(OptServerID, cfg.ServerIP), NewAddr(OptRequestedIP, offer.YIAddr)), now)
+	if ack == nil {
+		t.Fatal("no ACK")
+	}
+	if mt, _ := ack.Options.MessageType(); mt != ACK {
+		t.Fatalf("reply type = %v, want ACK", mt)
+	}
+	return ack.YIAddr
+}
+
 func TestHandleDiscoverProducesOffer(t *testing.T) {
 	cfg, pool := testConfig()
 	reply := handle(cfg, pool, clientReq(Discover), time.Now())
@@ -44,7 +63,6 @@ func TestHandleDiscoverProducesOffer(t *testing.T) {
 	if !cfg.Subnet.Contains(reply.YIAddr) || reply.YIAddr == cfg.ServerIP {
 		t.Fatalf("offered address %v is not a usable pool address", reply.YIAddr)
 	}
-	// Config options must be present.
 	for _, code := range []OptionCode{OptSubnetMask, OptRouter, OptDNSServers, OptInterfaceMTU, OptLeaseTime} {
 		if _, ok := reply.Options.Get(code); !ok {
 			t.Errorf("OFFER missing option %d", code)
@@ -55,47 +73,73 @@ func TestHandleDiscoverProducesOffer(t *testing.T) {
 func TestHandleFullDORA(t *testing.T) {
 	cfg, pool := testConfig()
 	now := time.Now()
-
-	offer := handle(cfg, pool, clientReq(Discover), now)
-	if offer == nil {
-		t.Fatal("no OFFER")
-	}
-	// SELECTING REQUEST: option 54 = our server id, option 50 = offered addr.
-	req := clientReq(Request,
-		NewAddr(OptServerID, cfg.ServerIP),
-		NewAddr(OptRequestedIP, offer.YIAddr),
-	)
-	ack := handle(cfg, pool, req, now)
-	if ack == nil {
-		t.Fatal("no ACK")
-	}
-	if mt, _ := ack.Options.MessageType(); mt != ACK {
-		t.Fatalf("reply type = %v, want ACK", mt)
-	}
-	if ack.YIAddr != offer.YIAddr {
-		t.Fatalf("ACK yiaddr = %v, want the offered %v", ack.YIAddr, offer.YIAddr)
+	ip := doDORA(t, cfg, pool, now)
+	if !cfg.Subnet.Contains(ip) {
+		t.Fatalf("ACKed address %v not in subnet", ip)
 	}
 }
 
-func TestHandleRequestForOtherServerIsSilent(t *testing.T) {
+func TestHandleRequestForOtherServerCancelsOfferAndIsSilent(t *testing.T) {
 	cfg, pool := testConfig()
+	now := time.Now()
+	offer := handle(cfg, pool, clientReq(Discover), now)
+
 	req := clientReq(Request,
 		NewAddr(OptServerID, netip.MustParseAddr("192.168.1.254")), // a different server
-		NewAddr(OptRequestedIP, netip.MustParseAddr("192.168.1.50")),
+		NewAddr(OptRequestedIP, offer.YIAddr),
 	)
-	if reply := handle(cfg, pool, req, time.Now()); reply != nil {
+	if reply := handle(cfg, pool, req, now); reply != nil {
 		t.Fatalf("REQUEST selecting another server: want silence, got %v", reply)
+	}
+	// Our tentative offer must have been released immediately.
+	if _, ok := pool.Binding("52:54:00:aa:bb:cc", now); ok {
+		t.Fatal("offer not cancelled after the client selected another server")
 	}
 }
 
-func TestHandleRequestWrongAddressNAKs(t *testing.T) {
+func TestHandleSelectingUnofferedAddressNAKs(t *testing.T) {
 	cfg, pool := testConfig()
-	// INIT-REBOOT for an address on the wrong subnet: no server id, option 50
-	// out of our subnet -> NAK.
-	req := clientReq(Request, NewAddr(OptRequestedIP, netip.MustParseAddr("10.9.9.9")))
-	reply := handle(cfg, pool, req, time.Now())
+	now := time.Now()
+	// A SELECTING REQUEST naming us but for an address we never offered this
+	// client (no prior DISCOVER) must be NAKed.
+	req := clientReq(Request,
+		NewAddr(OptServerID, cfg.ServerIP),
+		NewAddr(OptRequestedIP, netip.MustParseAddr("192.168.1.77")),
+	)
+	reply := handle(cfg, pool, req, now)
 	if reply == nil {
-		t.Fatal("wrong-subnet REQUEST produced no reply, want NAK")
+		t.Fatal("SELECTING for an un-offered address produced no reply, want NAK")
+	}
+	if mt, _ := reply.Options.MessageType(); mt != NAK {
+		t.Fatalf("reply type = %v, want NAK", mt)
+	}
+}
+
+func TestHandleUnknownInitRebootIsSilent(t *testing.T) {
+	cfg, pool := testConfig()
+	// INIT-REBOOT (no server-id, requested-ip, ciaddr=0) from a client the
+	// server has no record of MUST be silent (RFC 2131 §4.3.2) -- not an ACK
+	// of a free address (the old, non-compliant behavior) and not a NAK.
+	req := clientReq(Request, NewAddr(OptRequestedIP, netip.MustParseAddr("192.168.1.50")))
+	if reply := handle(cfg, pool, req, time.Now()); reply != nil {
+		t.Fatalf("unknown INIT-REBOOT: want silence, got %v", reply)
+	}
+}
+
+func TestHandleInitRebootWrongAddressNAKs(t *testing.T) {
+	cfg, pool := testConfig()
+	now := time.Now()
+	ip := doDORA(t, cfg, pool, now)
+
+	// The client now (INIT-REBOOT) insists on a *different* address than the
+	// one it holds -> NAK.
+	wrong := netip.MustParseAddr("192.168.1.200")
+	if wrong == ip {
+		wrong = netip.MustParseAddr("192.168.1.201")
+	}
+	reply := handle(cfg, pool, clientReq(Request, NewAddr(OptRequestedIP, wrong)), now)
+	if reply == nil {
+		t.Fatal("INIT-REBOOT for the wrong held address produced no reply, want NAK")
 	}
 	if mt, _ := reply.Options.MessageType(); mt != NAK {
 		t.Fatalf("reply type = %v, want NAK", mt)
@@ -108,14 +152,10 @@ func TestHandleRequestWrongAddressNAKs(t *testing.T) {
 func TestHandleRenewingUsesCiaddr(t *testing.T) {
 	cfg, pool := testConfig()
 	now := time.Now()
-	// Establish a lease via DORA first.
-	offer := handle(cfg, pool, clientReq(Discover), now)
-	handle(cfg, pool, clientReq(Request,
-		NewAddr(OptServerID, cfg.ServerIP), NewAddr(OptRequestedIP, offer.YIAddr)), now)
+	ip := doDORA(t, cfg, pool, now)
 
-	// RENEWING: no option 50, no server id, ciaddr = current address.
-	renew := clientReq(Request)
-	renew.CIAddr = offer.YIAddr
+	renew := clientReq(Request) // no server-id, no requested-ip, ciaddr set
+	renew.CIAddr = ip
 	ack := handle(cfg, pool, renew, now.Add(6*time.Hour))
 	if ack == nil {
 		t.Fatal("RENEW produced no reply")
@@ -123,30 +163,72 @@ func TestHandleRenewingUsesCiaddr(t *testing.T) {
 	if mt, _ := ack.Options.MessageType(); mt != ACK {
 		t.Fatalf("RENEW reply type = %v, want ACK", mt)
 	}
-	if ack.YIAddr != offer.YIAddr {
-		t.Fatalf("RENEW yiaddr = %v, want %v", ack.YIAddr, offer.YIAddr)
+	if ack.YIAddr != ip {
+		t.Fatalf("RENEW yiaddr = %v, want %v", ack.YIAddr, ip)
 	}
 }
 
 func TestHandleReleaseFreesLease(t *testing.T) {
 	cfg, pool := testConfig()
 	now := time.Now()
-	offer := handle(cfg, pool, clientReq(Discover), now)
-	handle(cfg, pool, clientReq(Request,
-		NewAddr(OptServerID, cfg.ServerIP), NewAddr(OptRequestedIP, offer.YIAddr)), now)
+	ip := doDORA(t, cfg, pool, now)
 
-	rel := clientReq(Release)
-	rel.CIAddr = offer.YIAddr
+	rel := clientReq(Release, NewAddr(OptServerID, cfg.ServerIP))
+	rel.CIAddr = ip
 	if reply := handle(cfg, pool, rel, now); reply != nil {
 		t.Fatalf("RELEASE should get no reply, got %v", reply)
 	}
-	// The address is now free for a different client.
-	other, _ := net.ParseMAC("52:54:00:dd:ee:ff")
-	discover := clientReq(Discover)
-	discover.CHAddr = other
-	reoffer := handle(cfg, pool, discover, now)
-	if reoffer.YIAddr != offer.YIAddr {
-		t.Fatalf("released address not reused: got %v, want %v", reoffer.YIAddr, offer.YIAddr)
+	if _, ok := pool.Binding("52:54:00:aa:bb:cc", now); ok {
+		t.Fatal("RELEASE did not free the lease")
+	}
+}
+
+func TestHandleDeclineRequiresServerIDAndOwnership(t *testing.T) {
+	cfg, pool := testConfig()
+	now := time.Now()
+	ip := doDORA(t, cfg, pool, now)
+
+	// A DECLINE without a server identifier is ignored (no quarantine).
+	handle(cfg, pool, clientReq(Decline, NewAddr(OptRequestedIP, ip)), now)
+	if !pool.allocatable(ip, now) {
+		t.Fatal("DECLINE without server-id quarantined the address anyway")
+	}
+
+	// A DECLINE naming another server is ignored.
+	handle(cfg, pool, clientReq(Decline,
+		NewAddr(OptServerID, netip.MustParseAddr("192.168.1.254")),
+		NewAddr(OptRequestedIP, ip)), now)
+	if !pool.allocatable(ip, now) {
+		t.Fatal("DECLINE for another server quarantined the address anyway")
+	}
+
+	// A well-formed DECLINE from the owning client quarantines it.
+	handle(cfg, pool, clientReq(Decline,
+		NewAddr(OptServerID, cfg.ServerIP),
+		NewAddr(OptRequestedIP, ip)), now)
+	if pool.allocatable(ip, now) {
+		t.Fatal("a valid DECLINE did not quarantine the address")
+	}
+}
+
+func TestHandleRejectsRelayedRequest(t *testing.T) {
+	cfg, pool := testConfig()
+	req := clientReq(Discover)
+	req.GIAddr = netip.MustParseAddr("10.0.0.1") // came via a BOOTP relay
+	if reply := handle(cfg, pool, req, time.Now()); reply != nil {
+		t.Fatalf("relayed (giaddr!=0) request: want silence (relay unsupported), got %v", reply)
+	}
+}
+
+func TestRepliesLeaveSiaddrZero(t *testing.T) {
+	cfg, pool := testConfig()
+	now := time.Now()
+	offer := handle(cfg, pool, clientReq(Discover), now)
+	// siaddr (next bootstrap server) must be 0.0.0.0: it's not the server id,
+	// and a non-zero value could make a PXE client treat this CPE as a boot
+	// server.
+	if offer.SIAddr.IsValid() && !offer.SIAddr.IsUnspecified() {
+		t.Fatalf("OFFER siaddr = %v, want 0.0.0.0", offer.SIAddr)
 	}
 }
 

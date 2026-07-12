@@ -46,6 +46,9 @@ func TestParseLANSpecErrors(t *testing.T) {
 		"eth1=192.168.1.1/notanumber",
 		"eth1=192.168.1.1/99",
 		"eth1=192.168.1.1,notanumber",
+		"eth1=192.168.1.1,67",    // MTU below the IPv4 minimum of 68
+		"eth1=192.168.1.1,70000", // MTU above the 16-bit option ceiling
+		"eth1=192.168.1.1,-1",    // negative MTU
 	} {
 		if _, err := ParseLANSpec(in); err == nil {
 			t.Errorf("ParseLANSpec(%q): want error, got nil", in)

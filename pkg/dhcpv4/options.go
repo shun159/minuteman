@@ -89,12 +89,21 @@ func (o Options) Get(code OptionCode) (Option, bool) {
 }
 
 // Marshal encodes every option as code/length/data (RFC 2132 §2). The END
-// option and any padding are appended by Message.Marshal, not here.
+// option and any padding are appended by Message.Marshal, not here. A value
+// longer than the 255-byte option length field is split across multiple
+// instances of the same code, which clients concatenate (RFC 3396) — so a
+// large DNS-server list can't silently corrupt the message by truncating a
+// length byte while emitting the full data.
 func (o Options) Marshal() []byte {
 	var b []byte
 	for _, opt := range o {
-		b = append(b, byte(opt.Code), byte(len(opt.Data)))
-		b = append(b, opt.Data...)
+		data := opt.Data
+		for first := true; first || len(data) > 0; first = false {
+			n := min(len(data), 255)
+			b = append(b, byte(opt.Code), byte(n))
+			b = append(b, data[:n]...)
+			data = data[n:]
+		}
 	}
 	return b
 }

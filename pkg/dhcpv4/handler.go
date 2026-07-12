@@ -9,12 +9,13 @@ import (
 // InterfaceConfig is the DHCPv4 service configuration for one LAN interface.
 type InterfaceConfig struct {
 	Iface    string
-	ServerIP netip.Addr   // the CPE's own IPv4 on this LAN: the DHCP server id, offered router, and (see cmd/minuteman) DNS
+	ServerIP netip.Addr   // the CPE's own IPv4 on this LAN: the DHCP server id and offered router
 	Subnet   netip.Prefix // the LAN subnet addresses are carved from
 	// DNSServers is offered in option 6. For DS-Lite this is normally the
 	// CPE's own ServerIP (so LAN DNS goes to minuteman's -dns-proxy, which
 	// forwards it over IPv6 rather than through the softwire); empty omits
-	// the option.
+	// the option (see cmd/minuteman: it declines to advertise a DNS server
+	// that wouldn't actually answer).
 	DNSServers []netip.Addr
 	// MTU is offered in option 26. For DS-Lite this should be the WAN MTU
 	// minus the 40-byte IPv4-in-IPv6 tunnel overhead, so LAN clients size
@@ -24,13 +25,17 @@ type InterfaceConfig struct {
 }
 
 // handle turns one received request into the reply the server should send,
-// or nil to stay silent (a DISCOVER for an exhausted pool, a REQUEST that
-// selected a different server, a RELEASE/DECLINE which get no reply, or a
-// malformed message). It is pure: the only state it mutates is pool, and it
-// reads the clock only through now. The returned message's Flags/CIAddr/
+// or nil to stay silent. It is pure: the only state it mutates is pool, and
+// it reads the clock only through now. The returned message's Flags/CIAddr/
 // YIAddr/CHAddr are what packet.go's destination logic keys off.
 func handle(cfg InterfaceConfig, pool *Pool, req *Message, now time.Time) *Message {
 	if req.Op != OpBootRequest {
+		return nil
+	}
+	// BOOTP relay (giaddr set) is out of this server's scope (see the package
+	// doc): a relayed reply must go back to the relay agent on the server
+	// port, which destination() doesn't do, so decline rather than mis-send.
+	if req.GIAddr.IsValid() && !req.GIAddr.IsUnspecified() {
 		return nil
 	}
 	mt, ok := req.Options.MessageType()
@@ -49,39 +54,33 @@ func handle(cfg InterfaceConfig, pool *Pool, req *Message, now time.Time) *Messa
 		return buildReply(cfg, pool, req, Offer, ip)
 
 	case Request:
-		// A REQUEST naming a different server (SELECTING state) isn't ours
-		// to answer; our tentative offer simply expires.
+		return handleRequest(cfg, pool, req, clientID, now)
+
+	case Release:
+		// RFC 2131 §4.4.6: RELEASE is unicast to the leasing server; ignore
+		// one addressed elsewhere. Pool.Release re-checks ownership.
 		if sid, ok := req.Options.ServerID(); ok && sid != cfg.ServerIP {
 			return nil
 		}
-		// The requested address is option 50 (SELECTING / INIT-REBOOT) or,
-		// absent that, ciaddr (RENEWING / REBINDING).
-		target, ok := req.Options.RequestedIP()
-		if !ok {
-			target = req.CIAddr
-		}
-		if !target.IsValid() || target.IsUnspecified() {
-			return nil // nothing to act on
-		}
-		ip, ok := pool.Commit(clientID, target, now)
-		if !ok {
-			return buildNAK(cfg, req)
-		}
-		return buildReply(cfg, pool, req, ACK, ip)
-
-	case Release:
 		pool.Release(clientID, req.CIAddr)
 		return nil
 
 	case Decline:
+		// RFC 2131 §4.4.5: a DHCPDECLINE MUST carry the server identifier and
+		// the declined address. Ignore ones not addressed to us; Pool.Decline
+		// further ignores an address the client doesn't actually hold, so a
+		// client can't poison the pool with addresses it was never leased.
+		if sid, ok := req.Options.ServerID(); !ok || sid != cfg.ServerIP {
+			return nil
+		}
 		if declined, ok := req.Options.RequestedIP(); ok {
-			pool.Decline(clientID, declined)
+			pool.Decline(clientID, declined, now)
 		}
 		return nil
 
 	case Inform:
 		// The client already has an (externally configured) address in
-		// ciaddr and wants only configuration parameters -- no lease, no
+		// ciaddr and wants only configuration parameters — no lease, no
 		// yiaddr (RFC 2131 §4.3.5).
 		return buildInformAck(cfg, req)
 
@@ -90,10 +89,62 @@ func handle(cfg InterfaceConfig, pool *Pool, req *Message, now time.Time) *Messa
 	}
 }
 
+// handleRequest implements RFC 2131 §4.3.2's three DHCPREQUEST substates,
+// distinguished by which of server-identifier / requested-IP / ciaddr the
+// client set.
+func handleRequest(cfg InterfaceConfig, pool *Pool, req *Message, clientID string, now time.Time) *Message {
+	reqIP, hasReqIP := req.Options.RequestedIP()
+
+	// SELECTING: server-identifier present — the client is accepting one
+	// server's offer.
+	if sid, hasSID := req.Options.ServerID(); hasSID {
+		if sid != cfg.ServerIP {
+			pool.CancelOffer(clientID) // it chose another server; free our offer now
+			return nil
+		}
+		if !hasReqIP {
+			return nil // malformed SELECTING
+		}
+		bound, ok := pool.Binding(clientID, now)
+		if !ok || bound != reqIP {
+			return buildNAK(cfg, req) // we never offered this, or the offer lapsed
+		}
+		pool.Commit(clientID, reqIP, now)
+		return buildReply(cfg, pool, req, ACK, reqIP)
+	}
+
+	// No server-identifier: INIT-REBOOT (requested-IP, ciaddr zero) or
+	// RENEWING/REBINDING (ciaddr set). The address in question is the
+	// requested-IP option or, absent it, ciaddr.
+	target := reqIP
+	if !hasReqIP {
+		target = req.CIAddr
+	}
+	if !target.IsValid() || target.IsUnspecified() {
+		return nil
+	}
+
+	bound, ok := pool.Binding(clientID, now)
+	if !ok {
+		// No record of this client. RFC 2131 §4.3.2 requires silence here so
+		// independent DHCP servers on one segment coexist; the client times
+		// out and falls back to DISCOVER, recovering its address through a
+		// fresh lease (this server keeps no state across restarts, so a
+		// returning client's INIT-REBOOT for its cached address is exactly
+		// this "no record" case).
+		return nil
+	}
+	if bound != target {
+		return buildNAK(cfg, req) // the client insists on an address we didn't lease it
+	}
+	pool.Commit(clientID, target, now)
+	return buildReply(cfg, pool, req, ACK, target)
+}
+
 // buildReply assembles an OFFER or ACK granting yip to the client, carrying
 // the full lease + configuration option set.
 func buildReply(cfg InterfaceConfig, pool *Pool, req *Message, mt MessageType, yip netip.Addr) *Message {
-	m := baseReply(cfg, req)
+	m := baseReply(req)
 	m.YIAddr = yip
 	m.Options = append(Options{
 		NewMessageType(mt),
@@ -108,7 +159,7 @@ func buildReply(cfg InterfaceConfig, pool *Pool, req *Message, mt MessageType, y
 // buildInformAck assembles an ACK for a DHCPINFORM: configuration options
 // only, no address grant and no lease timers.
 func buildInformAck(cfg InterfaceConfig, req *Message) *Message {
-	m := baseReply(cfg, req)
+	m := baseReply(req)
 	m.CIAddr = req.CIAddr // echo the client's own address (RFC 2131 §4.3.5)
 	m.Options = append(Options{
 		NewMessageType(ACK),
@@ -122,7 +173,7 @@ func buildInformAck(cfg InterfaceConfig, req *Message) *Message {
 // 2131 §4.3.2): the client's notion of its own address is exactly what's
 // being rejected, so it may not be reachable by unicast.
 func buildNAK(cfg InterfaceConfig, req *Message) *Message {
-	m := baseReply(cfg, req)
+	m := baseReply(req)
 	m.Flags |= flagBroadcast
 	m.Options = Options{
 		NewMessageType(NAK),
@@ -131,16 +182,18 @@ func buildNAK(cfg InterfaceConfig, req *Message) *Message {
 	return m
 }
 
-// baseReply fills the BOOTP header fields common to every reply.
-func baseReply(cfg InterfaceConfig, req *Message) *Message {
+// baseReply fills the BOOTP header fields common to every reply. siaddr
+// (next bootstrap server) is deliberately left zero: it is not the server
+// identifier (option 54 carries that), and setting it would advertise this
+// CPE as a boot server it isn't (RFC 2131 §3.1, server message table).
+func baseReply(req *Message) *Message {
 	return &Message{
 		Op:     OpBootReply,
 		HType:  hardwareTypeEthernet,
 		HLen:   6,
 		XID:    req.XID,
-		Flags:  req.Flags,    // echo the broadcast flag
-		SIAddr: cfg.ServerIP, // next-server (informational)
-		GIAddr: req.GIAddr,   // echo relay address (0 for a directly-attached client)
+		Flags:  req.Flags,  // echo the broadcast flag
+		GIAddr: req.GIAddr, // echoed for form; giaddr!=0 requests are rejected in handle
 		CHAddr: req.CHAddr,
 	}
 }

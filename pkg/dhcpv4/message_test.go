@@ -91,6 +91,36 @@ func TestClientIDPrefersOptionOverChaddr(t *testing.T) {
 	}
 }
 
+func TestMarshalSplitsLongOptions(t *testing.T) {
+	// 64 DNS servers = 256 bytes of data, past the 255-byte option length
+	// field. Marshal must split it across multiple option-6 instances (RFC
+	// 3396) rather than truncate the length byte and corrupt the stream.
+	dns := make([]netip.Addr, 64)
+	for i := range dns {
+		dns[i] = netip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)})
+	}
+	opts := Options{NewAddrs(OptDNSServers, dns)}
+	b := opts.Marshal()
+
+	// Walk the encoded stream: it must parse cleanly into option-6 chunks
+	// that concatenate back to the full 256 bytes.
+	var got int
+	for i := 0; i < len(b); {
+		if OptionCode(b[i]) != OptDNSServers {
+			t.Fatalf("unexpected option code %d at offset %d (stream corrupted)", b[i], i)
+		}
+		n := int(b[i+1])
+		if n > 255 || i+2+n > len(b) {
+			t.Fatalf("chunk length %d at offset %d runs past the buffer", n, i)
+		}
+		got += n
+		i += 2 + n
+	}
+	if got != 64*4 {
+		t.Fatalf("reassembled option-6 data = %d bytes, want %d", got, 64*4)
+	}
+}
+
 func TestParseOptionRejectsOverrunLength(t *testing.T) {
 	// A code/length pair whose length points past the buffer must error.
 	b := make([]byte, bootpFixedLen+4+3)

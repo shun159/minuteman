@@ -58,6 +58,11 @@ func ParseLANSpec(s string) (LANSpec, error) {
 		if err != nil {
 			return LANSpec{}, fmt.Errorf("parsing MTU in %q: %w", s, err)
 		}
+		// 68 is RFC 791's minimum IPv4 MTU; 65535 is the ceiling of both the
+		// datapath's uint16 InnerMTU and the DHCP Interface MTU option.
+		if mtu < 68 || mtu > 65535 {
+			return LANSpec{}, fmt.Errorf("MTU in %q must be between 68 and 65535, got %d", s, mtu)
+		}
 	}
 
 	return LANSpec{Iface: ifacePart, GatewayIP: ip, Subnet: subnet, MTU: mtu}, nil

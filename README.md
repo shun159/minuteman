@@ -58,9 +58,10 @@ kernel IPv6 forwarding and this IPv6 provisioning are all that's needed alongsid
   DNS server(s) learned via DHCPv6 (or `-dns-server`, if given) — so LAN DNS lookups never take the
   DS-Lite softwire round trip an ordinary tunneled IPv4 DNS query would.
 - **DHCPv4 server (RFC 2131/2132)**, opt-in via `-dhcpv4`: hands LAN clients the private IPv4 address the
-  DS-Lite softwire carries, plus the CPE as their router and DNS (pair with `-dns-proxy`), and an interface
-  MTU (option 26) reduced by the tunnel overhead so clients size packets to fit the softwire. Each `-lan`
-  interface serves its own subnet (from the `-lan` value's optional `/prefixlen`, default `/24`).
+  DS-Lite softwire carries, plus the CPE as their router (and, paired with `-dns-proxy`, DNS), and an
+  interface MTU (option 26) reduced by the tunnel overhead so clients size packets to fit the softwire.
+  Each `-lan` interface serves its own subnet (from the `-lan` value's optional `/prefixlen`, default
+  `/24`).
 
 ## Current status
 
@@ -122,7 +123,7 @@ minuteman -wan <iface> -b4 <ipv6-addr> -lan <iface>=<gateway-ipv4>[,mtu] [-lan .
 | `-dns-server` | Upstream DNS server for `-dns-proxy` (repeatable, IPv6 recommended); defaults to the DHCPv6-learned DNS servers if omitted |
 | `-dhcpv4` | Run a DHCPv4 server (RFC 2131) on every `-lan` interface, leasing addresses from that interface's subnet with the gateway as router/DNS and a DS-Lite-adjusted MTU |
 | `-dhcpv4-lease` | DHCPv4 lease duration (default `12h`) |
-| `-dhcpv4-dns` | IPv4 DNS server to advertise to DHCPv4 clients (repeatable); defaults to each `-lan` gateway IP (this CPE, i.e. `-dns-proxy`) |
+| `-dhcpv4-dns` | IPv4 DNS server to advertise to DHCPv4 clients (repeatable); if unset, the `-lan` gateway is advertised when `-dns-proxy` runs, otherwise no DNS is advertised |
 | `-hb46pp-vendor-id` | HB46PP `vendorid` query parameter sent during provisioning fallback (default `acde48-minuteman`) |
 | `-hb46pp-product` | HB46PP `product` query parameter (default `minuteman`) |
 | `-hb46pp-version` | HB46PP `version` query parameter (default `0_1`) |
