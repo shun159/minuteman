@@ -370,10 +370,16 @@ orphaned the running kernel's module directory — reboot to fix that).
 - **`pkg/dnsproxy/`** — the DNS proxy RFC 6333 recommends a DS-Lite B4 run (the B4 SHOULD act as a DNS
   proxy for LAN clients): opaque byte-relay only, no DNS message parsing, caching, or rewriting of any
   kind, so it's simple enough to have no unit tests of its own (like `pkg/ndproxy`/`pkg/routeradvert`'s raw
-  socket I/O, correctness here is exercised by `test/netns`, not `go test`). `serve.go`'s
-  `Serve(ctx, Config)` opens a UDP `net.ListenUDP` and TCP `net.ListenTCP` socket per `Config.ListenAddrs`
-  (port 53), closing every socket on `ctx.Done()` to unblock `serveUDP`/`serveTCP`'s read loops — the same
-  close-to-unblock shutdown pattern `pkg/ndproxy`'s `conn`/`packetConn` use. `udp.go`'s `serveUDP` spawns
+  socket I/O, correctness here is exercised by `test/netns`, not `go test`). `serve.go` splits opening
+  from serving the same way `pkg/dhcpv4` does (`New`/`Serve`): `Listen(Config)` opens a UDP `net.ListenUDP`
+  and TCP `net.ListenTCP` socket per `Config.ListenAddrs` (port 53) *synchronously*, returning a `*Server`
+  or a bind failure to the caller (so `cmd/minuteman` fails fast, and only advertises one of these
+  addresses as an RDNSS DNS server once it's actually bound — see `startDNSProxy`/`routeradvert`), and the
+  returned `Server`'s `Serve(ctx)` runs the forwarding loops, closing every socket on `ctx.Done()` to
+  unblock `serveUDP`/`serveTCP`'s read loops — the same close-to-unblock shutdown pattern `pkg/ndproxy`'s
+  `conn`/`packetConn` use. A listen address that's IPv6 link-local carries a zone (`netip.Addr.Zone()`,
+  set by `routeradvert.LinkLocalAddr`), threaded into the `net.UDPAddr`/`net.TCPAddr` so the kernel binds
+  it to the right interface. `udp.go`'s `serveUDP` spawns
   one goroutine per received datagram (so one slow upstream never blocks the next query), trying
   `Config.Upstreams` in order over a fresh one-shot `net.DialUDP` socket per query (deliberately not
   pooled: a dedicated socket means a response can never be confused with a different concurrent query's,
@@ -447,10 +453,17 @@ orphaned the running kernel's module directory — reboot to fix that).
   `-ndproxy` is set instead, `runNDProxy()` is a thin wrapper that hands the `-lan` interface names straight
   to `internal/wanextend.Serve`, which owns the whole flow itself (see that package's own entry below) and
   registers every goroutine it starts on the same `sync.WaitGroup` as the `-dhcpv6-pd` path, for the same
-  shutdown-draining reason. If `-dns-proxy` is set, `runDNSProxy()` starts `pkg/dnsproxy.Serve` listening on
-  every `-lan` interface's gateway IP, forwarding to `-dns-server` if any were given or else the DNS servers
-  `resolveAFTR()` returned; `run()` fails fast before any of this if `-dns-proxy` is set but no DNS servers
-  are available from either source. If `-dhcpv4` is set, `runDHCPv4()` builds one `pkg/dhcpv4.InterfaceConfig`
+  shutdown-draining reason. If `-dns-proxy` is set, `startDNSProxy()` opens `pkg/dnsproxy` (via
+  `dnsproxy.Listen`, *synchronously*, so a bind failure fails `run()`) listening on every `-lan`
+  interface's IPv4 gateway IP *and* its own link-local IPv6 address, forwarding to `-dns-server` if any
+  were given or else the DNS servers `resolveAFTR()` returned; `run()` fails fast before any of this if
+  `-dns-proxy` is set but no DNS servers are available from either source. It's started *before*
+  `runPrefixDelegation`/`runNDProxy` and returns the map of `-lan` interface → the link-local address it
+  actually bound; that map is passed to those two so their RA workers advertise an RFC 8106 RDNSS option
+  (RFC 7084 §L-4, so an IPv6-only SLAAC client gets a DNS server) pointing *only* at addresses this proxy
+  really bound — never a DNS server nothing answers on. A LAN link-local still DAD-tentative at bind time
+  (`EADDRNOTAVAIL`) is retried on the tentative cadence; any other bind error (port 53 in use, etc.) fails
+  immediately. If `-dhcpv4` is set, `runDHCPv4()` builds one `pkg/dhcpv4.InterfaceConfig`
   per `-lan` (subnet from its `/prefixlen`, gateway as router; DNS = `-dhcpv4-dns`, else the gateway when
   `-dns-proxy` runs, else omitted; MTU = the `-lan` MTU or else the WAN MTU minus the 40-byte tunnel
   overhead, dropped if below the IPv4 minimum) and constructs the server with `pkg/dhcpv4.New` *synchronously*

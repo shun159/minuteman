@@ -23,7 +23,12 @@ import (
 // initial discovery failed or was cancelled; once past that point, Serve
 // itself always returns nil and leaves its goroutines running until ctx is
 // cancelled.
-func Serve(ctx context.Context, wanIface string, wanIfindex int, lanIfaces []string, wg *sync.WaitGroup) error {
+//
+// rdnssByIface is forwarded to every LAN RA worker's routeradvert.Config
+// (see its RDNSSAddr doc) -- it maps a -lan interface to the DNS-server
+// address a DNS proxy actually bound there, so it's non-empty only when the
+// caller also runs a DNS proxy on those interfaces' link-local addresses.
+func Serve(ctx context.Context, wanIface string, wanIfindex int, lanIfaces []string, rdnssByIface map[string]netip.Addr, wg *sync.WaitGroup) error {
 	prefix, err := DiscoverPrefix(ctx, wanIfindex)
 	if err != nil {
 		return fmt.Errorf("discovering WAN prefix for NDProxy: %w", err)
@@ -53,7 +58,7 @@ func Serve(ctx context.Context, wanIface string, wanIfindex int, lanIfaces []str
 		}
 	}()
 
-	ra := newRAManager()
+	ra := newRAManager(rdnssByIface)
 	log.Printf("NDProxy: extending WAN prefix %s onto %d LAN interface(s)", prefix, len(lanIfaces))
 	ra.sync(ctx, prefix, lanIfaces, wg)
 

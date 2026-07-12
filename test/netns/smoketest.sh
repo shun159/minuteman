@@ -299,13 +299,19 @@ fi
 if [[ $dns_proxy_enabled -eq 1 ]]; then
     echo "== DNS proxy (RFC 6333): $NETNS_HOST -> $VETH_CPE_HOST -> mm-isp, not through the softwire =="
     if [[ $started_minuteman -eq 1 ]]; then
+        # The listen list is now "[<gateway-IPv4> <link-local-IPv6>%<iface>]"
+        # (RFC 8106 RDNSS points LAN clients at that link-local, so the proxy
+        # must actually bind it), so the IPv4 is followed by a space, not the
+        # closing bracket -- match either.
         check "minuteman started the DNS proxy listening on ${LAN_CPE_ADDR%/*} (see $RUNDIR/minuteman.log)" \
-            grep -q "DNS proxy: listening on \[${LAN_CPE_ADDR%/*}\]" "$RUNDIR/minuteman.log"
+            grep -qE "DNS proxy: listening on \[${LAN_CPE_ADDR%/*}[] ]" "$RUNDIR/minuteman.log"
+        check "minuteman's DNS proxy also listens on the LAN link-local address (the RDNSS target it advertises)" \
+            grep -qE "DNS proxy: listening on \[.*fe80:" "$RUNDIR/minuteman.log"
     fi
     # $NETNS_HOST queries minuteman's LAN gateway IP directly (not mm-isp) --
     # a correct answer proves the proxy actually forwarded the query to
     # mm-isp's DNS server over the CPE's own native IPv6 and relayed the
-    # answer back, both over UDP and over TCP (dnsproxy.Serve runs both).
+    # answer back, both over UDP and over TCP (dnsproxy's Server.Serve runs both).
     check "$NETNS_HOST (LAN client) resolves $AFTR_FQDN via minuteman's DNS proxy (UDP)" \
         bash -c "[[ \$(ip netns exec $NETNS_HOST dig @${LAN_CPE_ADDR%/*} +short AAAA $AFTR_FQDN) == '${CORE_AFTR_ADDR%/*}' ]]"
     check "$NETNS_HOST (LAN client) resolves $AFTR_FQDN via minuteman's DNS proxy (TCP)" \

@@ -38,11 +38,14 @@ type raWorker struct {
 // interface, so there's only ever one prefix to hand out. Not safe for
 // concurrent use.
 type raManager struct {
-	workers map[string]*raWorker
+	workers      map[string]*raWorker
+	rdnssByIface map[string]netip.Addr
 }
 
-func newRAManager() *raManager {
-	return &raManager{workers: make(map[string]*raWorker)}
+// newRAManager mirrors internal/lanprefix.NewRAManager's rdnssByIface
+// parameter -- see routeradvert.Config.RDNSSAddr's own doc.
+func newRAManager(rdnssByIface map[string]netip.Addr) *raManager {
+	return &raManager{workers: make(map[string]*raWorker), rdnssByIface: rdnssByIface}
 }
 
 // sync restarts every lanIfaces worker to advertise prefix, tracking each
@@ -83,6 +86,7 @@ func (m *raManager) start(ctx context.Context, iface string, prefix netip.Prefix
 			OnLink:            false,
 			ValidLifetime:     validLifetime,
 			PreferredLifetime: preferredLifetime,
+			RDNSSAddr:         m.rdnssByIface[iface],
 		})
 		if err != nil {
 			log.Printf("wanextend: RA serving on %s ended unexpectedly: %v", iface, err)
