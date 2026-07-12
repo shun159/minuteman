@@ -10,104 +10,49 @@ DHCPv6 Prefix Delegation (PD) and AFTR (DS-Lite) resolution — on top of an XDP
 
 ## Current state
 
-The DS-Lite (RFC 6333) B4-element datapath is implemented and attaches/runs against real interfaces
-(verified against veth pairs: XDP programs load, pass the kernel verifier, and process live traffic).
-AFTR discovery is also implemented: a from-scratch, stdlib-only DHCPv6 client (RFC 3736 Information-Request
-+ RFC 6334 `OPTION_AFTR_NAME`, resolved via DNS) runs in-process when `-aftr` is omitted — no external
-DHCP/DNS client daemon is spawned, consistent with the project's no-sidecar goal. When the DHCPv6 Reply
-carries no AFTR-Name, discovery now falls back to HB46PP (the JAIPA-standardized "HTTP-Based IPv4 over
-IPv6 Provisioning Protocol", `pkg/hb46pp` — see Architecture below): the fallback advertises
-`capability=dslite` and feeds the resulting `dslite.aftr` into the same DS-Lite setup, so minuteman works
-against both DHCPv6-provisioning and HB46PP-provisioning VNEs with no per-provider configuration. DHCPv6 Prefix Delegation
-(RFC 3633) is also implemented behind `-dhcpv6-pd`: `pkg/dhcpv6` grew a generic stateful exchange (Solicit/
-Request/Renew/Rebind/Release) that `pkg/prefixdelegation` drives to acquire and maintain a delegated prefix,
-and `internal/lanprefix` carves one `/64` per `-lan` interface from it and assigns it via `pkg/netlink`
-(hand-rolled `golang.org/x/sys/unix` netlink I/O, no netlink library or `ip` exec). `internal/lanprefix`
-also now drives Router Advertisements (RFC 4861) out each `-lan` interface via the `pkg/routeradvert`
-package, so LAN clients can SLAAC an address out of the assigned `/64` themselves — LAN clients get both
-the DS-Lite IPv4 path and native IPv6 out of the delegated prefix.
+Feature-complete as a DS-Lite (RFC 6333) B4 element, plus the pieces a real home CPE also needs. Each
+item below is independently toggled unless noted, and its mechanics are covered in depth in Architecture
+further down — this is just the index of what exists and which flag turns it on.
 
-NDProxy (RFC 4389) is also implemented, behind `-ndproxy`, for the alternative model some ISPs use instead
-of DHCPv6-PD: a single `/64` handed out on the WAN link itself, with the CPE expected to extend that same
-`/64` onto the LAN rather than being delegated a distinct prefix for it. `pkg/ndproxy` answers Neighbor
-Solicitations arriving on the WAN link on behalf of LAN hosts, but — unlike a passive-snooping proxy —
-only after actively verifying via a Neighbor Solicitation probe on the LAN side that the target host
-genuinely exists right now (`pkg/ndproxy.Serve`'s `proxyState` machine); `internal/wanextend` is the
-policy layer around it: `DiscoverPrefix` learns the WAN's own SLAAC `/64` via `pkg/netlink` and
-`WatchChanges` keeps polling for it changing afterwards (an ISP renumbering the WAN link), re-advertising
-it on every `-lan` interface with the On-Link flag cleared (`routeradvert.Config.OnLink`) so LAN clients
-route everything through the CPE rather than assuming direct link-layer reachability, and
-`HostRoutes` installs/removes a per-target `/128` route via `pkg/netlink` as `pkg/ndproxy.Serve` confirms
-or expires each target, so the kernel's own forwarding decision picks the right `-lan` interface when
-there's more than one. `-ndproxy` and `-dhcpv6-pd` are mutually exclusive (they're alternative WAN IPv6
-provisioning models, not composable).
+- **DS-Lite B4 datapath** (always on) — attaches/runs against real interfaces; XDP programs load, pass
+  the kernel verifier, and have processed live traffic on veth pairs.
+- **AFTR discovery** (automatic unless `-aftr` is given) — an in-process, stdlib-only DHCPv6 client
+  (RFC 3736 + RFC 6334 `OPTION_AFTR_NAME`) with an HB46PP (JAIPA v6mig-1) fallback when the Reply carries
+  no AFTR-Name, so minuteman needs no per-VNE configuration and spawns no external DHCP/DNS daemon.
+- **DHCPv6 Prefix Delegation** (`-dhcpv6-pd`, RFC 3633) — acquires and maintains a delegated prefix,
+  carves one `/64` per `-lan` interface from it, and RAs it out (RFC 4861) for LAN SLAAC.
+- **NDProxy** (`-ndproxy`, RFC 4389) — the alternative WAN model some ISPs use instead of PD (one shared
+  WAN `/64`, extended onto the LAN): actively verifies a LAN target before proxying NS/NA for it, rather
+  than passively snooping. Mutually exclusive with `-dhcpv6-pd` (alternative WAN provisioning models).
+- **DNS proxy** (`-dns-proxy`, RFC 6333's B4 SHOULD) — opaque byte relay to upstream DNS server(s),
+  structurally bypassing the softwire (an ordinary native-IPv6 socket from the CPE's own process).
+- **DHCPv4 server** (`-dhcpv4`, RFC 2131/2132) — hands LAN clients the private IPv4 the softwire carries,
+  with a DS-Lite-adjusted MTU (option 26). Needed a datapath change (see `xdp_dslite_encap` below) so
+  broadcast DISCOVER/REQUEST traffic isn't wrapped into the softwire before reaching the server.
+- **Native-IPv6 forwarding fastpath** (always on) — transit IPv6 that used to fall to the kernel slow
+  path (`XDP_PASS`) is now routed directly in XDP, with in-datapath ICMPv6 Packet Too Big and an optional
+  software-RSS cpumap stage (`-ipv6-sw-rss`, off by default — for NICs without capable hardware RSS).
 
-A DNS proxy (RFC 6333's B4 SHOULD) is also implemented, behind `-dns-proxy`, orthogonal to both of the
-above: `pkg/dnsproxy.Serve` listens on every `-lan` interface's gateway IP (port 53, UDP and TCP) and
-forwards each query verbatim to upstream DNS server(s) — `-dns-server`, or, if that's omitted, the DNS
-servers `resolveAFTR` already learned via the DHCPv6 Information-Request it performs for AFTR discovery
-(`aftrdiscovery.Result.DNSServers`) — relaying the answer back unmodified. The package never parses a DNS
-message at all, just relays bytes, so it's opaque to (and correct regardless of) whatever record types or
-EDNS0 options a query/answer carries. Forwarding goes out as an ordinary native-IPv6 socket call from the
-CPE's own process, so it structurally can't be routed through `xdp_dslite_encap`/`decap` (those only ever
-see LAN-originated IPv4 or WAN-arriving AFTR-tunneled traffic, neither of which this is) — verified live
-against the netns rig (see below) by capturing on the AFTR's own decap interface during a DNS-proxied
-query and confirming zero packets arrive there. `-dns-proxy` requires at least one DNS server from either
-source; `run()` fails fast at startup if none are available (e.g. `-aftr` was given directly, skipping
-DHCPv6 discovery entirely, and no `-dns-server` was given either).
-
-A DHCPv4 server (RFC 2131/2132) is also implemented, behind `-dhcpv4`, orthogonal to all of the above: it
-hands LAN clients the private IPv4 address the DS-Lite softwire carries (`pkg/dhcpv4`). Each `-lan`
-interface serves its own subnet — taken from the `-lan` value's optional `/prefixlen` (default `/24`) — with
-its gateway IP as the offered router. The DNS server offered (option 6) is `-dhcpv4-dns` if given, else the
-gateway when `-dns-proxy` is running to answer there, else nothing (rather than pointing clients at a port
-nothing listens on). The advertised interface MTU (option 26) is the WAN
-MTU minus the 40-byte DS-Lite tunnel overhead (or the explicit `-lan` MTU if set), so LAN clients size
-packets to fit the softwire. Getting DHCP to the server needed a *datapath* change: a DHCP DISCOVER/REQUEST
-is sent to the limited-broadcast address, and `xdp_dslite_encap` (attached to the LAN interface, running
-before minuteman's own AF_PACKET DHCP socket) was wrapping it into the softwire like any other IPv4 packet.
-`xdp_dslite_encap` now bypasses (`XDP_PASS`) non-unicast IPv4 destinations (limited broadcast + multicast,
-`is_non_unicast_dst`) — which is correct in its own right, since a point-to-point softwire to one AFTR must
-never carry broadcast/multicast — so those packets reach the local stack and the DHCP server; unicast DHCP
-renewals to the gateway were already bypassed by `is_local_gateway_dst`. Verified end-to-end against the
-netns rig with a real `dhclient` (DORA, the pool's first address, the gateway default route, and the
-DS-Lite-adjusted MTU all applied, then the DS-Lite data path exercised over that DHCP-assigned config).
-
-A native-IPv6 forwarding fastpath is also implemented, always on (no flag), extending the datapath beyond
-DS-Lite's IPv4-only tunneling: transit IPv6 that previously fell to `XDP_PASS` (the kernel slow path) is
-now routed directly in XDP by `handle_ipv6_forward` — a plain IPv6 router step (`bpf_fib_lookup(AF_INET6)`
-→ L2 rewrite → hop-limit decrement → `bpf_redirect_map`), shared by the LAN-ingress (encap) and WAN-ingress
-(decap) programs. It's deliberately conservative: multicast/link-local destinations, FIB non-`SUCCESS`
-results (local delivery to the CPE, unresolved neighbors, forwarding disabled), and same-interface/unmanaged
-egress all fall back to `XDP_PASS`, so NDP/RA/DHCPv6/MLD and everything addressed to the CPE keep working on
-the kernel path. Because IPv6 now lives in the fastpath, PMTUD is served there too: an egress MTU that's too
-small makes the datapath originate ICMPv6 Packet Too Big itself (`send_icmpv6_pkt_too_big`, a plain XDP_TX
-reply back out the ingress interface). An *optional* software-RSS stage (`-ipv6-sw-rss`, off by default —
-redundant on hardware-RSS NICs like mlx4) fans this forwarding across CPUs via a dedicated cpumap
-(`xdp_ipv6_fwd_cpu` + `cpu_map_v6`, kept separate from the dormant DS-Lite fanout). Verified end-to-end
-against the netns rig (`MM_DUALSTACK=1`): native IPv6 reaches the simulated internet with zero packets on
-the softwire and a non-zero datapath IPv6-forward counter; `MM_IPV6_SW_RSS=1` additionally confirms the
-fanout; and a forced-small WAN MTU confirms a LAN client caches the datapath-originated PtB's advertised
-MTU.
+All of the above has been verified end-to-end against the netns rig (see Testing below).
 
 `internal/` holds `cliconfig` (CLI flag parsing), `lanprefix` (DHCPv6-PD LAN policy, including RA
 serving), and `wanextend` (NDProxy LAN policy, including RA serving and host-route management);
 `pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/`pkg/prefixdelegation`/`pkg/routeradvert`/`pkg/ndproxy`/
 `pkg/netlink`/`pkg/dnsproxy`/`pkg/dhcpv4` are the reusable protocol packages.
 
-Also not yet implemented: the migration technologies other than DS-Lite that an HB46PP response can
-describe (`map_e`/`map_t`/`lw4o6`/`464xlat`/`ipip`). `pkg/hb46pp` already decodes the response's
-`order`-ranked technology list and preserves those technologies' parameter objects raw
-(`json.RawMessage` fields on `hb46pp.Provisioning`), so implementing one of them means adding its typed
-parameter struct there, its datapath, and extending `cmd/minuteman`'s policy beyond the current
-dslite-only capability request. Also not acted on yet: periodic re-discovery — both
-`aftrdiscovery.Result` and `hb46pp.Result` report their refresh interval (RFC 4242's, and HB46PP's
-`ttl`/20-24h default, respectively), and `hb46pp.Result.Provisioning.Token` is decoded but never echoed
-back on a later request, but `cmd/minuteman` discovers once at startup and never re-runs discovery.
-Implementing this needs more than a timer: RFC 3315 says re-discovery should also trigger on the WAN
-address changing, and the harder part is applying a *changed* AFTR to the live datapath safely (today
-`SetB4Config` is only ever called once, before the datapath is considered "up") without disrupting
-in-flight softwire traffic.
+Not yet implemented:
+- The migration technologies other than DS-Lite that an HB46PP response can describe (`map_e`/`map_t`/
+  `lw4o6`/`464xlat`/`ipip`). `pkg/hb46pp` already decodes the response's `order`-ranked technology list
+  and preserves those technologies' parameter objects raw (`json.RawMessage` on `hb46pp.Provisioning`),
+  so implementing one means adding its typed parameter struct there, its datapath, and extending
+  `cmd/minuteman`'s policy beyond the current dslite-only capability request.
+- Periodic AFTR re-discovery — both `aftrdiscovery.Result` and `hb46pp.Result` report their refresh
+  interval (RFC 4242's, and HB46PP's `ttl`/20-24h default), and `hb46pp.Result.Provisioning.Token` is
+  decoded but never echoed back on a later request, but `cmd/minuteman` discovers once at startup and
+  never re-runs discovery. Needs more than a timer: RFC 3315 says re-discovery should also trigger on the
+  WAN address changing, and the harder part is applying a *changed* AFTR to the live datapath safely
+  (today `SetB4Config` is only ever called once, before the datapath is considered "up") without
+  disrupting in-flight softwire traffic.
 
 ## Build commands
 
@@ -137,9 +82,9 @@ rig — see "Testing: netns DS-Lite rig" below.
 
 ## Testing: netns DS-Lite rig
 
-`test/netns/` builds a 5-namespace RFC 6333 topology (`mm-host` LAN client → `mm-cpe` running minuteman as
-the B4 → `mm-isp` IPv6 access network → `mm-aftr` AFTR simulator → `mm-inet` simulated public IPv4 internet)
-to exercise the datapath end-to-end without physical hardware:
+`test/netns/` builds a 5-namespace RFC 6333 topology (LAN client → CPE running minuteman as the B4 → IPv6
+access network → AFTR simulator → simulated public IPv4 internet) to exercise the datapath end-to-end
+without physical hardware:
 
 ```sh
 sudo ./test/netns/setup.sh       # builds the namespaces/veths/routing/NAT
@@ -148,109 +93,27 @@ sudo ./test/netns/smoketest.sh   # starts minuteman itself + pings/curls end-to-
 sudo ./test/netns/teardown.sh    # tears everything down (always safe to re-run)
 ```
 
-`common.sh` holds every namespace/interface/address name in one place; the other scripts source it rather
-than repeating the topology. `mm-isp` runs dnsmasq for RA + DNS and Kea for DHCPv6 (stateless RFC 3736
-service and DHCPv6-PD — only one process can bind port 547, and dnsmasq has no PD support). How the AFTR's
-address is published is selectable at setup time via `MM_AFTR_DISCOVERY`:
-- `dhcpv6` (default): Kea serves a real RFC 6334 `OPTION_AFTR_NAME` (hand-encoded in `common.sh`'s
-  `encode_dns_name`, since neither server has a built-in encoder for it) that dnsmasq's DNS resolves to the
-  AFTR's tunnel address, exercising `pkg/aftrdiscovery`.
-- `hb46pp`: Kea withholds option 64, so minuteman's discovery falls back to HB46PP — dnsmasq serves the
-  `4over6.info` discovery TXT record pointing at a `python3 -m http.server` in `mm-isp` that serves the
-  provisioning JSON as a static `rule.cgi` file (python's handler ignores the query string, so minuteman's
-  real query parameters are accepted and simply unread), exercising `pkg/hb46pp` end-to-end. `setup.sh`
-  records the mode in `$RUNDIR/aftr-discovery-mode` so `smoketest.sh` asserts the matching discovery checks.
-
-How the LAN gets IPv6 reachability is a separate, orthogonal choice, selectable via `MM_WAN_MODEL`:
-- `dhcpv6-pd` (default): Kea's `subnet6` includes a `pd-pools` entry delegating `PD_POOL_PREFIX`, and
-  `run-cpe.sh`/`smoketest.sh` start minuteman with `-dhcpv6-pd`, exercising `pkg/prefixdelegation` +
-  `internal/lanprefix` end-to-end (the existing DHCPv6-PD + RA/SLAAC checks below).
-- `ndproxy`: Kea's `subnet6` omits `pd-pools` entirely (this mode's whole premise is an ISP that hands out
-  no distinct delegation), and the scripts start minuteman with `-ndproxy` instead. `mm-isp`'s dnsmasq RA
-  on the WAN link (already running regardless of `MM_WAN_MODEL`, for both AFTR discovery and this) is what
-  minuteman's `internal/wanextend.DiscoverPrefix` learns `WAN_PREFIX` from; `smoketest.sh` then confirms the
-  actual RFC 4389 proxying behavior by having `mm-isp` — L2-adjacent to `mm-cpe`'s WAN link and itself the
-  origin of the on-link `WAN_PREFIX` RA there — ping `mm-host`'s SLAAC'd address directly: that only
-  succeeds if minuteman's `pkg/ndproxy` intercepted the resulting Neighbor Solicitation on the WAN link,
-  actively verified `mm-host` via an LAN-side probe, answered on its behalf, and `internal/wanextend
-  .HostRoutes` installed the resulting host route. `setup.sh` also disables RFC 4941 privacy addresses on
-  `mm-host` (`use_tempaddr=0`) so there's exactly one deterministic SLAAC address for `smoketest.sh` to
-  target this way. `setup.sh` records the mode in `$RUNDIR/wan-model` so `run-cpe.sh`/`smoketest.sh` start
-  minuteman with the matching flag and `smoketest.sh` asserts the matching checks.
-
-A third, independent toggle, `MM_DNS_PROXY` (`0` default or `1`), adds `-dns-proxy` to the minuteman
-invocation (`run-cpe.sh`/`smoketest.sh` read `$RUNDIR/dns-proxy-enabled`, matching the other two toggles'
-own state-file pattern). It needs only a DNS server address, which Kea's `dns-servers` option-data always
-provides regardless of `MM_AFTR_DISCOVERY`/`MM_WAN_MODEL`, so it composes with either. `smoketest.sh` has
-`mm-host` `dig` the AFTR-Name `A`/`AAAA` record — the same one `mm-isp` itself answers directly for the
-AFTR-discovery checks above — through minuteman's LAN gateway IP instead, over both UDP and TCP, and
-checks the answer matches; a live run also confirmed via `tcpdump -i dslite0` on `mm-aftr` that zero
-packets cross the softwire during a DNS-proxied query (see `pkg/dnsproxy`'s own entry in Architecture for
-why that's structurally guaranteed, not just empirically true this once).
-
-A fourth, independent toggle, `MM_DHCPV4` (`0` default or `1`), adds `-dhcpv4` and exercises the DHCPv4
-server. Because a LAN client can no longer be given a static IPv4 (it must obtain one from the server),
-`setup.sh` in this mode leaves `mm-host` without a static address or default route, and `smoketest.sh` — as
-its very first check, before anything else assumes the host has IPv4 — runs a real `dhclient` in `mm-host`
-to acquire them, then asserts the pool's first address (`.2`), the gateway default route, and the
-DS-Lite-adjusted interface MTU (`1460`, from option 26) all landed; every later check (DNS proxy, the
-DS-Lite data path) then runs over that DHCP-assigned config, so the whole rig doubles as an end-to-end
-DHCPv4 test. `dhclient` is given a small conf requesting `interface-mtu` so it applies option 26.
-`teardown.sh` also stops any `dhclient` left running in `mm-host`.
-
-A fifth, independent toggle, `MM_DUALSTACK` (`0` default or `1`), exercises RFC 6333's core dual-stack
-premise — a DS-Lite B4 tunnels *only* IPv4; native IPv6 is forwarded directly, never through the softwire.
-It changes no minuteman flag (that behavior is inherent to `xdp_dslite_encap`, which only ever matches
-`ETH_P_IP` and `XDP_PASS`es everything else — see the datapath entry in Architecture): `setup.sh` instead
-gives `mm-inet` a *native* IPv6 address (`2001:db8:beef::/64`, a second subnet on the aftr↔inet link)
-alongside its IPv4, wires the native-IPv6 forwarding path (`mm-aftr` becomes a plain IPv6 router for that
-subnet in addition to its DS-Lite decap role — `net.ipv6.conf.all.forwarding=1`; `mm-isp` learns a route to
-it, plus — in `dhcpv6-pd` mode only — a return route to the delegated `/56` via `mm-cpe`'s pinned WAN
-address, since Kea delegates but installs no kernel route; in `ndproxy` mode the return path is already
-on-link via minuteman's RFC 4389 proxying), and has dnsmasq serve one FQDN (`dualstack.example.com`) with
-both an `A` and an `AAAA` record. `smoketest.sh` then asserts `mm-host` holds both an IPv4 (static or
-DHCPv4) and a global SLAAC IPv6 address, resolves the FQDN once per family, and — capturing on the AFTR's
-`dslite0` throughout — confirms the `A`/IPv4 ping reaches `mm-inet` *and crosses* the tunnel (a non-zero
-packet count, the positive control) while the `AAAA`/IPv6 ping reaches `mm-inet` natively with *zero*
-packets on `dslite0`. In this mode `smoketest.sh` also proves the native-IPv6 path was carried by
-minuteman's *XDP forwarding fastpath* rather than the kernel slow path (which the dslite0/reachability
-checks alone can't distinguish): it starts minuteman with `-stats-interval 2s` and asserts the logged
-datapath `IPv6Fwd` counter advanced. A further independent toggle, `MM_IPV6_SW_RSS` (`0` default or `1`),
-adds `-ipv6-sw-rss` to that invocation and additionally asserts the `IPv6RSSRedirect` counter advanced
-(the cpumap fanout engaged). Composes with all four toggles above; pairs naturally with `MM_DHCPV4=1` for
-the "host has both a DHCPv4 and an IPv6 address" case. Verified passing for `MM_DUALSTACK=1` against both
-`MM_WAN_MODEL=dhcpv6-pd` (with `MM_DHCPV4=1`) and `MM_WAN_MODEL=ndproxy`, and with `MM_IPV6_SW_RSS=1`; the
-datapath's ICMPv6-Packet-Too-Big origination was verified separately by forcing a small WAN egress MTU and
-confirming a LAN client caches the advertised path MTU.
+Six independent env-var toggles select what `setup.sh` builds and what `smoketest.sh` asserts —
+`MM_AFTR_DISCOVERY` (`dhcpv6`/`hb46pp`), `MM_WAN_MODEL` (`dhcpv6-pd`/`ndproxy`), `MM_DNS_PROXY`,
+`MM_DHCPV4`, `MM_DUALSTACK`, `MM_IPV6_SW_RSS` — plus the full list of verified-passing combinations. See
+**`test/netns/README.md`** for all of that detail; it's a rig-operation runbook, not something most tasks
+need loaded up front.
 
 `run-cpe.sh` and `smoketest.sh` deliberately omit `-aftr` so minuteman discovers it live against the rig —
 pass `-aftr <addr>` as an extra argument to either script to override with a static address instead.
 
-Two things worth knowing if you touch these scripts:
-- `mm-cpe` needs both `net.ipv4.ip_forward=1` and `net.ipv6.conf.all.forwarding=1`, or `bpf_fib_lookup()` in
-  the datapath returns `BPF_FIB_LKUP_RET_FWD_DISABLED` for every packet and nothing gets encapsulated;
-  `net.ipv6.conf.<if>.accept_ra=2` is then needed on top so RA/SLAAC still works with forwarding on.
-  `setup.sh` no longer sets these itself — `pkg/datapath.Loader.AttachWAN` does (see Architecture below), so
-  they're applied whenever minuteman runs, not just inside this test rig.
+Two things that will break the rig if changed casually:
+- `mm-cpe` needs both `net.ipv4.ip_forward=1` and `net.ipv6.conf.all.forwarding=1`, or `bpf_fib_lookup()`
+  returns `BPF_FIB_LKUP_RET_FWD_DISABLED` for every packet — but this is applied by
+  `pkg/datapath.Loader.AttachWAN` itself (see Architecture below), not by `setup.sh`, so it happens
+  whenever minuteman runs, not just in this rig.
 - mm-isp's dnsmasq must be started, and mm-cpe's WAN link brought up, in that order — Linux only retries
-  Router Solicitation a few times right after an interface comes up, so if the RA server isn't listening yet
-  the CPE gives up and never gets a default route; `setup.sh` sequences this deliberately, don't reorder it.
-  Likewise the `dhcp-range=::,constructor:<iface>,ra-only` form is required (not bare `::`) or dnsmasq
-  never actually replies to Router Solicitations despite logging that RA is enabled.
+  Router Solicitation a few times right after an interface comes up, so a late RA server means the CPE
+  never gets a default route; `setup.sh` sequences this deliberately, don't reorder it.
 
-The AFTR's decap step uses a kernel `ip6tnl` (mode `ipip6`) device, which needs the `ip6_tunnel` module.
-`setup.sh` checks for it up front with a specific diagnostic for the common Arch situation where a kernel
-package upgrade has replaced `/lib/modules/<old-version>/` before a reboot, leaving the currently *running*
-kernel without a matching module directory (`uname -r` disagrees with what's on disk) — reboot to fix that.
-The full smoketest (AFTR discovery, LAN IPv6 reachability, LAN IPv4 provisioning, and the DS-Lite data path
-end-to-end through the AFTR's decap+NAPT44 to the simulated internet and back, ICMP and TCP) has been
-verified passing from a fresh setup for `MM_AFTR_DISCOVERY=dhcpv6`/`hb46pp` (both against the `dhcpv6-pd`
-WAN model), for `MM_WAN_MODEL=dhcpv6-pd`/`ndproxy` (both against `dhcpv6` AFTR discovery), for
-`MM_DNS_PROXY=1`, for `MM_DHCPV4=1` (both against `dhcpv6`/`dhcpv6-pd`), and for `MM_DUALSTACK=1` (against
-both WAN models); the default (all toggles off) was also re-run after the `xdp_dslite_encap`
-non-unicast-bypass change to confirm no regression. The uncrossed corners of the five independent axes
-haven't each been re-run, but they are independent code paths (AFTR discovery, LAN IPv6 provisioning, DNS
-forwarding, LAN IPv4 provisioning, native-IPv6 dual-stack) with no shared state.
+The AFTR's decap step uses a kernel `ip6tnl` device, which needs the `ip6_tunnel` module; `setup.sh`
+checks for it up front (with an Arch-specific diagnostic for the common case where a kernel upgrade has
+orphaned the running kernel's module directory — reboot to fix that).
 
 ## Code style
 
