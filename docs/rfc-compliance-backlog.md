@@ -90,6 +90,41 @@ doesn't watch for the WAN address changing. Applying a *changed* AFTR to the liv
 `SetB4Config` is only ever called once, before the datapath is considered "up") without disrupting
 in-flight softwire traffic is the harder part of implementing this.
 
+**Fix direction**:
+
+Stage (a) — safe live switching + the re-discovery loop itself:
+- Replace the single `b4_config_map[0]` with a small fixed-slot `next_hops` array (value:
+  `{valid, aftr_addr, b4_addr}` — MACs/egress deliberately *not* frozen in; the per-packet
+  `lookup_aftr_nexthop` FIB resolution stays) plus a single-`__u32` `active_nh` index. Encap reads
+  `next_hops[active_nh]`; decap's `is_expected_dslite_peer` accepts any `valid` slot (2 fixed slots
+  suffice). This indirection is required for *any* live switch, draining or not:
+  `bpf_map_update_elem` on an ARRAY map copies the new value into the element **in place**
+  (`array_map_update_elem` → `copy_map_value`, `kernel/bpf/arraymap.c` — verified against mainline;
+  no RCU replacement without `BPF_F_LOCK`), so overwriting the live `b4_config` mid-traffic can yield
+  a torn half-old/half-new read. Write-new-slot-then-flip-one-word-index is the safe idiom.
+- `cmd/minuteman` grows the re-discovery loop: consume the refresh intervals
+  `aftrdiscovery.Result`/`hb46pp.Result` already report (echoing `hb46pp` `Token` back), and watch
+  the WAN address (`internal/wanextend.WatchChanges`'s shape). Policy: a re-discovery whose result
+  still contains the current AFTR is a **no-op** (DNS round-robin must not cause churn); a
+  WAN-address change is a hard switch — the AFTR's NAT state is keyed to the B4 address, so
+  in-flight flows are unrecoverable regardless and draining would be pointless; an AFTR-only change
+  is a hard switch in stage (a), a drain in stage (b).
+- The netns rig needs a second AFTR plus a record/provisioning swap mechanism to exercise this.
+
+Stage (b) — drain-window flow affinity, only for AFTR-only changes:
+- On switch, open a bounded drain window (~30-60 min) and register *new* inner-IPv4 flows (5-tuple
+  key; `BPF_NOEXIST` insert + re-lookup to settle the multi-RX-queue race) pointing at the new slot.
+  A flow-table **miss** during the window means a pre-switch flow → old slot. Window end: drop the
+  table, clear the old slot's `valid` (closing decap acceptance of the old AFTR). Inverting the
+  tracking this way — new flows during the window only, not all flows always — keeps steady-state
+  per-packet cost at zero and needs no GC daemon; the trade-off (flows outliving the window break)
+  is already bounded by the old AFTR's own NAT idle timeouts, and it's extendable to always-on
+  tracking + `last_seen_ns` GC if unbounded draining ever matters.
+- Corners: portless/fragmented traffic degrades to a ports=0 key; a full flow table forwards
+  unpinned via the active slot (never drops); plain `HASH`, not `LRU_HASH` (eviction would silently
+  unpin live flows mid-stream). No PROG_ARRAY/tail-call dispatch — the action variants stay an
+  inline switch — and the native-IPv6 fastpath is untouched (no AFTR involvement).
+
 ## 7. Minor / acceptable for a home CPE
 
 - RDNSS is only advertised while `-dns-proxy` is on; with it off (the default), an IPv6-only SLAAC LAN

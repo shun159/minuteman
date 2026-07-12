@@ -52,10 +52,12 @@ Not yet implemented:
   never re-runs discovery. Needs more than a timer: RFC 3315 says re-discovery should also trigger on the
   WAN address changing, and the harder part is applying a *changed* AFTR to the live datapath safely
   (today `SetB4Config` is only ever called once, before the datapath is considered "up") without
-  disrupting in-flight softwire traffic.
-- A handful of RFC 7084/6333 compliance gaps (RDNSS-in-RA is the highest-impact one — an IPv6-only SLAAC
-  LAN client currently gets no DNS server at all). See `docs/rfc-compliance-backlog.md` for the full,
-  priority-ordered list with the specific code each gap points at.
+  disrupting in-flight softwire traffic. A staged design for this (next-hop indirection with an atomic
+  active-index flip first, an optional drain-window flow-affinity stage on top) is recorded in
+  `docs/rfc-compliance-backlog.md`'s AFTR re-discovery entry.
+- A handful of RFC 7084/6333 compliance gaps (softwire fragmentation, RFC 6333 §5.3's MUST, is the
+  highest-impact one remaining). See `docs/rfc-compliance-backlog.md` for the full, priority-ordered
+  list with the specific code each gap points at.
 
 ## Build commands
 
