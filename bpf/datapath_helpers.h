@@ -17,6 +17,22 @@
 #define IPPROTO_ICMPV6 58
 #endif
 
+#ifndef IPPROTO_HOPOPTS
+#define IPPROTO_HOPOPTS 0
+#endif
+
+#ifndef IPPROTO_ROUTING
+#define IPPROTO_ROUTING 43
+#endif
+
+#ifndef IPPROTO_FRAGMENT
+#define IPPROTO_FRAGMENT 44
+#endif
+
+#ifndef IPPROTO_DSTOPTS
+#define IPPROTO_DSTOPTS 60
+#endif
+
 #ifndef ICMPV6_PKT_TOOBIG
 #define ICMPV6_PKT_TOOBIG 2
 #endif
@@ -86,7 +102,8 @@ struct icmpv6_pkt_too_big {
     struct ipv6_quote quote;
 };
 
-#define ICMPV6_PTB_REPLY_L3_LEN (sizeof(struct ipv6hdr) + sizeof(struct icmpv6_pkt_too_big))
+#define ICMPV6_PTB_REPLY_L3_LEN                                                          \
+    (sizeof(struct ipv6hdr) + sizeof(struct icmpv6_pkt_too_big))
 
 static __always_inline __u16
 checksum_fold32(__u32 csum)
@@ -350,6 +367,13 @@ ipv6_addr_is_unspecified(const struct in6_addr *a)
     return (a->s6_addr32[0] | a->s6_addr32[1] | a->s6_addr32[2] | a->s6_addr32[3]) == 0;
 }
 
+static __always_inline bool
+ipv6_addr_is_loopback(const struct in6_addr *a)
+{
+    return a->s6_addr32[0] == 0 && a->s6_addr32[1] == 0 && a->s6_addr32[2] == 0 &&
+           a->s6_addr32[3] == bpf_htonl(1);
+}
+
 /*
  * ICMPv6's checksum, unlike ICMPv4's, covers an IPv6 pseudo-header (source +
  * destination address, upper-layer length, next header = 58) in addition to
@@ -401,8 +425,7 @@ copy_ipv6_quote(struct ipv6_quote *quote, const struct ipv6hdr *ip6h)
  */
 static __always_inline void
 write_icmpv6_pkt_too_big(struct ethhdr *eth, struct ipv6hdr *iph,
-                         struct icmpv6_pkt_too_big *icmp,
-                         const struct ipv6_quote *quote,
+                         struct icmpv6_pkt_too_big *icmp, const struct ipv6_quote *quote,
                          const struct in6_addr *src6, __u32 mtu)
 {
     struct icmpv6_pkt_too_big msg = {};
@@ -477,16 +500,56 @@ inner_ip4_hash(const struct iphdr *iph, void *data_end)
  * replies) and MLD live, none of which a CPE forwards. Everything else (global
  * and ULA unicast) is a forwarding candidate; the FIB lookup then decides
  * whether it's actually transit or destined to us.
+ *
+ * The source must be checked too, mirroring the kernel's own ip6_forward: per
+ * RFC 4291 SS2.5.6 / RFC 4861, a link-local or unspecified source is only
+ * meaningful on its own link and must never be forwarded off it, and a
+ * multicast source is always malformed. Skipping this check would let a
+ * spoofed or misconfigured on-link source get FIB-routed and redirected
+ * cross-link, something the kernel path never does.
+ *
+ * Extension headers this fastpath doesn't walk (Hop-by-Hop Options, Routing,
+ * Destination Options -- RFC 8200 SS4 requires per-node processing of these;
+ * Fragment needs reassembly-aware handling) are also handed to the kernel
+ * rather than blindly redirected on their raw nexthdr value.
+ *
+ * ::1 (loopback) is rejected as both source and destination: per RFC 4291
+ * SS2.5.3 it must never appear on the wire of any link at all, so a router
+ * must not FIB-lookup or redirect it either way -- local-delivery semantics
+ * for it belong to the kernel, not this fastpath.
  */
 static __always_inline bool
 ipv6_is_forwardable(const struct ipv6hdr *ip6h)
 {
     __u8 d0 = ip6h->daddr.s6_addr[0];
+    __u8 s0 = ip6h->saddr.s6_addr[0];
 
     if (d0 == 0xff)
-        return false; /* ff00::/8 multicast */
+        return false; /* ff00::/8 multicast destination */
     if (d0 == 0xfe && (ip6h->daddr.s6_addr[1] & 0xc0) == 0x80)
-        return false; /* fe80::/10 link-local */
+        return false; /* fe80::/10 link-local destination */
+    if (ipv6_addr_is_loopback(&ip6h->daddr))
+        return false; /* ::1 destination */
+
+    if (ipv6_addr_is_unspecified(&ip6h->saddr))
+        return false; /* :: source */
+    if (s0 == 0xff)
+        return false; /* ff00::/8 multicast source (malformed) */
+    if (s0 == 0xfe && (ip6h->saddr.s6_addr[1] & 0xc0) == 0x80)
+        return false; /* fe80::/10 link-local source */
+    if (ipv6_addr_is_loopback(&ip6h->saddr))
+        return false; /* ::1 source */
+
+    switch (ip6h->nexthdr) {
+    case IPPROTO_HOPOPTS:
+    case IPPROTO_ROUTING:
+    case IPPROTO_FRAGMENT:
+    case IPPROTO_DSTOPTS:
+        return false;
+    default:
+        break;
+    }
+
     return true;
 }
 

@@ -107,7 +107,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, MAX_CPUS);
-    __type(key, __u32); /* fanout slot index */
+    __type(key, __u32);   /* fanout slot index */
     __type(value, __u32); /* target CPU id */
 } ipv6_rss_cpus SEC(".maps");
 
@@ -388,9 +388,8 @@ send_plain_icmp_frag_needed(struct xdp_md *ctx, __u64 l2_len,
  * unset, the packet is handed to the kernel to originate the PtB instead.
  */
 static __always_inline int
-send_icmpv6_pkt_too_big(struct xdp_md *ctx, __u64 l2_len,
-                        const struct ipv6hdr *orig_ip6h, const struct in6_addr *src6,
-                        __u32 mtu)
+send_icmpv6_pkt_too_big(struct xdp_md *ctx, __u64 l2_len, const struct ipv6hdr *orig_ip6h,
+                        const struct in6_addr *src6, __u32 mtu)
 {
     __u8 *data = (__u8 *)(long)ctx->data;
     __u8 *data_end = (__u8 *)(long)ctx->data_end;
@@ -493,8 +492,7 @@ handle_ipv6_forward(struct xdp_md *ctx, __u64 l2_len, struct ipv6hdr *ip6h,
          * the packet -- now that IPv6 lives in the fastpath, PMTUD must be
          * served here, not by the kernel slow path we've bypassed.
          */
-        return send_icmpv6_pkt_too_big(ctx, l2_len, ip6h, &cfg->b4_addr,
-                                       fib.mtu_result);
+        return send_icmpv6_pkt_too_big(ctx, l2_len, ip6h, &cfg->b4_addr, fib.mtu_result);
     }
     if (ret != BPF_FIB_LKUP_RET_SUCCESS) {
         /*
@@ -553,8 +551,7 @@ handle_ipv6_forward(struct xdp_md *ctx, __u64 l2_len, struct ipv6hdr *ip6h,
  * flows already and makes this redundant overhead).
  */
 static __always_inline int
-maybe_redirect_ipv6_to_cpu(struct xdp_md *ctx, const struct ipv6hdr *ip6h,
-                           void *data_end)
+maybe_redirect_ipv6_to_cpu(struct xdp_md *ctx, const struct ipv6hdr *ip6h, void *data_end)
 {
     __u32 key = FANOUT_KEY;
 
