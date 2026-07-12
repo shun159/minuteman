@@ -57,4 +57,5 @@ type Stats struct {
 	IPv6Fwd         uint64
 	IPv6Pass        uint64
 	IPv6RSSRedirect uint64
+	ICMPRateLimited uint64
 }

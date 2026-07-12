@@ -185,6 +185,12 @@ orphaned the running kernel's module directory — reboot to fix that).
     from the dormant DS-Lite `fanout_*`/`cpu_map`). Per-path counters live in the `stats` `PERCPU_ARRAY`
     (see `enum stat_id`; the field/index order in `pkg/datapath/stats.go`'s `statID` and the `Stats` struct
     must be kept in sync with it by hand — new counters are appended before `STAT_MAX`).
+  - Every ICMP error the datapath originates (`send_plain_icmp_frag_needed`,
+    `send_dslite_icmp_frag_needed`, `send_icmpv6_pkt_too_big`) is gated by `icmp_error_allowed()`, a
+    per-CPU token bucket (`icmp_error_rate` `PERCPU_ARRAY`, 100/s sustained + 20 burst per CPU) — RFC 4443
+    §2.4(f) makes rate-limiting originated ICMPv6 errors a MUST, and these `XDP_TX` replies bypass the
+    kernel's own `icmp_ratelimit` sysctls entirely. When the bucket is empty the offending packet is
+    dropped without an error (mirroring the kernel's own behavior), counted in `STAT_ICMP_RATE_LIMITED`.
   - **`bpf/datapath_helpers.h`** — shared low-level helpers (checksum fold/compute, IPv4 TTL decrement with
     incremental checksum update, IPv6 hop-limit decrement (`decrease_ipv6_hoplimit` — no checksum, so
     trivial), L2(+VLAN)/IPv4/IPv6 header parsing with bounds checks, IPv6 address comparison and
