@@ -43,6 +43,18 @@ struct fanout_config {
     __u32 cpu_count;
 };
 
+/*
+ * Software-RSS configuration for the native-IPv6 forwarding fastpath. Kept
+ * entirely separate from the DS-Lite fanout_config above (and its cpu_map): the
+ * DS-Lite CPU-fanout scaffold is dormant -- never enabled from userspace -- and
+ * IPv6 software RSS must be independently switchable without waking it. Off by
+ * default; enabled only when the NIC's hardware RSS can't spread flows itself.
+ */
+struct ipv6_rss_config {
+    __u32 enabled;
+    __u32 cpu_count;
+};
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
@@ -85,6 +97,27 @@ struct {
     __type(value, struct bpf_cpumap_val);
 } cpu_map SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct ipv6_rss_config);
+} ipv6_rss_config_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, MAX_CPUS);
+    __type(key, __u32); /* fanout slot index */
+    __type(value, __u32); /* target CPU id */
+} ipv6_rss_cpus SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_CPUMAP);
+    __uint(max_entries, MAX_CPUS);
+    __type(key, __u32);
+    __type(value, struct bpf_cpumap_val);
+} cpu_map_v6 SEC(".maps");
+
 enum stat_id {
     STAT_PASS = 0,
     STAT_DROP,
@@ -106,6 +139,9 @@ enum stat_id {
     STAT_REDIRECT_WAN,
     STAT_REDIRECT_LAN,
     STAT_ICMP_FRAG_NEEDED,
+    STAT_IPV6_FWD,
+    STAT_IPV6_PASS,
+    STAT_IPV6_RSS_REDIRECT,
     STAT_MAX,
 };
 
@@ -341,6 +377,205 @@ send_plain_icmp_frag_needed(struct xdp_md *ctx, __u64 l2_len,
     return XDP_TX;
 }
 
+/*
+ * Sends an ICMPv6 "Packet Too Big" (RFC 4443 §3.2) reply straight back out the
+ * interface the offending packet arrived on. Used from the native-IPv6
+ * forwarding fastpath when the resolved egress link's MTU is too small: since
+ * IPv6 is never softwire-tunneled, the original sender is directly reachable via
+ * the ingress interface, so this is a plain (untunneled) reply -- the IPv6
+ * analogue of send_plain_icmp_frag_needed, not send_dslite_icmp_frag_needed.
+ * src6 is the router's own routable source address for the reply; if it's
+ * unset, the packet is handed to the kernel to originate the PtB instead.
+ */
+static __always_inline int
+send_icmpv6_pkt_too_big(struct xdp_md *ctx, __u64 l2_len,
+                        const struct ipv6hdr *orig_ip6h, const struct in6_addr *src6,
+                        __u32 mtu)
+{
+    __u8 *data = (__u8 *)(long)ctx->data;
+    __u8 *data_end = (__u8 *)(long)ctx->data_end;
+
+    if (ipv6_addr_is_unspecified(src6)) {
+        increase_stats_count(STAT_IPV6_PASS);
+        return XDP_PASS;
+    }
+
+    if (l2_len < sizeof(struct ethhdr) || l2_len > 64) {
+        increase_stats_count(STAT_ABORT);
+        return XDP_ABORTED;
+    }
+
+    if ((void *)orig_ip6h + ICMPV6_PTB_QUOTE_LEN > data_end) {
+        increase_stats_count(STAT_ABORT);
+        return XDP_ABORTED;
+    }
+
+    struct ipv6_quote quote = {};
+    copy_ipv6_quote(&quote, orig_ip6h);
+
+    if (mtu < IPV6_MIN_MTU)
+        mtu = IPV6_MIN_MTU;
+
+    __u32 new_len = (__u32)l2_len + (__u32)ICMPV6_PTB_REPLY_L3_LEN;
+    __u32 old_len = data_end - data;
+    if (new_len > old_len) {
+        increase_stats_count(STAT_ABORT);
+        return XDP_ABORTED;
+    }
+
+    if (bpf_xdp_adjust_tail(ctx, (int)new_len - (int)old_len) < 0) {
+        increase_stats_count(STAT_ABORT);
+        return XDP_ABORTED;
+    }
+
+    data = (__u8 *)(long)ctx->data;
+    data_end = (__u8 *)(long)ctx->data_end;
+
+    struct ethhdr *eth = (struct ethhdr *)data;
+    struct ipv6hdr *iph = (struct ipv6hdr *)(data + l2_len);
+    struct icmpv6_pkt_too_big *icmp =
+        (struct icmpv6_pkt_too_big *)(data + l2_len + sizeof(struct ipv6hdr));
+
+    if ((void *)(eth + 1) > data_end || (void *)(iph + 1) > data_end ||
+        (void *)(icmp + 1) > data_end) {
+        increase_stats_count(STAT_ABORT);
+        return XDP_ABORTED;
+    }
+
+    write_icmpv6_pkt_too_big(eth, iph, icmp, &quote, src6, mtu);
+
+    increase_stats_count(STAT_MTU_DROP);
+    increase_stats_count(STAT_ICMP_FRAG_NEEDED);
+    return XDP_TX;
+}
+
+/*
+ * Native-IPv6 forwarding fastpath, shared by the LAN-ingress (encap) and
+ * WAN-ingress (decap) programs and by the software-RSS cpumap stage. It is a
+ * plain IPv6 router step: FIB-resolve the next hop, rewrite L2, decrement the
+ * hop limit, and redirect out the egress interface -- doing in XDP what the
+ * kernel slow path would otherwise do for every transit IPv6 packet. Anything
+ * that isn't cleanly forwardable transit (local delivery to us, unresolved
+ * neighbors, too-big packets, link-local/multicast) is handed back to the
+ * kernel via XDP_PASS, so NDP/RA/DHCPv6/PMTUD all keep working unchanged.
+ *
+ * l2_len is ip6h's offset from the frame start (the L2 header length); the
+ * frame is rewritten in place, with no bpf_xdp_adjust_head.
+ */
+static __always_inline int
+handle_ipv6_forward(struct xdp_md *ctx, __u64 l2_len, struct ipv6hdr *ip6h,
+                    const struct b4_config *cfg)
+{
+    if (!ipv6_is_forwardable(ip6h)) {
+        increase_stats_count(STAT_IPV6_PASS);
+        return XDP_PASS;
+    }
+
+    /* Let the kernel synthesize ICMPv6 Time Exceeded (mirrors the IPv4 path). */
+    if (ip6h->hop_limit <= 1) {
+        increase_stats_count(STAT_IPV6_PASS);
+        return XDP_PASS;
+    }
+
+    struct bpf_fib_lookup fib = {};
+    fib.family = AF_INET6;
+    fib.l4_protocol = ip6h->nexthdr;
+    fib.tot_len = (__u16)(sizeof(*ip6h) + bpf_ntohs(ip6h->payload_len));
+    __builtin_memcpy(fib.ipv6_src, &ip6h->saddr, sizeof(fib.ipv6_src));
+    __builtin_memcpy(fib.ipv6_dst, &ip6h->daddr, sizeof(fib.ipv6_dst));
+    fib.ifindex = ctx->ingress_ifindex;
+
+    int ret = bpf_fib_lookup(ctx, &fib, sizeof(fib), 0);
+    if (ret == BPF_FIB_LKUP_RET_FRAG_NEEDED) {
+        /*
+         * The egress link's MTU is too small: an IPv6 router never fragments,
+         * so we originate ICMPv6 Packet Too Big ourselves rather than dropping
+         * the packet -- now that IPv6 lives in the fastpath, PMTUD must be
+         * served here, not by the kernel slow path we've bypassed.
+         */
+        return send_icmpv6_pkt_too_big(ctx, l2_len, ip6h, &cfg->b4_addr,
+                                       fib.mtu_result);
+    }
+    if (ret != BPF_FIB_LKUP_RET_SUCCESS) {
+        /*
+         * NOT_FWDED (destined to one of our own addresses -> local delivery,
+         * which keeps DHCPv6/dnsproxy/etc. working), NO_NEIGH (kernel resolves
+         * ND, then later packets fast-path), FWD_DISABLED,
+         * blackhole/unreachable/prohibit: all belong to the kernel slow path.
+         */
+        if (ret == BPF_FIB_LKUP_RET_NO_NEIGH)
+            increase_stats_count(STAT_FIB_NO_NEIGH);
+        else
+            increase_stats_count(STAT_IPV6_PASS);
+        return XDP_PASS;
+    }
+
+    /*
+     * Egress must be a managed interface (registered in tx_ports) and distinct
+     * from the ingress. The same-interface case -- e.g. ndproxy's shared /64
+     * before wanextend installs its /128 host route -- is left to the kernel's
+     * NDP/Redirect handling rather than hairpinned here.
+     */
+    if (fib.ifindex == ctx->ingress_ifindex) {
+        increase_stats_count(STAT_IPV6_PASS);
+        return XDP_PASS;
+    }
+    if (fib.ifindex != cfg->wan_ifindex && !get_lan_config(fib.ifindex)) {
+        increase_stats_count(STAT_FIB_WRONG_IF);
+        return XDP_PASS;
+    }
+
+    increase_stats_count(STAT_FIB_SUCCESS);
+
+    __u8 *data = (__u8 *)(long)ctx->data;
+    __u8 *data_end = (__u8 *)(long)ctx->data_end;
+
+    struct ethhdr *eth = (struct ethhdr *)data;
+    ip6h = (struct ipv6hdr *)(data + l2_len);
+    if ((void *)(eth + 1) > data_end || (void *)(ip6h + 1) > data_end) {
+        increase_stats_count(STAT_ABORT);
+        return XDP_ABORTED;
+    }
+
+    __builtin_memcpy(eth->h_dest, fib.dmac, ETH_ALEN);
+    __builtin_memcpy(eth->h_source, fib.smac, ETH_ALEN);
+    /* h_proto stays ETH_P_IPV6. */
+    decrease_ipv6_hoplimit(ip6h);
+
+    return redirect_to_ifindex(fib.ifindex, STAT_IPV6_FWD);
+}
+
+/*
+ * Optional software-RSS stage for native IPv6: when enabled, hash the flow and
+ * bounce the packet to another CPU's cpu_map_v6 queue (running xdp_ipv6_fwd_cpu)
+ * so forwarding work spreads across CPUs. Returns 0 -- forward inline on this
+ * CPU -- when disabled, which is the default (hardware RSS, e.g. mlx4, spreads
+ * flows already and makes this redundant overhead).
+ */
+static __always_inline int
+maybe_redirect_ipv6_to_cpu(struct xdp_md *ctx, const struct ipv6hdr *ip6h,
+                           void *data_end)
+{
+    __u32 key = FANOUT_KEY;
+
+    struct ipv6_rss_config *cfg = bpf_map_lookup_elem(&ipv6_rss_config_map, &key);
+    if (!cfg || !cfg->enabled || cfg->cpu_count == 0)
+        return 0;
+
+    __u32 h = inner_ip6_hash(ip6h, data_end);
+    __u32 idx = h % cfg->cpu_count;
+
+    if (idx >= MAX_CPUS)
+        return 0;
+
+    __u32 *cpu = bpf_map_lookup_elem(&ipv6_rss_cpus, &idx);
+    if (!cpu)
+        return 0;
+
+    increase_stats_count(STAT_IPV6_RSS_REDIRECT);
+    return bpf_redirect_map(&cpu_map_v6, *cpu, 0);
+}
+
 SEC("xdp")
 int
 xdp_dslite_encap(struct xdp_md *ctx)
@@ -356,6 +591,24 @@ xdp_dslite_encap(struct xdp_md *ctx)
         return XDP_DROP;
     }
     if (parsed == 0) {
+        /*
+         * Not IPv4. Native IPv6 gets the forwarding fastpath (LAN -> WAN, or
+         * LAN -> LAN); anything else (ARP, VLAN-tagged IPv6, ...) is left to
+         * the kernel.
+         */
+        __u64 l2_len6 = 0;
+        struct ipv6hdr *ip6h = 0;
+        if (parse_l2_ipv6(data, data_end, &l2_len6, &ip6h) == 1) {
+            struct b4_config *cfg6 = get_b4_config();
+            if (!cfg6) {
+                increase_stats_count(STAT_NO_CONFIG);
+                return XDP_PASS;
+            }
+            int action = maybe_redirect_ipv6_to_cpu(ctx, ip6h, data_end);
+            if (action)
+                return action;
+            return handle_ipv6_forward(ctx, l2_len6, ip6h, cfg6);
+        }
         increase_stats_count(STAT_PASS);
         return XDP_PASS;
     }
@@ -780,8 +1033,16 @@ xdp_dslite_decap(struct xdp_md *ctx)
     if (!cfg)
         return XDP_PASS;
 
-    if (outer_iph->nexthdr != IPPROTO_IPIP)
-        return XDP_PASS;
+    if (outer_iph->nexthdr != IPPROTO_IPIP) {
+        /*
+         * Native (non-softwire) IPv6 arriving on the WAN gets the forwarding
+         * fastpath (WAN -> LAN) instead of being passed to the kernel.
+         */
+        int v6action = maybe_redirect_ipv6_to_cpu(ctx, outer_iph, data_end);
+        if (v6action)
+            return v6action;
+        return handle_ipv6_forward(ctx, l2_len, outer_iph, cfg);
+    }
 
     if (!is_expected_dslite_peer(cfg, outer_iph))
         return XDP_PASS;
@@ -797,4 +1058,34 @@ xdp_dslite_decap(struct xdp_md *ctx)
         return action;
 
     return handle_xdp_dslite_decap(ctx);
+}
+
+/*
+ * Software-RSS second stage for native IPv6: runs on the CPU maybe_redirect_
+ * ipv6_to_cpu fanned the packet out to (via cpu_map_v6), re-parses the frame,
+ * and performs the same handle_ipv6_forward step there. Ingress ifindex is
+ * preserved across the cpumap redirect, so the FIB lookup and egress/ingress
+ * checks behave exactly as they would on the inline path.
+ */
+SEC("xdp/cpumap")
+int
+xdp_ipv6_fwd_cpu(struct xdp_md *ctx)
+{
+    __u8 *data = (__u8 *)(long)ctx->data;
+    __u8 *data_end = (__u8 *)(long)ctx->data_end;
+
+    __u64 l2_len = 0;
+    struct ipv6hdr *ip6h = 0;
+    if (parse_l2_ipv6(data, data_end, &l2_len, &ip6h) != 1) {
+        increase_stats_count(STAT_IPV6_PASS);
+        return XDP_PASS;
+    }
+
+    struct b4_config *cfg = get_b4_config();
+    if (!cfg) {
+        increase_stats_count(STAT_NO_CONFIG);
+        return XDP_PASS;
+    }
+
+    return handle_ipv6_forward(ctx, l2_len, ip6h, cfg);
 }

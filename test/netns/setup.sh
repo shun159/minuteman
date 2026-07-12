@@ -36,6 +36,17 @@
 # acquires its address/route/MTU from minuteman's DHCPv4 server via dhclient
 # in smoketest.sh, exercising pkg/dhcpv4.
 #
+# MM_DUALSTACK ("0"/unset (default) or "1") builds a dual-stack destination:
+# mm-inet gets a native IPv6 address (2001:db8:beef::/64) alongside its IPv4,
+# reachable from the LAN WITHOUT the DS-Lite softwire (host -> cpe -> isp ->
+# aftr-as-plain-IPv6-router -> inet), and dnsmasq serves DUALSTACK_FQDN with
+# both an A and an AAAA record. smoketest.sh then confirms RFC 6333's
+# dual-stack behavior: the A/IPv4 path crosses the AFTR's dslite0 tunnel while
+# the AAAA/IPv6 path does not. Changes no minuteman flag (IPv6-goes-native is
+# inherent to the XDP datapath). Composes with any of the four toggles above;
+# pairs naturally with MM_DHCPV4=1 so mm-host holds both a DHCPv4 and a SLAAC
+# address at once.
+#
 # After this completes, run minuteman as the B4 with test/netns/run-cpe.sh,
 # then test end-to-end connectivity with test/netns/smoketest.sh (both read
 # the modes this script recorded and act/assert accordingly).
@@ -81,6 +92,15 @@ case "$DHCPV4" in
 0 | 1) ;;
 *)
     echo "error: MM_DHCPV4 must be '0' or '1' (got '$DHCPV4')" >&2
+    exit 1
+    ;;
+esac
+
+DUALSTACK="${MM_DUALSTACK:-0}"
+case "$DUALSTACK" in
+0 | 1) ;;
+*)
+    echo "error: MM_DUALSTACK must be '0' or '1' (got '$DUALSTACK')" >&2
     exit 1
     ;;
 esac
@@ -224,6 +244,17 @@ EOF
 if [[ "$AFTR_DISCOVERY" == hb46pp ]]; then
     echo "txt-record=4over6.info,v=v6mig-1 url=$HB46PP_URL t=a" >>"$DNSMASQ_CONF"
 fi
+# In dual-stack mode dnsmasq resolves DUALSTACK_FQDN to both families: the A
+# record is mm-inet's public IPv4 (reached through the softwire + NAPT44),
+# the AAAA is mm-inet's native IPv6 (reached without the softwire). Two
+# separate address= lines -- one per family -- so a query for A returns the
+# IPv4 and a query for AAAA returns the IPv6.
+if [[ "$DUALSTACK" == 1 ]]; then
+    {
+        echo "address=/$DUALSTACK_FQDN/${PUBLIC_INET_ADDR%/*}"
+        echo "address=/$DUALSTACK_FQDN/${PUBLIC6_INET_ADDR%/*}"
+    } >>"$DNSMASQ_CONF"
+fi
 netns_exec "$NETNS_ISP" dnsmasq --conf-file="$DNSMASQ_CONF" --pid-file="$DNSMASQ_PIDFILE"
 
 # Only now -- with mm-isp's RA server already up and answering, per the
@@ -355,6 +386,7 @@ echo "$AFTR_DISCOVERY" >"$AFTR_DISCOVERY_MODE_FILE"
 echo "$WAN_MODEL" >"$WAN_MODEL_FILE"
 echo "$DNS_PROXY" >"$DNS_PROXY_ENABLED_FILE"
 echo "$DHCPV4" >"$DHCPV4_ENABLED_FILE"
+echo "$DUALSTACK" >"$DUALSTACK_ENABLED_FILE"
 
 echo "== mm-cpe: B4 element (minuteman runs here) =="
 # ip_forward/net.ipv6.conf.all.forwarding=1 (required for bpf_fib_lookup() in
@@ -406,6 +438,35 @@ echo "== mm-inet: simulated public IPv4 internet =="
 netns_exec "$NETNS_INET" ip addr add "$PUBLIC_INET_ADDR" dev "$VETH_INET_AFTR"
 netns_exec "$NETNS_INET" ip link set "$VETH_INET_AFTR" up
 disable_veth_offloads "$NETNS_INET" "$VETH_INET_AFTR"
+
+if [[ "$DUALSTACK" == 1 ]]; then
+    echo "== MM_DUALSTACK: native IPv6 path (no softwire) to a dual-stack mm-inet =="
+    # mm-aftr becomes a plain IPv6 router for this second subnet, in ADDITION
+    # to its DS-Lite decap role -- native IPv6 is forwarded by its normal FIB
+    # and never touches the dslite0 ip6tnl. (ip6_forwarding must be on for
+    # that; only ip_forward was set above, for the softwire's own inner-IPv4
+    # forwarding.)
+    netns_exec "$NETNS_AFTR" sysctl -qw net.ipv6.conf.all.forwarding=1
+    netns_exec "$NETNS_AFTR" ip addr add "$PUBLIC6_AFTR_ADDR" dev "$VETH_AFTR_INET"
+    # mm-inet's native IPv6 (the DUALSTACK_FQDN AAAA target) + its route back
+    # toward the LAN, via mm-aftr acting as the IPv6 router.
+    netns_exec "$NETNS_INET" ip addr add "$PUBLIC6_INET_ADDR" dev "$VETH_INET_AFTR"
+    netns_exec "$NETNS_INET" ip -6 route add default via "${PUBLIC6_AFTR_ADDR%/*}"
+    # mm-isp is the IPv6 crossroads: it must know how to reach mm-inet's new
+    # /64 (forward direction: LAN -> internet) via mm-aftr...
+    netns_exec "$NETNS_ISP" ip -6 route add "$PUBLIC6_PREFIX" via "${CORE_AFTR_ADDR%/*}"
+    # ...and, in dhcpv6-pd mode, how to reach the LAN's delegated /56 (return
+    # direction) via mm-cpe's statically-pinned WAN address. Kea delegates the
+    # prefix but installs no kernel route for it, so without this the reply
+    # traffic from mm-inet would have no way back to mm-host's SLAAC address.
+    # (In ndproxy mode the LAN's addresses are inside WAN_PREFIX, already
+    # on-link on mm-isp's own WAN interface and resolved by minuteman's RFC
+    # 4389 proxying, so no such route is needed -- see the ndproxy checks in
+    # smoketest.sh.)
+    if [[ "$WAN_MODEL" == dhcpv6-pd ]]; then
+        netns_exec "$NETNS_ISP" ip -6 route add "$PD_POOL_PREFIX" via "${WAN_CPE_ADDR%/*}"
+    fi
+fi
 
 echo "== done =="
 echo "Next: sudo ./test/netns/run-cpe.sh   (starts minuteman as the B4 in mm-cpe)"

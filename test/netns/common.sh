@@ -63,6 +63,25 @@ VETH_INET_AFTR=v-inet-aftr # in mm-inet
 PUBLIC_AFTR_ADDR=203.0.113.1/30
 PUBLIC_INET_ADDR=203.0.113.2/30
 
+# MM_DUALSTACK=1 (see setup.sh): mm-inet doubles as a dual-stack "public
+# server". Alongside its IPv4 (PUBLIC_INET_ADDR, reached through the DS-Lite
+# softwire + AFTR NAPT44), it gets a *native* IPv6 address on a second subnet
+# on the same aftr<->inet link. That native IPv6 is reached WITHOUT the
+# softwire -- host -> cpe -> isp -> aftr(acting as a plain IPv6 router, NOT
+# decapsulating) -> inet -- which is exactly RFC 6333's dual-stack premise:
+# a DS-Lite B4 tunnels only IPv4; IPv6 is forwarded natively (minuteman's
+# xdp_dslite_encap only ever matches ETH_P_IP and XDP_PASSes everything else,
+# so this is structurally guaranteed, not just configured). dnsmasq serves
+# DUALSTACK_FQDN with both an A and an AAAA record so smoketest.sh can steer
+# the LAN client down either path purely by DNS record type and confirm (via
+# tcpdump on the AFTR's dslite0) that only the IPv4/A path crosses the tunnel.
+# 2001:db8:beef::/64 is another slice of IANA's IPv6 documentation range
+# (RFC 3849), like PD_POOL_PREFIX.
+DUALSTACK_FQDN=dualstack.example.com
+PUBLIC6_PREFIX=2001:db8:beef::/64
+PUBLIC6_AFTR_ADDR=2001:db8:beef::1/64   # mm-aftr's end of the inet link (plain IPv6 router hop)
+PUBLIC6_INET_ADDR=2001:db8:beef::2/64   # mm-inet's native IPv6 == DUALSTACK_FQDN's AAAA
+
 # DS-Lite tunnel device inside mm-aftr (kernel ip6tnl, mode ipip6 = IPv4-in-IPv6,
 # i.e. RFC 6333's softwire encapsulation with next header IPPROTO_IPIP).
 AFTR_TUN=dslite0
@@ -142,6 +161,17 @@ DHCPV4_ENABLED_FILE="$RUNDIR/dhcpv4-enabled"
 DHCLIENT_CONF="$RUNDIR/dhclient.conf"
 DHCLIENT_LEASES="$RUNDIR/dhclient.leases"
 DHCLIENT_PIDFILE="$RUNDIR/dhclient.pid"
+
+# Whether setup.sh built the MM_DUALSTACK native-IPv6 topology above -- a
+# fifth independent toggle (orthogonal to the four above; it changes no
+# minuteman flag at all, since IPv6-goes-native is inherent to the datapath,
+# not a configurable option). smoketest.sh reads this to decide whether to run
+# the A-vs-AAAA record datapath checks. Off by default (MM_DUALSTACK unset or
+# "0"). Pairs naturally with MM_DHCPV4=1 to give mm-host both a DHCPv4 address
+# and a SLAAC IPv6 one -- the "host has both" case -- but works with mm-host's
+# static IPv4 too.
+DUALSTACK_ENABLED_FILE="$RUNDIR/dualstack-enabled"
+DUALSTACK_PCAP="$RUNDIR/dualstack-dslite.pcap"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MINUTEMAN_BIN="$REPO_ROOT/bin/minuteman"

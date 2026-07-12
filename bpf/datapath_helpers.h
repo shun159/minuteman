@@ -13,6 +13,18 @@
 #define IPPROTO_IPIP 4
 #endif
 
+#ifndef IPPROTO_ICMPV6
+#define IPPROTO_ICMPV6 58
+#endif
+
+#ifndef ICMPV6_PKT_TOOBIG
+#define ICMPV6_PKT_TOOBIG 2
+#endif
+
+#ifndef IPV6_MIN_MTU
+#define IPV6_MIN_MTU 1280
+#endif
+
 #ifndef AF_INET
 #define AF_INET 2
 #endif
@@ -52,6 +64,29 @@ struct icmp_frag_needed {
 };
 
 #define ICMP_FRAG_REPLY_L3_LEN (sizeof(struct iphdr) + sizeof(struct icmp_frag_needed))
+
+/*
+ * The invoking-packet quote carried in an ICMPv6 Packet Too Big: the offending
+ * IPv6 header plus 8 bytes past it. A fixed quote (like ipv4_quote) keeps the
+ * reply a constant size; RFC 4443 only requires as much of the original as fits
+ * within the minimum IPv6 MTU, and 40+8 bytes is well within it.
+ */
+struct ipv6_quote {
+    struct ipv6hdr iph;
+    __u8 data[8];
+};
+
+#define ICMPV6_PTB_QUOTE_LEN sizeof(struct ipv6_quote)
+
+struct icmpv6_pkt_too_big {
+    __u8 type;
+    __u8 code;
+    __u16 checksum;
+    __u32 mtu;
+    struct ipv6_quote quote;
+};
+
+#define ICMPV6_PTB_REPLY_L3_LEN (sizeof(struct ipv6hdr) + sizeof(struct icmpv6_pkt_too_big))
 
 static __always_inline __u16
 checksum_fold32(__u32 csum)
@@ -309,6 +344,91 @@ write_dslite_icmp_frag_needed(struct ethhdr *eth, struct ipv6hdr *outer_iph,
     __builtin_memcpy(icmp, &msg, sizeof(msg));
 }
 
+static __always_inline bool
+ipv6_addr_is_unspecified(const struct in6_addr *a)
+{
+    return (a->s6_addr32[0] | a->s6_addr32[1] | a->s6_addr32[2] | a->s6_addr32[3]) == 0;
+}
+
+/*
+ * ICMPv6's checksum, unlike ICMPv4's, covers an IPv6 pseudo-header (source +
+ * destination address, upper-layer length, next header = 58) in addition to
+ * the ICMPv6 message itself. All words are summed in network byte order.
+ */
+static __always_inline __u16
+icmpv6_checksum(const struct in6_addr *src, const struct in6_addr *dst,
+                const struct icmpv6_pkt_too_big *msg)
+{
+    __u32 csum = 0;
+    const __u16 *s = (const __u16 *)src;
+    const __u16 *d = (const __u16 *)dst;
+
+#pragma unroll
+    for (int i = 0; i < 8; i++)
+        csum += s[i];
+#pragma unroll
+    for (int i = 0; i < 8; i++)
+        csum += d[i];
+
+    __u32 len = sizeof(*msg);
+    csum += bpf_htons((__u16)(len >> 16));
+    csum += bpf_htons((__u16)(len & 0xffff));
+    csum += bpf_htons(IPPROTO_ICMPV6);
+
+    const __u16 *p = (const __u16 *)msg;
+#pragma unroll
+    for (int i = 0; i < sizeof(*msg) / 2; i++)
+        csum += p[i];
+
+    return checksum_fold32(csum);
+}
+
+static __always_inline void
+copy_ipv6_quote(struct ipv6_quote *quote, const struct ipv6hdr *ip6h)
+{
+    __builtin_memcpy(quote, ip6h, sizeof(*quote));
+}
+
+/*
+ * Writes an ICMPv6 "Packet Too Big" (RFC 4443 §3.2) reply in place of the
+ * packet currently at [eth, iph, icmp), addressed back to the invoking packet's
+ * source over a plain (untunneled) Ethernet+IPv6 frame. Used on the native-IPv6
+ * forwarding path when the resolved egress link's MTU is too small: the
+ * offending sender is directly reachable via the ingress interface (IPv6 is
+ * never softwire-tunneled), so no DS-Lite re-encapsulation is needed -- unlike
+ * write_dslite_icmp_frag_needed's IPv4 case. src6 is the router's own routable
+ * source address for the reply.
+ */
+static __always_inline void
+write_icmpv6_pkt_too_big(struct ethhdr *eth, struct ipv6hdr *iph,
+                         struct icmpv6_pkt_too_big *icmp,
+                         const struct ipv6_quote *quote,
+                         const struct in6_addr *src6, __u32 mtu)
+{
+    struct icmpv6_pkt_too_big msg = {};
+
+    swap_eth_addrs(eth);
+    eth->h_proto = bpf_htons(ETH_P_IPV6);
+
+    iph->version = 6;
+    iph->priority = 0;
+    __builtin_memset(iph->flow_lbl, 0, sizeof(iph->flow_lbl));
+    iph->payload_len = bpf_htons((__u16)sizeof(struct icmpv6_pkt_too_big));
+    iph->nexthdr = IPPROTO_ICMPV6;
+    iph->hop_limit = 64;
+    iph->saddr = *src6;
+    iph->daddr = quote->iph.saddr;
+
+    msg.type = ICMPV6_PKT_TOOBIG;
+    msg.code = 0;
+    msg.mtu = bpf_htonl(mtu);
+    msg.quote = *quote;
+    msg.checksum = 0;
+    msg.checksum = icmpv6_checksum(&iph->saddr, &iph->daddr, &msg);
+
+    __builtin_memcpy(icmp, &msg, sizeof(msg));
+}
+
 // https://qiita.com/qiita_kuru/items/54e4d902c86e40663119#murmurhash3-finalizer
 static __always_inline __u32
 murmur_mix(__u32 x)
@@ -341,6 +461,67 @@ inner_ip4_hash(const struct iphdr *iph, void *data_end)
     struct l4_ports *ports = (struct l4_ports *)((__u8 *)iph + sizeof(*iph));
     if ((void *)(ports + 1) <= data_end) {
         if (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP) {
+            h ^= ((__u32)bpf_ntohs(ports->sport) << 16);
+            h ^= (__u32)bpf_ntohs(ports->dport);
+        }
+    }
+
+    return murmur_mix(h);
+}
+
+/*
+ * A native IPv6 packet is eligible for the XDP forwarding fastpath only if its
+ * destination is a routable unicast address. Multicast (ff00::/8) and
+ * link-local (fe80::/10) destinations are handed to the kernel instead: that's
+ * where all of NDP (RS/RA/NS/NA/Redirect), DHCPv6 (ff02::1:2 + link-local
+ * replies) and MLD live, none of which a CPE forwards. Everything else (global
+ * and ULA unicast) is a forwarding candidate; the FIB lookup then decides
+ * whether it's actually transit or destined to us.
+ */
+static __always_inline bool
+ipv6_is_forwardable(const struct ipv6hdr *ip6h)
+{
+    __u8 d0 = ip6h->daddr.s6_addr[0];
+
+    if (d0 == 0xff)
+        return false; /* ff00::/8 multicast */
+    if (d0 == 0xfe && (ip6h->daddr.s6_addr[1] & 0xc0) == 0x80)
+        return false; /* fe80::/10 link-local */
+    return true;
+}
+
+/*
+ * IPv6 has no header checksum, so decrementing the hop limit is just a byte
+ * write -- unlike decrease_ipv4_ttl, which must fix up the IPv4 checksum too.
+ */
+static __always_inline void
+decrease_ipv6_hoplimit(struct ipv6hdr *ip6h)
+{
+    ip6h->hop_limit -= 1;
+}
+
+/*
+ * Flow hash over an IPv6 packet for software-RSS CPU fanout, mirroring
+ * inner_ip4_hash: full src/dst addresses + next header, plus the L4 ports when
+ * the next header is TCP/UDP and reachable. Extension headers aren't walked, so
+ * a packet whose transport is behind one hashes on addresses only -- fine for
+ * spreading load, since correctness never depends on the hash.
+ */
+static __always_inline __u32
+inner_ip6_hash(const struct ipv6hdr *ip6h, void *data_end)
+{
+    __u32 h = 0;
+
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        h ^= bpf_ntohl(ip6h->saddr.s6_addr32[i]);
+        h ^= bpf_ntohl(ip6h->daddr.s6_addr32[i]);
+    }
+    h ^= ((__u32)ip6h->nexthdr) << 16;
+
+    struct l4_ports *ports = (struct l4_ports *)((__u8 *)ip6h + sizeof(*ip6h));
+    if ((void *)(ports + 1) <= data_end) {
+        if (ip6h->nexthdr == IPPROTO_TCP || ip6h->nexthdr == IPPROTO_UDP) {
             h ^= ((__u32)bpf_ntohs(ports->sport) << 16);
             h ^= (__u32)bpf_ntohs(ports->dport);
         }

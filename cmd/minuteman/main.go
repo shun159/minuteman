@@ -25,6 +25,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -90,6 +91,19 @@ func main() {
 	}
 }
 
+// onlineCPUs returns the CPU ids to fan native-IPv6 forwarding across when
+// -ipv6-sw-rss is set: every logical CPU available to this process (0..N-1).
+// runtime.NumCPU already respects CPU-affinity/cgroup limits, so this matches
+// the CPUs the datapath can actually be scheduled on.
+func onlineCPUs() []uint32 {
+	n := runtime.NumCPU()
+	cpus := make([]uint32, n)
+	for i := range cpus {
+		cpus[i] = uint32(i)
+	}
+	return cpus
+}
+
 func run() error {
 	var (
 		wanIface       = flag.String("wan", "", "WAN interface name (required)")
@@ -102,6 +116,7 @@ func run() error {
 		dnsProxyOn     = flag.Bool("dns-proxy", false, "run a DNS proxy (RFC 6333's B4 SHOULD) on every -lan interface's gateway IP, port 53/UDP+TCP, forwarding queries directly over IPv6 to -dns-server (or the DHCPv6-learned DNS servers, if -dns-server is omitted) instead of through the DS-Lite softwire")
 		dhcpv4On       = flag.Bool("dhcpv4", false, "run a DHCPv4 server (RFC 2131) on every -lan interface, handing LAN clients an address from that interface's subnet (see -lan's optional /prefixlen, default /24), with the gateway IP as router and DNS (pair with -dns-proxy) and a DS-Lite-adjusted MTU")
 		dhcpv4Lease    = flag.Duration("dhcpv4-lease", 12*time.Hour, "DHCPv4 lease duration handed to LAN clients (with -dhcpv4)")
+		ipv6SwRSS      = flag.Bool("ipv6-sw-rss", false, "spread native-IPv6 forwarding-fastpath work across CPUs with a cpumap software-RSS stage; leave off when the NIC's hardware RSS already distributes flows (e.g. mlx4)")
 		hb46ppVendorID = flag.String("hb46pp-vendor-id", defaultHB46PPVendorID, "HB46PP vendorid query parameter sent during provisioning discovery fallback (vendor OUI, optionally -suffix)")
 		hb46ppProduct  = flag.String("hb46pp-product", defaultHB46PPProduct, "HB46PP product query parameter sent during provisioning discovery fallback")
 		hb46ppVersion  = flag.String("hb46pp-version", defaultHB46PPVersion, "HB46PP version query parameter sent during provisioning discovery fallback (digits/underscores only)")
@@ -198,6 +213,14 @@ func run() error {
 		if err := attachLAN(dp, spec); err != nil {
 			return err
 		}
+	}
+
+	if *ipv6SwRSS {
+		cpus := onlineCPUs()
+		if err := dp.EnableIPv6SoftwareRSS(cpus); err != nil {
+			return fmt.Errorf("enabling IPv6 software RSS: %w", err)
+		}
+		log.Printf("IPv6 software RSS: fanning native-IPv6 forwarding across %d CPUs", len(cpus))
 	}
 
 	var bgWG sync.WaitGroup

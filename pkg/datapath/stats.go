@@ -28,6 +28,9 @@ const (
 	statRedirectWAN
 	statRedirectLAN
 	statICMPFragNeeded
+	statIPv6Fwd
+	statIPv6Pass
+	statIPv6RSSRedirect
 	statMax
 )
 
@@ -35,26 +38,29 @@ const (
 func (l *Loader) Stats() (Stats, error) {
 	var s Stats
 	fields := [statMax]*uint64{
-		statPass:           &s.Pass,
-		statDrop:           &s.Drop,
-		statAbort:          &s.Abort,
-		statEncap:          &s.Encap,
-		statDecap:          &s.Decap,
-		statMTUDrop:        &s.MTUDrop,
-		statNoConfig:       &s.NoConfig,
-		statNoLANConfig:    &s.NoLANConfig,
-		statBypass:         &s.Bypass,
-		statFIBSuccess:     &s.FIBSuccess,
-		statFIBNoNeigh:     &s.FIBNoNeigh,
-		statFIBFail:        &s.FIBFail,
-		statFIBWrongIf:     &s.FIBWrongIf,
-		statDecapPass:      &s.DecapPass,
-		statDecapNotDSLite: &s.DecapNotDSLite,
-		statDecapBadPacket: &s.DecapBadPacket,
-		statDecapSlow:      &s.DecapSlow,
-		statRedirectWAN:    &s.RedirectWAN,
-		statRedirectLAN:    &s.RedirectLAN,
-		statICMPFragNeeded: &s.ICMPFragNeeded,
+		statPass:            &s.Pass,
+		statDrop:            &s.Drop,
+		statAbort:           &s.Abort,
+		statEncap:           &s.Encap,
+		statDecap:           &s.Decap,
+		statMTUDrop:         &s.MTUDrop,
+		statNoConfig:        &s.NoConfig,
+		statNoLANConfig:     &s.NoLANConfig,
+		statBypass:          &s.Bypass,
+		statFIBSuccess:      &s.FIBSuccess,
+		statFIBNoNeigh:      &s.FIBNoNeigh,
+		statFIBFail:         &s.FIBFail,
+		statFIBWrongIf:      &s.FIBWrongIf,
+		statDecapPass:       &s.DecapPass,
+		statDecapNotDSLite:  &s.DecapNotDSLite,
+		statDecapBadPacket:  &s.DecapBadPacket,
+		statDecapSlow:       &s.DecapSlow,
+		statRedirectWAN:     &s.RedirectWAN,
+		statRedirectLAN:     &s.RedirectLAN,
+		statICMPFragNeeded:  &s.ICMPFragNeeded,
+		statIPv6Fwd:         &s.IPv6Fwd,
+		statIPv6Pass:        &s.IPv6Pass,
+		statIPv6RSSRedirect: &s.IPv6RSSRedirect,
 	}
 
 	for id, dst := range fields {
