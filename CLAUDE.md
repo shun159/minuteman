@@ -73,6 +73,23 @@ renewals to the gateway were already bypassed by `is_local_gateway_dst`. Verifie
 netns rig with a real `dhclient` (DORA, the pool's first address, the gateway default route, and the
 DS-Lite-adjusted MTU all applied, then the DS-Lite data path exercised over that DHCP-assigned config).
 
+A native-IPv6 forwarding fastpath is also implemented, always on (no flag), extending the datapath beyond
+DS-Lite's IPv4-only tunneling: transit IPv6 that previously fell to `XDP_PASS` (the kernel slow path) is
+now routed directly in XDP by `handle_ipv6_forward` — a plain IPv6 router step (`bpf_fib_lookup(AF_INET6)`
+→ L2 rewrite → hop-limit decrement → `bpf_redirect_map`), shared by the LAN-ingress (encap) and WAN-ingress
+(decap) programs. It's deliberately conservative: multicast/link-local destinations, FIB non-`SUCCESS`
+results (local delivery to the CPE, unresolved neighbors, forwarding disabled), and same-interface/unmanaged
+egress all fall back to `XDP_PASS`, so NDP/RA/DHCPv6/MLD and everything addressed to the CPE keep working on
+the kernel path. Because IPv6 now lives in the fastpath, PMTUD is served there too: an egress MTU that's too
+small makes the datapath originate ICMPv6 Packet Too Big itself (`send_icmpv6_pkt_too_big`, a plain XDP_TX
+reply back out the ingress interface). An *optional* software-RSS stage (`-ipv6-sw-rss`, off by default —
+redundant on hardware-RSS NICs like mlx4) fans this forwarding across CPUs via a dedicated cpumap
+(`xdp_ipv6_fwd_cpu` + `cpu_map_v6`, kept separate from the dormant DS-Lite fanout). Verified end-to-end
+against the netns rig (`MM_DUALSTACK=1`): native IPv6 reaches the simulated internet with zero packets on
+the softwire and a non-zero datapath IPv6-forward counter; `MM_IPV6_SW_RSS=1` additionally confirms the
+fanout; and a forced-small WAN MTU confirms a LAN client caches the datapath-originated PtB's advertised
+MTU.
+
 `internal/` holds `cliconfig` (CLI flag parsing), `lanprefix` (DHCPv6-PD LAN policy, including RA
 serving), and `wanextend` (NDProxy LAN policy, including RA serving and host-route management);
 `pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/`pkg/prefixdelegation`/`pkg/routeradvert`/`pkg/ndproxy`/
@@ -181,6 +198,31 @@ DS-Lite data path) then runs over that DHCP-assigned config, so the whole rig do
 DHCPv4 test. `dhclient` is given a small conf requesting `interface-mtu` so it applies option 26.
 `teardown.sh` also stops any `dhclient` left running in `mm-host`.
 
+A fifth, independent toggle, `MM_DUALSTACK` (`0` default or `1`), exercises RFC 6333's core dual-stack
+premise — a DS-Lite B4 tunnels *only* IPv4; native IPv6 is forwarded directly, never through the softwire.
+It changes no minuteman flag (that behavior is inherent to `xdp_dslite_encap`, which only ever matches
+`ETH_P_IP` and `XDP_PASS`es everything else — see the datapath entry in Architecture): `setup.sh` instead
+gives `mm-inet` a *native* IPv6 address (`2001:db8:beef::/64`, a second subnet on the aftr↔inet link)
+alongside its IPv4, wires the native-IPv6 forwarding path (`mm-aftr` becomes a plain IPv6 router for that
+subnet in addition to its DS-Lite decap role — `net.ipv6.conf.all.forwarding=1`; `mm-isp` learns a route to
+it, plus — in `dhcpv6-pd` mode only — a return route to the delegated `/56` via `mm-cpe`'s pinned WAN
+address, since Kea delegates but installs no kernel route; in `ndproxy` mode the return path is already
+on-link via minuteman's RFC 4389 proxying), and has dnsmasq serve one FQDN (`dualstack.example.com`) with
+both an `A` and an `AAAA` record. `smoketest.sh` then asserts `mm-host` holds both an IPv4 (static or
+DHCPv4) and a global SLAAC IPv6 address, resolves the FQDN once per family, and — capturing on the AFTR's
+`dslite0` throughout — confirms the `A`/IPv4 ping reaches `mm-inet` *and crosses* the tunnel (a non-zero
+packet count, the positive control) while the `AAAA`/IPv6 ping reaches `mm-inet` natively with *zero*
+packets on `dslite0`. In this mode `smoketest.sh` also proves the native-IPv6 path was carried by
+minuteman's *XDP forwarding fastpath* rather than the kernel slow path (which the dslite0/reachability
+checks alone can't distinguish): it starts minuteman with `-stats-interval 2s` and asserts the logged
+datapath `IPv6Fwd` counter advanced. A further independent toggle, `MM_IPV6_SW_RSS` (`0` default or `1`),
+adds `-ipv6-sw-rss` to that invocation and additionally asserts the `IPv6RSSRedirect` counter advanced
+(the cpumap fanout engaged). Composes with all four toggles above; pairs naturally with `MM_DHCPV4=1` for
+the "host has both a DHCPv4 and an IPv6 address" case. Verified passing for `MM_DUALSTACK=1` against both
+`MM_WAN_MODEL=dhcpv6-pd` (with `MM_DHCPV4=1`) and `MM_WAN_MODEL=ndproxy`, and with `MM_IPV6_SW_RSS=1`; the
+datapath's ICMPv6-Packet-Too-Big origination was verified separately by forcing a small WAN egress MTU and
+confirming a LAN client caches the advertised path MTU.
+
 `run-cpe.sh` and `smoketest.sh` deliberately omit `-aftr` so minuteman discovers it live against the rig —
 pass `-aftr <addr>` as an extra argument to either script to override with a static address instead.
 
@@ -204,10 +246,11 @@ The full smoketest (AFTR discovery, LAN IPv6 reachability, LAN IPv4 provisioning
 end-to-end through the AFTR's decap+NAPT44 to the simulated internet and back, ICMP and TCP) has been
 verified passing from a fresh setup for `MM_AFTR_DISCOVERY=dhcpv6`/`hb46pp` (both against the `dhcpv6-pd`
 WAN model), for `MM_WAN_MODEL=dhcpv6-pd`/`ndproxy` (both against `dhcpv6` AFTR discovery), for
-`MM_DNS_PROXY=1`, and for `MM_DHCPV4=1` (both against `dhcpv6`/`dhcpv6-pd`); the default (all four toggles
-off) was also re-run after the `xdp_dslite_encap` non-unicast-bypass change to confirm no regression. The
-uncrossed corners of the four independent axes haven't each been re-run, but they are independent code
-paths (AFTR discovery, LAN IPv6 provisioning, DNS forwarding, LAN IPv4 provisioning) with no shared state.
+`MM_DNS_PROXY=1`, for `MM_DHCPV4=1` (both against `dhcpv6`/`dhcpv6-pd`), and for `MM_DUALSTACK=1` (against
+both WAN models); the default (all toggles off) was also re-run after the `xdp_dslite_encap`
+non-unicast-bypass change to confirm no regression. The uncrossed corners of the five independent axes
+haven't each been re-run, but they are independent code paths (AFTR discovery, LAN IPv6 provisioning, DNS
+forwarding, LAN IPv4 provisioning, native-IPv6 dual-stack) with no shared state.
 
 ## Code style
 
@@ -230,20 +273,59 @@ paths (AFTR discovery, LAN IPv6 provisioning, DNS forwarding, LAN IPv4 provision
     Fragmentation-Needed via `XDP_TX` when needed (`send_plain_icmp_frag_needed` — untunneled, since the LAN
     sender is directly reachable on the ingress interface), then wraps the packet in an outer
     Ethernet+IPv6(nexthdr=`IPPROTO_IPIP`) header and redirects it out the WAN ifindex via the `tx_ports`
-    `DEVMAP_HASH`.
+    `DEVMAP_HASH`. Native IPv6 arriving here (a LAN client's IPv6 transit traffic) is *not* IPv4, so instead
+    of being encapsulated it takes the native-IPv6 forwarding fastpath (`handle_ipv6_forward`, see below).
   - `xdp_dslite_decap` (`SEC("xdp")`, attach to the WAN interface) / `xdp_dslite_decap_cpu` (`SEC("xdp/cpumap")`
     second-stage variant): validates the outer IPv6 header matches the configured AFTR/B4 pair
     (`is_expected_dslite_peer`), optionally fans decap work out across CPUs first
     (`maybe_redirect_to_cpu` + the `cpu_map`/`fanout_*` maps, gated by `fanout_config.enabled`), strips the
     IPv6 header, resolves the LAN egress interface via `bpf_fib_lookup`, and — if the egress path MTU is too
     small — replies with an ICMPv4 Fragmentation-Needed re-encapsulated back through the softwire
-    (`send_dslite_icmp_frag_needed`, since the original IPv4 sender is only reachable via the AFTR).
+    (`send_dslite_icmp_frag_needed`, since the original IPv4 sender is only reachable via the AFTR). Native
+    (non-softwire) IPv6 arriving on the WAN — the `outer_iph->nexthdr != IPPROTO_IPIP` case, previously
+    `XDP_PASS`ed to the kernel — takes the same native-IPv6 forwarding fastpath instead.
+  - `handle_ipv6_forward` — the native-IPv6 forwarding fastpath, a plain IPv6 router step shared by the
+    encap (LAN-ingress), decap (WAN-ingress) and `xdp_ipv6_fwd_cpu` (software-RSS) programs. It does in XDP
+    what the kernel slow path would otherwise do for every transit IPv6 packet: `bpf_fib_lookup(AF_INET6)`,
+    rewrite L2 from the resolved `dmac`/`smac`, `decrease_ipv6_hoplimit`, and `bpf_redirect_map` out the
+    egress ifindex (`tx_ports`). It is deliberately conservative — anything that isn't cleanly forwardable
+    transit is handed back to the kernel via `XDP_PASS`, so NDP/RA/RS/NS/NA, DHCPv6, MLD and local delivery
+    all keep working unchanged: multicast (`ff00::/8`) and link-local (`fe80::/10`) destinations are rejected
+    up front (`ipv6_is_forwardable`); a FIB result other than `SUCCESS` is passed to the kernel (`NOT_FWDED`
+    = destined to one of the CPE's own addresses → local delivery, `NO_NEIGH` = kernel resolves ND then
+    later packets fast-path, `FWD_DISABLED`, unreachable/blackhole/prohibit); and an egress that is the
+    ingress interface, or not one of the managed WAN/LAN interfaces, is passed too. Unlike the plan's first
+    cut, PMTUD is served *here*, not deferred to the kernel: on `BPF_FIB_LKUP_RET_FRAG_NEEDED` it originates
+    ICMPv6 Packet Too Big itself (`send_icmpv6_pkt_too_big` → `write_icmpv6_pkt_too_big`, a plain untunneled
+    `XDP_TX` reply back out the ingress interface — IPv6 is never softwire-tunneled, so the sender is always
+    directly reachable, the IPv6 analogue of the encap path's `send_plain_icmp_frag_needed`), sourced from
+    the CPE's own `b4_addr` (falling back to `XDP_PASS` if that's unset). Native IPv6 forwarding is always
+    on (no flag), the same posture as DS-Lite's inner-IPv4 forwarding. Known simplifications: VLAN-tagged
+    IPv6 and packets whose transport is behind IPv6 extension headers stay on the kernel path; the PtB source
+    is the single `b4_addr` rather than a per-ingress-interface address.
+  - `xdp_ipv6_fwd_cpu` (`SEC("xdp/cpumap")`) + `maybe_redirect_ipv6_to_cpu` — an *optional* software-RSS
+    (CPU-fanout) stage for the native-IPv6 fastpath, off by default. When `ipv6_rss_config.enabled`, the
+    encap/decap entry programs hash the flow (`inner_ip6_hash`) and `bpf_redirect_map` the packet to another
+    CPU's `cpu_map_v6` queue, where `xdp_ipv6_fwd_cpu` re-parses and runs `handle_ipv6_forward` (ingress
+    ifindex is preserved across the redirect, so the FIB/egress checks behave identically). It uses its own
+    dedicated maps (`ipv6_rss_config_map`/`ipv6_rss_cpus`/`cpu_map_v6`) rather than the DS-Lite
+    `fanout_config`/`fanout_cpus`/`cpu_map` — the DS-Lite CPU-fanout scaffold is dormant (never enabled from
+    Go), and IPv6 software RSS must be switchable without waking it. It's for NICs whose hardware RSS can't
+    spread flows across CPUs; on hardware-RSS-capable NICs (e.g. mlx4) it's redundant and left off. Enabled
+    via `-ipv6-sw-rss` → `Loader.EnableIPv6SoftwareRSS`.
   - Config is held in BPF maps, not hardcoded: `b4_config_map` (single-entry `ARRAY`: B4/AFTR IPv6 addresses,
     fallback WAN MACs, WAN ifindex) and `lan_configs` (`HASH` keyed by LAN ifindex: gateway IPv4, inner MTU).
-    Per-path counters live in the `stats` `PERCPU_ARRAY` (see `enum stat_id`).
-  - **`bpf/datapath_helpers.h`** — shared low-level helpers (checksum fold/compute, TTL decrement with
-    incremental checksum update, L2(+VLAN)/IPv4/IPv6 header parsing with bounds checks, IPv6 address
-    comparison, ICMP Fragmentation-Needed message construction in both plain and DS-Lite-tunneled form).
+    The optional IPv6 software-RSS stage adds `ipv6_rss_config_map`/`ipv6_rss_cpus`/`cpu_map_v6` (separate
+    from the dormant DS-Lite `fanout_*`/`cpu_map`). Per-path counters live in the `stats` `PERCPU_ARRAY`
+    (see `enum stat_id`; the field/index order in `pkg/datapath/stats.go`'s `statID` and the `Stats` struct
+    must be kept in sync with it by hand — new counters are appended before `STAT_MAX`).
+  - **`bpf/datapath_helpers.h`** — shared low-level helpers (checksum fold/compute, IPv4 TTL decrement with
+    incremental checksum update, IPv6 hop-limit decrement (`decrease_ipv6_hoplimit` — no checksum, so
+    trivial), L2(+VLAN)/IPv4/IPv6 header parsing with bounds checks, IPv6 address comparison and
+    unspecified/forwardable classification (`ipv6_addr_equal`/`ipv6_addr_is_unspecified`/`ipv6_is_forwardable`),
+    IPv6 flow hashing (`inner_ip6_hash`), and ICMP error construction: ICMPv4 Fragmentation-Needed in both
+    plain and DS-Lite-tunneled form, plus ICMPv6 Packet Too Big (`write_icmpv6_pkt_too_big`, whose
+    `icmpv6_checksum` covers the IPv6 pseudo-header, unlike ICMPv4's).
   - **`bpf/uapi/linux/*.h`** — vendored kernel UAPI headers providing `#define` constants (`ETH_P_*`, `IP_DF`,
     `ICMP_*`) that the BTF-derived `bpf/vmlinux.h` (struct/union/enum definitions only, no macros) doesn't
     carry. `vmlinux.h` and these uapi headers are complementary: struct/type layouts come from BTF, numeric
@@ -266,6 +348,11 @@ paths (AFTR discovery, LAN IPv6 provisioning, DNS forwarding, LAN IPv4 provision
     packet until dnsmasq's next periodic RA, minutes later).
   - `config.go` — `SetB4Config(B4Config)`, `SetLANConfig(ifindex uint32, LANConfig)`; also registers each
     attached ifindex as a valid `bpf_redirect_map()` target in `tx_ports` (self-mapped ifindex → ifindex).
+  - `ipv6_rss.go` — `EnableIPv6SoftwareRSS([]uint32)` turns on the native-IPv6 software-RSS cpumap stage
+    across the given CPU ids: it populates `cpu_map_v6` with `bpfBpfCpumapVal{Qsize, prog: XdpIpv6FwdCpu.FD()}`
+    per CPU, fills `ipv6_rss_cpus` (slot → cpu), and sets `ipv6_rss_config{Enabled, CpuCount}`. Off unless
+    called (`-ipv6-sw-rss`). `cilium/ebpf` v0.21 has no high-level CPUMAP-with-program value helper, so the
+    raw `bpf_cpumap_val` struct bpf2go generated (`bpfBpfCpumapVal`) is `Put` directly.
   - `stats.go` — `Stats()` sums the `PERCPU_ARRAY` counters across CPUs into a plain `Stats` struct. The
     field/index order (`statID` in `stats.go`) must be kept manually in sync with `enum stat_id` in the C
     source — bpf2go can't export a Go enum here because `enum stat_id` never appears as a stored map value
@@ -466,6 +553,9 @@ paths (AFTR discovery, LAN IPv6 provisioning, DNS forwarding, LAN IPv4 provision
   validated in `run()` before anything else happens), `-dns-proxy` (opt-in DNS proxy, orthogonal to both
   IPv6-provisioning flags) with repeatable `-dns-server` to override its upstreams, `-dhcpv4` (opt-in DHCPv4
   server, orthogonal to everything else) with `-dhcpv4-lease` and repeatable `-dhcpv4-dns`,
+  `-ipv6-sw-rss` (opt-in native-IPv6 software-RSS cpumap fanout — off by default, for NICs whose hardware
+  RSS can't spread flows; when set, `run()` calls `dp.EnableIPv6SoftwareRSS(onlineCPUs())` after WAN/LAN
+  attach, once every egress ifindex is registered in `tx_ports`),
   `-hb46pp-vendor-id`/`-hb46pp-product`/`-hb46pp-version`
   (HB46PP client-identity query parameters — see below; default to the documentation OUI `acde48` since
   minuteman has no IEEE OUI, overridable since a VNE may key rollout/workaround decisions off them, not just

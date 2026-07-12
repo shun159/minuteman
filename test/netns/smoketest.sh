@@ -71,6 +71,28 @@ retry() {
     return 1
 }
 
+# dslite_capture runs "$@" while sniffing the AFTR's dslite0 softwire endpoint,
+# so a caller can tell whether the traffic it generated actually crossed the
+# DS-Lite tunnel. dslite0 only ever carries softwire-decapsulated (or about-to-
+# be-encapsulated) inner IPv4, so any packet seen there means the tunnel was
+# used and zero means it wasn't. Sets two globals: DSLITE_CONN (the command's
+# exit status) and DSLITE_PKTS (packets captured on dslite0 during the run).
+dslite_capture() {
+    rm -f "$DUALSTACK_PCAP"
+    ip netns exec "$NETNS_AFTR" tcpdump -i "$AFTR_TUN" -n -w "$DUALSTACK_PCAP" \
+        >/dev/null 2>&1 &
+    local td=$!
+    # Give tcpdump a moment to actually open the capture before generating
+    # traffic, or the first packets race the sniffer and go uncounted.
+    sleep 0.7
+    "$@"
+    DSLITE_CONN=$?
+    sleep 0.5
+    kill "$td" 2>/dev/null
+    wait "$td" 2>/dev/null
+    DSLITE_PKTS=$(tcpdump -r "$DUALSTACK_PCAP" 2>/dev/null | wc -l)
+}
+
 wan_model=dhcpv6-pd
 if [[ -f "$WAN_MODEL_FILE" ]]; then
     wan_model="$(cat "$WAN_MODEL_FILE")"
@@ -98,10 +120,28 @@ if [[ $dhcpv4_enabled -eq 1 ]]; then
     dhcpv4_flags=(-dhcpv4)
 fi
 
+dualstack_enabled=0
+if [[ -f "$DUALSTACK_ENABLED_FILE" && "$(cat "$DUALSTACK_ENABLED_FILE")" == 1 ]]; then
+    dualstack_enabled=1
+fi
+
 if ip netns pids "$NETNS_CPE" 2>/dev/null | xargs -r -I{} readlink -f /proc/{}/exe 2>/dev/null | grep -qx "$MINUTEMAN_BIN"; then
     echo "== minuteman already running in $NETNS_CPE, reusing it =="
 else
     echo "== starting minuteman in $NETNS_CPE (no -aftr: discovers it live via DHCPv6; $wan_model_flag: acquires/learns IPv6 for the LAN live too) =="
+    # In dual-stack mode we log datapath stats (interval 2s) so the IPv6
+    # fastpath assertion below can read the IPv6-forward counter; otherwise
+    # stats stay off (0) as before. MM_IPV6_SW_RSS=1 additionally enables the
+    # native-IPv6 software-RSS cpumap stage (and its counter assertion).
+    stats_interval=0
+    ipv6_rss_flags=()
+    if [[ $dualstack_enabled -eq 1 ]]; then
+        stats_interval=2s
+    fi
+    if [[ "${MM_IPV6_SW_RSS:-0}" == 1 ]]; then
+        ipv6_rss_flags=(-ipv6-sw-rss)
+        stats_interval=2s
+    fi
     ip netns exec "$NETNS_CPE" "$MINUTEMAN_BIN" \
         -wan "$VETH_CPE_ISP" \
         -b4 "${WAN_CPE_ADDR%/*}" \
@@ -109,7 +149,8 @@ else
         "$wan_model_flag" \
         "${dns_proxy_flags[@]}" \
         "${dhcpv4_flags[@]}" \
-        -stats-interval 0 >"$RUNDIR/minuteman.log" 2>&1 &
+        "${ipv6_rss_flags[@]}" \
+        -stats-interval "$stats_interval" >"$RUNDIR/minuteman.log" 2>&1 &
     minuteman_pid=$!
     started_minuteman=1
     # DHCPv6 discovery includes an RFC 3315 initial random delay (up to 1s)
@@ -282,6 +323,74 @@ sleep 0.3
 check "LAN client can reach a TCP service on the simulated internet host" \
     ip netns exec "$NETNS_HOST" curl -sf --max-time 3 "http://${PUBLIC_INET_ADDR%/*}:8080/"
 wait "$nc_pid" 2>/dev/null
+
+if [[ $dualstack_enabled -eq 1 ]]; then
+    echo "== Dual-stack (RFC 6333): IPv4 via softwire, IPv6 native -- A vs AAAA =="
+    # The whole point: a DS-Lite B4 tunnels only IPv4; native IPv6 is forwarded
+    # directly. mm-host is dual-stack, mm-inet answers on both families under
+    # one name (DUALSTACK_FQDN), and we steer traffic down each path purely by
+    # DNS record type, confirming via dslite0 which path the softwire carried.
+
+    # mm-host is genuinely dual-stack: an IPv4 (static, or from -dhcpv4) and a
+    # global SLAAC IPv6 both live on its LAN interface right now.
+    check "$NETNS_HOST holds both an IPv4 and a global IPv6 address (dual-stack)" \
+        bash -c "ip netns exec $NETNS_HOST ip -4 addr show dev $VETH_HOST_CPE | grep -q 'inet ' &&
+                 ip netns exec $NETNS_HOST ip -6 addr show dev $VETH_HOST_CPE scope global | grep -q 'inet6 '"
+
+    # Resolve DUALSTACK_FQDN once per family against mm-isp's resolver (over
+    # native IPv6, exactly as a real dual-stack CPE client would): A ->
+    # mm-inet's public IPv4, AAAA -> mm-inet's native IPv6.
+    a_addr="$(ip netns exec "$NETNS_HOST" dig @"${WAN_ISP_ADDR%/*}" +short A "$DUALSTACK_FQDN" | head -n1)"
+    aaaa_addr="$(ip netns exec "$NETNS_HOST" dig @"${WAN_ISP_ADDR%/*}" +short AAAA "$DUALSTACK_FQDN" | head -n1)"
+    check "DNS returns the A record for $DUALSTACK_FQDN (${PUBLIC_INET_ADDR%/*})" \
+        test "$a_addr" = "${PUBLIC_INET_ADDR%/*}"
+    check "DNS returns the AAAA record for $DUALSTACK_FQDN (${PUBLIC6_INET_ADDR%/*})" \
+        test "$aaaa_addr" = "${PUBLIC6_INET_ADDR%/*}"
+
+    # A record -> IPv4: MUST cross the softwire. Reachability proves the tunnel
+    # path works end to end; a non-zero dslite0 count is the positive control
+    # for the AAAA check below (proving the sniffer would have caught a leak).
+    if [[ -n "$a_addr" ]]; then
+        dslite_capture ip netns exec "$NETNS_HOST" \
+            ping -c 2 -W 2 -I "$VETH_HOST_CPE" "$a_addr"
+        check "IPv4/A path to $a_addr reaches the internet (through the softwire)" \
+            test "${DSLITE_CONN:-1}" -eq 0
+        check "IPv4/A path DID cross the AFTR's dslite0 tunnel (${DSLITE_PKTS:-0} pkts there, want >0)" \
+            test "${DSLITE_PKTS:-0}" -gt 0
+    fi
+
+    # AAAA record -> IPv6: MUST NOT touch the softwire (RFC 6333 -- a B4
+    # tunnels only IPv4). Reachability proves native IPv6 forwarding works; a
+    # ZERO dslite0 count proves it bypassed the tunnel entirely.
+    if [[ -n "$aaaa_addr" ]]; then
+        dslite_capture ip netns exec "$NETNS_HOST" \
+            ping -6 -c 2 -W 2 -I "$VETH_HOST_CPE" "$aaaa_addr"
+        check "IPv6/AAAA path to $aaaa_addr reaches mm-inet natively" \
+            test "${DSLITE_CONN:-1}" -eq 0
+        check "IPv6/AAAA path did NOT cross the AFTR's dslite0 tunnel (${DSLITE_PKTS:-0} pkts there, want 0)" \
+            test "${DSLITE_PKTS:-0}" -eq 0
+    fi
+
+    # Prove that native IPv6 was carried by minuteman's XDP forwarding fastpath
+    # -- not the kernel slow path. The reachability/dslite0 checks above hold
+    # for either, so here we read the datapath's own IPv6-forward counter from
+    # the logged stats: it advances only when handle_ipv6_forward redirected a
+    # packet in XDP. Only checkable when this script started minuteman (so it
+    # set -stats-interval and owns the log); a reused instance may have stats
+    # disabled.
+    if [[ $started_minuteman -eq 1 ]]; then
+        sleep 3 # let at least one stats: line post after the pings above
+        last_stats="$(grep 'stats:' "$RUNDIR/minuteman.log" | tail -n1)"
+        ipv6_fwd="$(sed -n 's/.*IPv6Fwd:\([0-9]*\).*/\1/p' <<<"$last_stats")"
+        check "native IPv6 was forwarded by the XDP fastpath (datapath IPv6Fwd=${ipv6_fwd:-0} > 0)" \
+            test "${ipv6_fwd:-0}" -gt 0
+        if [[ "${MM_IPV6_SW_RSS:-0}" == 1 ]]; then
+            ipv6_rss="$(sed -n 's/.*IPv6RSSRedirect:\([0-9]*\).*/\1/p' <<<"$last_stats")"
+            check "IPv6 software-RSS fanned native-IPv6 packets across CPUs (datapath IPv6RSSRedirect=${ipv6_rss:-0} > 0)" \
+                test "${ipv6_rss:-0}" -gt 0
+        fi
+    fi
+fi
 
 if [[ $fail -eq 0 ]]; then
     echo "== all checks passed =="

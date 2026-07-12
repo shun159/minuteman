@@ -34,24 +34,27 @@ type LANConfig struct {
 // enum stat_id), summed across all CPUs. Field order must stay in sync with
 // that enum.
 type Stats struct {
-	Pass           uint64
-	Drop           uint64
-	Abort          uint64
-	Encap          uint64
-	Decap          uint64
-	MTUDrop        uint64
-	NoConfig       uint64
-	NoLANConfig    uint64
-	Bypass         uint64
-	FIBSuccess     uint64
-	FIBNoNeigh     uint64
-	FIBFail        uint64
-	FIBWrongIf     uint64
-	DecapPass      uint64
-	DecapNotDSLite uint64
-	DecapBadPacket uint64
-	DecapSlow      uint64
-	RedirectWAN    uint64
-	RedirectLAN    uint64
-	ICMPFragNeeded uint64
+	Pass            uint64
+	Drop            uint64
+	Abort           uint64
+	Encap           uint64
+	Decap           uint64
+	MTUDrop         uint64
+	NoConfig        uint64
+	NoLANConfig     uint64
+	Bypass          uint64
+	FIBSuccess      uint64
+	FIBNoNeigh      uint64
+	FIBFail         uint64
+	FIBWrongIf      uint64
+	DecapPass       uint64
+	DecapNotDSLite  uint64
+	DecapBadPacket  uint64
+	DecapSlow       uint64
+	RedirectWAN     uint64
+	RedirectLAN     uint64
+	ICMPFragNeeded  uint64
+	IPv6Fwd         uint64
+	IPv6Pass        uint64
+	IPv6RSSRedirect uint64
 }

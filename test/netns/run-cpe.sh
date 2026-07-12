@@ -25,6 +25,11 @@
 # -dns-proxy is additionally passed if setup.sh was run with MM_DNS_PROXY=1
 # (read from DNS_PROXY_ENABLED_FILE), and -dhcpv4 if it was run with
 # MM_DHCPV4=1 (DHCPV4_ENABLED_FILE).
+#
+# MM_DUALSTACK deliberately has no effect here: IPv6-goes-native is inherent
+# to the XDP datapath (xdp_dslite_encap only ever tunnels IPv4), not a
+# configurable minuteman option, so that mode adds only topology in setup.sh
+# and assertions in smoketest.sh -- nothing to the minuteman invocation.
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
