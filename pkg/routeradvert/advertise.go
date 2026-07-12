@@ -60,6 +60,18 @@ type Config struct {
 	OnLink bool
 
 	ValidLifetime, PreferredLifetime time.Duration
+
+	// RDNSSAddr, when valid, adds a Recursive DNS Server option (RFC 8106)
+	// to every RA pointing LAN clients at it. It must be an address a DNS
+	// proxy is *actually* listening on (RFC 7084 §L-4) -- so the caller
+	// passes the concrete link-local address pkg/dnsproxy bound, not a mere
+	// "advertise RDNSS" flag: advertising a DNS server nothing answers on
+	// would be worse than advertising none, and having Serve independently
+	// re-resolve the address could diverge from what the proxy bound (e.g.
+	// if the link-local was still tentative when the proxy started). The
+	// zero netip.Addr means no RDNSS option. Its zone, if any, is local
+	// metadata and never goes on the wire (see NewRDNSS).
+	RDNSSAddr netip.Addr
 }
 
 // Serve sends RFC 4861 Router Advertisements on ifaceName: periodically
@@ -137,22 +149,26 @@ func Serve(ctx context.Context, ifaceName string, cfg Config) error {
 }
 
 // buildRA assembles a Router Advertisement carrying cfg's prefix (as a
-// Prefix Information Option, A flag always set and L set per cfg.OnLink)
-// and mac (as a Source Link-Layer Address option), with the given
-// RouterLifetime.
+// Prefix Information Option, A flag always set and L set per cfg.OnLink),
+// mac (as a Source Link-Layer Address option), and -- if cfg.RDNSSAddr is
+// valid -- an RDNSS option pointing at it, with the given RouterLifetime.
 func buildRA(cfg Config, lifetime time.Duration, mac net.HardwareAddr) *RouterAdvertisement {
+	opts := Options{
+		NewPrefixInformation(PrefixInformation{
+			Prefix:            cfg.Prefix,
+			OnLink:            cfg.OnLink,
+			Autonomous:        true,
+			ValidLifetime:     cfg.ValidLifetime,
+			PreferredLifetime: cfg.PreferredLifetime,
+		}),
+		NewSourceLinkLayerAddress(mac),
+	}
+	if cfg.RDNSSAddr.IsValid() {
+		opts = append(opts, NewRDNSS([]netip.Addr{cfg.RDNSSAddr}, lifetime))
+	}
 	return &RouterAdvertisement{
 		RouterLifetime: lifetime,
-		Options: Options{
-			NewPrefixInformation(PrefixInformation{
-				Prefix:            cfg.Prefix,
-				OnLink:            cfg.OnLink,
-				Autonomous:        true,
-				ValidLifetime:     cfg.ValidLifetime,
-				PreferredLifetime: cfg.PreferredLifetime,
-			}),
-			NewSourceLinkLayerAddress(mac),
-		},
+		Options:        opts,
 	}
 }
 

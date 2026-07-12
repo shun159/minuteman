@@ -40,6 +40,8 @@ import (
 	"github.com/shun159/miniteman/pkg/hb46pp"
 	"github.com/shun159/miniteman/pkg/prefixdelegation"
 	"github.com/shun159/miniteman/pkg/routeradvert"
+
+	"golang.org/x/sys/unix"
 )
 
 // tunnelOverhead is the DS-Lite IPv4-in-IPv6 encapsulation overhead (the
@@ -60,6 +62,19 @@ const minDHCPv4Lease = time.Minute
 // floor for the Interface MTU option; a computed/configured MTU below it is
 // dropped rather than advertised.
 const dhcpMinMTU = 68
+
+// dnsProxyBindRetries/dnsProxyBindRetryInterval bound how long startDNSProxy
+// waits out an EADDRNOTAVAIL when binding a LAN link-local address: the
+// kernel returns that while the address is still DAD-tentative, which right
+// after XDP attach bounces the LAN link (see routeradvert's
+// tentativeRetryInterval) it briefly is. ~10 * 1s covers several DAD cycles;
+// any *other* bind error (e.g. EADDRINUSE, port 53 already taken) fails
+// immediately rather than being retried, so a real misconfiguration surfaces
+// at once.
+const (
+	dnsProxyBindRetries       = 10
+	dnsProxyBindRetryInterval = time.Second
+)
 
 // Default HB46PP client identity sent as provisioning query parameters,
 // overridable via -hb46pp-vendor-id/-hb46pp-product/-hb46pp-version.
@@ -224,18 +239,28 @@ func run() error {
 	}
 
 	var bgWG sync.WaitGroup
+	// Started before runPrefixDelegation/runNDProxy so the exact link-local
+	// addresses it bound can be handed to them as RDNSS entries: an RA must
+	// never promise a DNS server this proxy hasn't actually bound (see
+	// startDNSProxy's own doc). rdnssByIface is empty when -dns-proxy is off,
+	// so no RDNSS is advertised then.
+	var rdnssByIface map[string]netip.Addr
+	if *dnsProxyOn {
+		var err error
+		rdnssByIface, err = startDNSProxy(ctx, lans, dnsServers, &bgWG)
+		if err != nil {
+			return fmt.Errorf("-dns-proxy: %w", err)
+		}
+	}
 	if *requestPD {
-		if err := runPrefixDelegation(ctx, *wanIface, lans, &bgWG); err != nil {
+		if err := runPrefixDelegation(ctx, *wanIface, lans, rdnssByIface, &bgWG); err != nil {
 			return err
 		}
 	}
 	if *ndProxy {
-		if err := runNDProxy(ctx, *wanIface, wanIfindex, lans, &bgWG); err != nil {
+		if err := runNDProxy(ctx, *wanIface, wanIfindex, lans, rdnssByIface, &bgWG); err != nil {
 			return err
 		}
-	}
-	if *dnsProxyOn {
-		runDNSProxy(ctx, lans, dnsServers, &bgWG)
 	}
 	if *dhcpv4On {
 		if err := runDHCPv4(ctx, lans, dhcpv4DNSFlag, *dnsProxyOn, wanNetIface.MTU, *dhcpv4Lease, &bgWG); err != nil {
@@ -255,8 +280,10 @@ func run() error {
 // that keeps renewing it, registering that goroutine on wg so callers can
 // wait for its shutdown-triggered Release (and every RA worker's
 // shutdown-triggered final RouterLifetime=0 advertisement) to finish before
-// exiting.
-func runPrefixDelegation(ctx context.Context, wanIface string, lans cliconfig.LANSpecList, wg *sync.WaitGroup) error {
+// exiting. rdnssByIface is forwarded to lanprefix.NewRAManager (see its own
+// doc) -- it's the map of link-local addresses startDNSProxy actually bound,
+// so RDNSS is advertised only where a DNS proxy is really listening.
+func runPrefixDelegation(ctx context.Context, wanIface string, lans cliconfig.LANSpecList, rdnssByIface map[string]netip.Addr, wg *sync.WaitGroup) error {
 	lease, err := prefixdelegation.Acquire(ctx, wanIface)
 	if err != nil {
 		return fmt.Errorf("acquiring delegated prefix via DHCPv6-PD: %w", err)
@@ -267,7 +294,7 @@ func runPrefixDelegation(ctx context.Context, wanIface string, lans cliconfig.LA
 		lanIfaces[i] = spec.Iface
 	}
 
-	raMgr := lanprefix.NewRAManager()
+	raMgr := lanprefix.NewRAManager(rdnssByIface)
 	var assigned []lanprefix.Assignment
 	reconcileAndLog := func(l *prefixdelegation.Lease) {
 		var err error
@@ -301,36 +328,85 @@ func runPrefixDelegation(ctx context.Context, wanIface string, lans cliconfig.LA
 // wanIface to answer WAN-side Neighbor Solicitations for LAN hosts it
 // actively verifies exist. wanextend.Serve registers every goroutine it
 // starts on wg, so run() waits for their shutdown-triggered final RAs and
-// socket cleanup before returning.
-func runNDProxy(ctx context.Context, wanIface string, wanIfindex uint32, lans cliconfig.LANSpecList, wg *sync.WaitGroup) error {
+// socket cleanup before returning. rdnssByIface is forwarded to
+// wanextend.Serve (see its own doc) -- it's the map of link-local addresses
+// startDNSProxy actually bound, so RDNSS is advertised only where a DNS
+// proxy is really listening.
+func runNDProxy(ctx context.Context, wanIface string, wanIfindex uint32, lans cliconfig.LANSpecList, rdnssByIface map[string]netip.Addr, wg *sync.WaitGroup) error {
 	lanIfaces := make([]string, len(lans))
 	for i, spec := range lans {
 		lanIfaces[i] = spec.Iface
 	}
-	return wanextend.Serve(ctx, wanIface, int(wanIfindex), lanIfaces, wg)
+	return wanextend.Serve(ctx, wanIface, int(wanIfindex), lanIfaces, rdnssByIface, wg)
 }
 
-// runDNSProxy starts pkg/dnsproxy.Serve listening on every -lan interface's
-// gateway IP, forwarding to dnsServers, tracked on wg so run() waits for
-// its sockets to close on shutdown. Unlike runPrefixDelegation/runNDProxy,
-// this can't fail at startup in a way worth surfacing synchronously (the
-// listen addresses are already-validated -lan gateway IPs; a bind failure
-// would mean something else is already using port 53 on one of them, which
-// Serve itself logs), so it doesn't return an error.
-func runDNSProxy(ctx context.Context, lans cliconfig.LANSpecList, dnsServers []netip.Addr, wg *sync.WaitGroup) {
-	listenAddrs := make([]netip.Addr, len(lans))
-	for i, spec := range lans {
-		listenAddrs[i] = spec.GatewayIP
+// startDNSProxy opens pkg/dnsproxy's listening sockets (via dnsproxy.Listen,
+// synchronously) on every -lan interface's IPv4 gateway IP and its own
+// link-local IPv6 address, starts serving on wg, and returns a map of -lan
+// interface -> the link-local address it actually bound there. Called, and
+// its success checked, *before* runPrefixDelegation/runNDProxy: those
+// advertise exactly the addresses in that returned map as RDNSS entries (RFC
+// 8106), so an RA can never promise a DNS server dnsproxy.Listen didn't
+// actually bind -- both a bind failure and a link-local that never became
+// available are reflected here (fail-fast / omitted from the map) rather
+// than diverging from what the RA workers independently believe, mirroring
+// pkg/dhcpv4.New's own synchronous-failure rationale.
+//
+// A LAN link-local that's still DAD-tentative at bind time yields
+// EADDRNOTAVAIL, which is retried on the tentative cadence (see
+// dnsProxyBindRetries); any other bind error (port 53 in use, etc.) fails
+// immediately. A -lan interface with no link-local address at all is logged
+// and left out of the map (no RDNSS for it), while its IPv4 listener still
+// starts.
+func startDNSProxy(ctx context.Context, lans cliconfig.LANSpecList, dnsServers []netip.Addr, wg *sync.WaitGroup) (map[string]netip.Addr, error) {
+	listenAddrs := make([]netip.Addr, 0, len(lans)*2)
+	rdnssByIface := make(map[string]netip.Addr, len(lans))
+	for _, spec := range lans {
+		listenAddrs = append(listenAddrs, spec.GatewayIP)
+		if ll, err := routeradvert.LinkLocalAddr(spec.Iface); err != nil {
+			log.Printf("DNS proxy: not listening on %s's link-local address (no RDNSS for it): %v", spec.Iface, err)
+		} else {
+			listenAddrs = append(listenAddrs, ll)
+			rdnssByIface[spec.Iface] = ll
+		}
+	}
+
+	srv, err := listenDNSProxyTolerantOfTentative(ctx, dnsproxy.Config{ListenAddrs: listenAddrs, Upstreams: dnsServers})
+	if err != nil {
+		return nil, err
 	}
 
 	log.Printf("DNS proxy: listening on %v, forwarding to %v", listenAddrs, dnsServers)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		if err := dnsproxy.Serve(ctx, dnsproxy.Config{ListenAddrs: listenAddrs, Upstreams: dnsServers}); err != nil {
+		if err := srv.Serve(ctx); err != nil {
 			log.Printf("DNS proxy ended unexpectedly: %v", err)
 		}
 	}()
+	return rdnssByIface, nil
+}
+
+// listenDNSProxyTolerantOfTentative calls dnsproxy.Listen, retrying only
+// while it fails with EADDRNOTAVAIL (a LAN link-local still DAD-tentative --
+// see dnsProxyBindRetries). Any other error, or exhausting the retries, is
+// returned; ctx cancellation aborts the wait.
+func listenDNSProxyTolerantOfTentative(ctx context.Context, cfg dnsproxy.Config) (*dnsproxy.Server, error) {
+	for attempt := 0; ; attempt++ {
+		srv, err := dnsproxy.Listen(cfg)
+		if err == nil {
+			return srv, nil
+		}
+		if !errors.Is(err, unix.EADDRNOTAVAIL) || attempt >= dnsProxyBindRetries {
+			return nil, err
+		}
+		log.Printf("DNS proxy: a listen address is still tentative, retrying: %v", err)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(dnsProxyBindRetryInterval):
+		}
+	}
 }
 
 // runDHCPv4 builds a pkg/dhcpv4.InterfaceConfig for every -lan interface,

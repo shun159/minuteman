@@ -7,10 +7,11 @@ import (
 	"time"
 )
 
-// NDP option types this package builds (RFC 4861 §4.6).
+// NDP option types this package builds (RFC 4861 §4.6, RFC 8106 §5.1).
 const (
-	optSourceLinkLayerAddress uint8 = 1 // §4.6.1
-	optPrefixInformation      uint8 = 3 // §4.6.2
+	optSourceLinkLayerAddress uint8 = 1  // §4.6.1
+	optPrefixInformation      uint8 = 3  // §4.6.2
+	optRecursiveDNSServer     uint8 = 25 // RFC 8106 §5.1
 )
 
 // optionUnitBytes is the unit NDP option Length fields are expressed in
@@ -83,5 +84,32 @@ func NewSourceLinkLayerAddress(mac net.HardwareAddr) []byte {
 	b[0] = optSourceLinkLayerAddress
 	b[1] = 1 // 8 bytes / optionUnitBytes
 	copy(b[2:], mac)
+	return b
+}
+
+// NewRDNSS builds a Recursive DNS Server option (RFC 8106 §5.1) listing
+// servers, valid for lifetime (truncated to whole seconds). RFC 7084 §L-4
+// requires an IPv6-only SLAAC LAN client be given a DNS server some way; this
+// is the RA-carried way (the alternative, DHCPv6 stateless service, isn't
+// something this project's LAN side runs). Per RFC 8106 §5.1 the address
+// list needn't be global -- the router's own link-local address is
+// explicitly permitted, which is what this project's callers use, so RDNSS
+// composes with either WAN provisioning model (DHCPv6-PD's distinct
+// delegated prefix or NDProxy's shared one) without depending on which one
+// is active.
+func NewRDNSS(servers []netip.Addr, lifetime time.Duration) []byte {
+	const lengthUnits = 1 // header (8 bytes) / optionUnitBytes, before addresses
+	b := make([]byte, (lengthUnits+2*len(servers))*optionUnitBytes)
+
+	b[0] = optRecursiveDNSServer
+	b[1] = uint8(lengthUnits + 2*len(servers))
+	// b[2:4] Reserved left zero.
+	binary.BigEndian.PutUint32(b[4:8], uint32(lifetime/time.Second))
+
+	for i, s := range servers {
+		addr := s.As16()
+		copy(b[8+i*16:8+(i+1)*16], addr[:])
+	}
+
 	return b
 }

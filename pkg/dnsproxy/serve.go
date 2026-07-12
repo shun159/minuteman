@@ -49,61 +49,83 @@ type Config struct {
 	Upstreams []netip.Addr
 }
 
-// Serve listens on every cfg.ListenAddrs address (UDP and TCP, port 53)
-// and forwards queries to cfg.Upstreams until ctx is cancelled, at which
-// point every socket is closed and Serve returns nil. A non-nil return
-// means either cfg had no Upstreams configured, or opening a listening
-// socket failed outright.
-func Serve(ctx context.Context, cfg Config) error {
+// Server is a configured, ready-to-run DNS proxy: Listen has already opened
+// every listening socket.
+type Server struct {
+	udpConns     []*net.UDPConn
+	tcpListeners []*net.TCPListener
+	upstreams    []netip.Addr
+}
+
+// Listen opens every cfg.ListenAddrs address (UDP and TCP, port 53)
+// synchronously, returning any failure -- no Upstreams configured, or a
+// listening socket failing to open (e.g. something else already on port 53)
+// -- to the caller instead of letting it surface only in a log line from a
+// background goroutine, mirroring pkg/dhcpv4.New's own fail-fast rationale.
+// This matters more here than it did before RDNSS: a caller (cmd/minuteman)
+// advertises one of these addresses to LAN clients as their DNS server (RFC
+// 8106 RDNSS, via routeradvert.Config.RDNSSAddr) only once Listen has
+// returned successfully, so a silent bind failure would otherwise leave
+// clients pointed at a DNS server nothing answers on. On any failure every
+// already-opened socket is closed.
+func Listen(cfg Config) (*Server, error) {
 	if len(cfg.Upstreams) == 0 {
-		return fmt.Errorf("dnsproxy: no upstream DNS servers configured")
+		return nil, fmt.Errorf("dnsproxy: no upstream DNS servers configured")
 	}
 
-	var udpConns []*net.UDPConn
-	var tcpListeners []*net.TCPListener
-	closeAll := func() {
-		for _, c := range udpConns {
-			c.Close()
-		}
-		for _, l := range tcpListeners {
-			l.Close()
-		}
-	}
-
+	s := &Server{upstreams: cfg.Upstreams}
 	for _, addr := range cfg.ListenAddrs {
-		udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: addr.AsSlice(), Port: dnsPort})
+		// Zone is only ever set for a link-local address (see
+		// routeradvert.LinkLocalAddr, the -dns-proxy + RDNSS path's source
+		// of these): fe80::/10 isn't unique without it, so the kernel needs
+		// it to pick the right interface to bind on.
+		udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: addr.AsSlice(), Port: dnsPort, Zone: addr.Zone()})
 		if err != nil {
-			closeAll()
-			return fmt.Errorf("dnsproxy: listening on %s:%d/udp: %w", addr, dnsPort, err)
+			s.closeAll()
+			return nil, fmt.Errorf("dnsproxy: listening on %s:%d/udp: %w", addr, dnsPort, err)
 		}
-		udpConns = append(udpConns, udpConn)
+		s.udpConns = append(s.udpConns, udpConn)
 
-		tcpListener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: addr.AsSlice(), Port: dnsPort})
+		tcpListener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: addr.AsSlice(), Port: dnsPort, Zone: addr.Zone()})
 		if err != nil {
-			closeAll()
-			return fmt.Errorf("dnsproxy: listening on %s:%d/tcp: %w", addr, dnsPort, err)
+			s.closeAll()
+			return nil, fmt.Errorf("dnsproxy: listening on %s:%d/tcp: %w", addr, dnsPort, err)
 		}
-		tcpListeners = append(tcpListeners, tcpListener)
+		s.tcpListeners = append(s.tcpListeners, tcpListener)
 	}
+	return s, nil
+}
 
+func (s *Server) closeAll() {
+	for _, c := range s.udpConns {
+		c.Close()
+	}
+	for _, l := range s.tcpListeners {
+		l.Close()
+	}
+}
+
+// Serve forwards queries on every socket Listen opened until ctx is
+// cancelled, at which point every socket is closed and Serve returns nil.
+func (s *Server) Serve(ctx context.Context) error {
 	var wg sync.WaitGroup
-	for _, c := range udpConns {
+	for _, c := range s.udpConns {
 		wg.Add(1)
 		go func(c *net.UDPConn) {
 			defer wg.Done()
-			serveUDP(c, cfg.Upstreams)
+			serveUDP(c, s.upstreams)
 		}(c)
 	}
-	for _, l := range tcpListeners {
+	for _, l := range s.tcpListeners {
 		wg.Add(1)
 		go func(l *net.TCPListener) {
 			defer wg.Done()
-			serveTCP(l, cfg.Upstreams)
+			serveTCP(l, s.upstreams)
 		}(l)
 	}
 
 	<-ctx.Done()
-	closeAll() // unblocks every serveUDP/serveTCP loop, see their own doc comments
+	s.closeAll() // unblocks every serveUDP/serveTCP loop, see their own doc comments
 	wg.Wait()
 	return nil
 }

@@ -65,6 +65,35 @@ func TestNewSourceLinkLayerAddress(t *testing.T) {
 	}
 }
 
+func TestNewRDNSS(t *testing.T) {
+	servers := []netip.Addr{
+		netip.MustParseAddr("fe80::1"),
+		netip.MustParseAddr("fe80::2"),
+	}
+	got := NewRDNSS(servers, 1800*time.Second)
+
+	want := []byte{
+		25, 5, // Type=25, Length=5 (1 + 2*2 units of 8 bytes)
+		0x00, 0x00, // Reserved
+		0x00, 0x00, 0x07, 0x08, // Lifetime = 1800
+		0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, // fe80::1
+		0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, // fe80::2
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("NewRDNSS = % x, want % x", got, want)
+	}
+}
+
+func TestNewRDNSSSingleServer(t *testing.T) {
+	got := NewRDNSS([]netip.Addr{netip.MustParseAddr("2001:db8::53")}, 0)
+	if len(got) != 24 {
+		t.Fatalf("NewRDNSS length = %d, want 24 (one 8-byte header + one 16-byte address)", len(got))
+	}
+	if got[1] != 3 {
+		t.Fatalf("Length field = %d, want 3", got[1])
+	}
+}
+
 func TestOptionsMarshal(t *testing.T) {
 	mac := net.HardwareAddr{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}
 	opts := Options{

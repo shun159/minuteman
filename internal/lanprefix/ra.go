@@ -3,6 +3,7 @@ package lanprefix
 import (
 	"context"
 	"log"
+	"net/netip"
 	"sync"
 
 	"github.com/shun159/miniteman/pkg/routeradvert"
@@ -20,12 +21,18 @@ type raWorker struct {
 // advertising each interface's currently-assigned /64 (see Assignment) to
 // LAN clients via Router Advertisements. Not safe for concurrent use.
 type RAManager struct {
-	workers map[string]*raWorker
+	workers      map[string]*raWorker
+	rdnssByIface map[string]netip.Addr
 }
 
 // NewRAManager returns an RAManager with no workers running yet.
-func NewRAManager() *RAManager {
-	return &RAManager{workers: make(map[string]*raWorker)}
+// rdnssByIface maps a LAN interface name to the DNS-server address to
+// advertise in its RAs' RDNSS option (RFC 8106) -- it must be an address a
+// DNS proxy actually bound (see routeradvert.Config.RDNSSAddr's own doc), so
+// the caller passes exactly the link-local addresses pkg/dnsproxy reported
+// binding. An interface absent from the map (or a nil map) gets no RDNSS.
+func NewRAManager(rdnssByIface map[string]netip.Addr) *RAManager {
+	return &RAManager{workers: make(map[string]*raWorker), rdnssByIface: rdnssByIface}
 }
 
 // Sync starts (or restarts) a routeradvert.Serve goroutine for every
@@ -82,6 +89,7 @@ func (m *RAManager) start(ctx context.Context, a Assignment, wg *sync.WaitGroup)
 			OnLink:            true,
 			ValidLifetime:     a.ValidLifetime,
 			PreferredLifetime: a.PreferredLifetime,
+			RDNSSAddr:         m.rdnssByIface[a.Iface],
 		})
 		if err != nil {
 			log.Printf("lanprefix: RA serving on %s ended unexpectedly: %v", a.Iface, err)
