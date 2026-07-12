@@ -1,0 +1,103 @@
+package dhcpv4
+
+import (
+	"net"
+	"net/netip"
+	"testing"
+	"time"
+)
+
+func TestMessageMarshalParseRoundTrip(t *testing.T) {
+	mac, _ := net.ParseMAC("52:54:00:12:34:56")
+	orig := &Message{
+		Op:     OpBootReply,
+		HType:  hardwareTypeEthernet,
+		HLen:   6,
+		XID:    0xdeadbeef,
+		Flags:  flagBroadcast,
+		YIAddr: netip.MustParseAddr("192.168.1.100"),
+		SIAddr: netip.MustParseAddr("192.168.1.1"),
+		CHAddr: mac,
+		Options: Options{
+			NewMessageType(Offer),
+			NewAddr(OptServerID, netip.MustParseAddr("192.168.1.1")),
+			NewSeconds(OptLeaseTime, 12*time.Hour),
+			NewMTU(1460),
+		},
+	}
+
+	got, err := Parse(orig.Marshal())
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got.Op != OpBootReply || got.XID != 0xdeadbeef {
+		t.Errorf("op/xid = %d/%#x", got.Op, got.XID)
+	}
+	if !got.Broadcast() {
+		t.Error("broadcast flag lost in round trip")
+	}
+	if got.YIAddr != orig.YIAddr || got.SIAddr != orig.SIAddr {
+		t.Errorf("addrs = %v/%v, want %v/%v", got.YIAddr, got.SIAddr, orig.YIAddr, orig.SIAddr)
+	}
+	if got.CHAddr.String() != mac.String() {
+		t.Errorf("chaddr = %v, want %v", got.CHAddr, mac)
+	}
+	if mt, ok := got.Options.MessageType(); !ok || mt != Offer {
+		t.Errorf("message type = %v/%v, want OFFER", mt, ok)
+	}
+	if sid, ok := got.Options.ServerID(); !ok || sid != orig.SIAddr {
+		t.Errorf("server id = %v/%v", sid, ok)
+	}
+}
+
+func TestMarshalIsPaddedToMinimum(t *testing.T) {
+	m := &Message{Op: OpBootReply, Options: Options{NewMessageType(ACK)}}
+	if got := len(m.Marshal()); got < minMessageLen {
+		t.Errorf("marshalled length = %d, want >= %d", got, minMessageLen)
+	}
+}
+
+func TestParseRejectsShortAndBadCookie(t *testing.T) {
+	if _, err := Parse(make([]byte, 100)); err == nil {
+		t.Error("Parse of a too-short buffer: want error, got nil")
+	}
+	b := make([]byte, bootpFixedLen+4)
+	// magic cookie left as zeros -> invalid
+	if _, err := Parse(b); err == nil {
+		t.Error("Parse with bad magic cookie: want error, got nil")
+	}
+}
+
+func TestParseUnspecifiedAddrsAreZero(t *testing.T) {
+	m := &Message{Op: OpBootRequest, Options: Options{NewMessageType(Discover)}}
+	got, err := Parse(m.Marshal())
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	// An address field left unset marshals as 0.0.0.0, and must parse back
+	// as the (valid, non-nil) unspecified IPv4 address, not an invalid Addr.
+	if got.CIAddr != netip.AddrFrom4([4]byte{}) {
+		t.Errorf("ciaddr = %v, want 0.0.0.0", got.CIAddr)
+	}
+}
+
+func TestClientIDPrefersOptionOverChaddr(t *testing.T) {
+	opts := Options{{Code: OptClientID, Data: []byte("custom-id")}}
+	if got := opts.ClientID([]byte("fallback")); got != "custom-id" {
+		t.Errorf("ClientID = %q, want %q", got, "custom-id")
+	}
+	if got := (Options{}).ClientID([]byte("fallback")); got != "fallback" {
+		t.Errorf("ClientID with no option = %q, want %q", got, "fallback")
+	}
+}
+
+func TestParseOptionRejectsOverrunLength(t *testing.T) {
+	// A code/length pair whose length points past the buffer must error.
+	b := make([]byte, bootpFixedLen+4+3)
+	copy(b[bootpFixedLen:], magicCookie[:])
+	b[bootpFixedLen+4] = byte(OptDNSServers)
+	b[bootpFixedLen+5] = 8 // claims 8 bytes, only 1 remains
+	if _, err := Parse(b); err == nil {
+		t.Error("Parse with overrun option length: want error, got nil")
+	}
+}

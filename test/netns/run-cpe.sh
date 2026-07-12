@@ -23,7 +23,8 @@
 # Advertisements go out -lan exactly as they would against a real ISP.
 #
 # -dns-proxy is additionally passed if setup.sh was run with MM_DNS_PROXY=1
-# (read from DNS_PROXY_ENABLED_FILE).
+# (read from DNS_PROXY_ENABLED_FILE), and -dhcpv4 if it was run with
+# MM_DHCPV4=1 (DHCPV4_ENABLED_FILE).
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -58,10 +59,16 @@ if [[ -f "$DNS_PROXY_ENABLED_FILE" && "$(cat "$DNS_PROXY_ENABLED_FILE")" == 1 ]]
     dns_proxy_flags=(-dns-proxy)
 fi
 
+dhcpv4_flags=()
+if [[ -f "$DHCPV4_ENABLED_FILE" && "$(cat "$DHCPV4_ENABLED_FILE")" == 1 ]]; then
+    dhcpv4_flags=(-dhcpv4)
+fi
+
 exec ip netns exec "$NETNS_CPE" "$MINUTEMAN_BIN" \
     -wan "$VETH_CPE_ISP" \
     -b4 "${WAN_CPE_ADDR%/*}" \
     -lan "$VETH_CPE_HOST=${LAN_CPE_ADDR%/*}" \
     "$wan_model_flag" \
     "${dns_proxy_flags[@]}" \
+    "${dhcpv4_flags[@]}" \
     "$@"

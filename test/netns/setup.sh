@@ -31,6 +31,11 @@
 # exercises pkg/dnsproxy, forwarding LAN clients' DNS queries to mm-isp's
 # DNS server directly over IPv6 rather than through the DS-Lite softwire.
 #
+# MM_DHCPV4 selects whether minuteman is started with -dhcpv4 ("0"/unset
+# (default) or "1"): when on, mm-host is left without a static IPv4 and
+# acquires its address/route/MTU from minuteman's DHCPv4 server via dhclient
+# in smoketest.sh, exercising pkg/dhcpv4.
+#
 # After this completes, run minuteman as the B4 with test/netns/run-cpe.sh,
 # then test end-to-end connectivity with test/netns/smoketest.sh (both read
 # the modes this script recorded and act/assert accordingly).
@@ -67,6 +72,15 @@ case "$DNS_PROXY" in
 0 | 1) ;;
 *)
     echo "error: MM_DNS_PROXY must be '0' or '1' (got '$DNS_PROXY')" >&2
+    exit 1
+    ;;
+esac
+
+DHCPV4="${MM_DHCPV4:-0}"
+case "$DHCPV4" in
+0 | 1) ;;
+*)
+    echo "error: MM_DHCPV4 must be '0' or '1' (got '$DHCPV4')" >&2
     exit 1
     ;;
 esac
@@ -140,7 +154,12 @@ ip link add "$VETH_ISP_AFTR" netns "$NETNS_ISP" type veth peer name "$VETH_AFTR_
 ip link add "$VETH_AFTR_INET" netns "$NETNS_AFTR" type veth peer name "$VETH_INET_AFTR" netns "$NETNS_INET"
 
 echo "== mm-host: LAN client =="
-netns_exec "$NETNS_HOST" ip addr add "$LAN_HOST_ADDR" dev "$VETH_HOST_CPE"
+# In DHCPv4 mode the host is left without a static IPv4 address or default
+# route: smoketest.sh has it acquire both (plus its MTU) from minuteman's
+# DHCPv4 server via dhclient, once minuteman is running.
+if [[ "$DHCPV4" == 0 ]]; then
+    netns_exec "$NETNS_HOST" ip addr add "$LAN_HOST_ADDR" dev "$VETH_HOST_CPE"
+fi
 # Privacy extensions (RFC 4941) off, on both the interface and the
 # namespace-wide default: SLAAC would otherwise also generate a random
 # temporary address alongside the stable EUI-64 one, and smoketest.sh's
@@ -150,7 +169,9 @@ netns_exec "$NETNS_HOST" ip addr add "$LAN_HOST_ADDR" dev "$VETH_HOST_CPE"
 netns_exec "$NETNS_HOST" sysctl -qw net.ipv6.conf.default.use_tempaddr=0
 netns_exec "$NETNS_HOST" sysctl -qw net.ipv6.conf."$VETH_HOST_CPE".use_tempaddr=0
 netns_exec "$NETNS_HOST" ip link set "$VETH_HOST_CPE" up
-netns_exec "$NETNS_HOST" ip route add default via "${LAN_CPE_ADDR%/*}"
+if [[ "$DHCPV4" == 0 ]]; then
+    netns_exec "$NETNS_HOST" ip route add default via "${LAN_CPE_ADDR%/*}"
+fi
 disable_veth_offloads "$NETNS_HOST" "$VETH_HOST_CPE"
 # v-host-cpe (this end) has no XDP program of its own; it's the *peer* of
 # mm-cpe's LAN-side XDP redirect target (v-cpe-host). The kernel only sets up
@@ -333,6 +354,7 @@ fi
 echo "$AFTR_DISCOVERY" >"$AFTR_DISCOVERY_MODE_FILE"
 echo "$WAN_MODEL" >"$WAN_MODEL_FILE"
 echo "$DNS_PROXY" >"$DNS_PROXY_ENABLED_FILE"
+echo "$DHCPV4" >"$DHCPV4_ENABLED_FILE"
 
 echo "== mm-cpe: B4 element (minuteman runs here) =="
 # ip_forward/net.ipv6.conf.all.forwarding=1 (required for bpf_fib_lookup() in

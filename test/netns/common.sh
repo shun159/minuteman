@@ -34,6 +34,14 @@ VETH_CPE_HOST=v-cpe-host   # in mm-cpe
 LAN_HOST_ADDR=192.168.1.2/24
 LAN_CPE_ADDR=192.168.1.1/24   # minuteman -lan gatewayIP
 LAN_PREFIX=192.168.1.0/24
+# In MM_DHCPV4=1 mode the host's static 192.168.1.2 above is not assigned;
+# it instead receives the DHCPv4 pool's first free address, which -- with
+# the server (.1) excluded -- is .2, i.e. the same address, so the AFTR's
+# NAT and the smoketest assertions line up either way. DHCPV4_LAN_MTU is the
+# interface MTU minuteman advertises via option 26: the WAN veth MTU (1500)
+# minus the 40-byte DS-Lite tunnel overhead.
+DHCPV4_HOST_ADDR=192.168.1.2
+DHCPV4_LAN_MTU=1460
 
 # WAN (cpe <-> isp), IPv6-only softwire access link
 VETH_CPE_ISP=v-cpe-isp     # in mm-cpe
@@ -123,6 +131,17 @@ WAN_MODEL_FILE="$RUNDIR/wan-model"
 # before; setup.sh records the choice here so run-cpe.sh/smoketest.sh add
 # -dns-proxy to the minuteman invocation only when asked.
 DNS_PROXY_ENABLED_FILE="$RUNDIR/dns-proxy-enabled"
+
+# Whether minuteman is started with -dhcpv4 -- a fourth independent toggle
+# (orthogonal to the three above). When on, setup.sh does NOT statically
+# assign mm-host's IPv4 address/default route; smoketest.sh instead has
+# mm-host acquire them from minuteman's DHCPv4 server with dhclient, and the
+# existing DS-Lite data-path checks then run over that DHCP-assigned config.
+# Off by default (MM_DHCPV4 unset or "0").
+DHCPV4_ENABLED_FILE="$RUNDIR/dhcpv4-enabled"
+DHCLIENT_CONF="$RUNDIR/dhclient.conf"
+DHCLIENT_LEASES="$RUNDIR/dhclient.leases"
+DHCLIENT_PIDFILE="$RUNDIR/dhclient.pid"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MINUTEMAN_BIN="$REPO_ROOT/bin/minuteman"

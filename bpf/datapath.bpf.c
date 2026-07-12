@@ -143,6 +143,24 @@ is_local_gateway_dst(const struct lan_config *lan, const struct iphdr *iph)
     return lan->gateway_ip && iph->daddr == bpf_htonl(lan->gateway_ip);
 }
 
+/*
+ * Non-unicast IPv4 destinations must never enter the DS-Lite softwire (it's a
+ * point-to-point tunnel to a single AFTR): the limited broadcast address
+ * 255.255.255.255 and the multicast range 224.0.0.0/4 are passed up the local
+ * stack instead. This is what lets a LAN client's DHCP DISCOVER/REQUEST (sent
+ * to the limited broadcast) reach minuteman's own in-process DHCPv4 server,
+ * which listens via an AF_PACKET socket downstream of XDP -- without this the
+ * encap path would wrap those broadcasts and redirect them out the WAN.
+ * (Unicast DHCP renewals go straight to the gateway IP, already bypassed by
+ * is_local_gateway_dst.)
+ */
+static __always_inline bool
+is_non_unicast_dst(const struct iphdr *iph)
+{
+    __u32 daddr = bpf_ntohl(iph->daddr);
+    return daddr == 0xffffffff || (daddr & 0xf0000000) == 0xe0000000;
+}
+
 static __always_inline bool
 is_local_lan_route(struct xdp_md *ctx, struct iphdr *iph)
 {
@@ -259,8 +277,9 @@ maybe_redirect_to_cpu(struct xdp_md *ctx, const struct iphdr *inner_iph, void *d
  * reachable on the ingress interface.
  */
 static __always_inline int
-send_plain_icmp_frag_needed(struct xdp_md *ctx, __u64 l2_len, const struct iphdr *orig_iph,
-                            __u32 icmp_src_ip, __u16 next_mtu)
+send_plain_icmp_frag_needed(struct xdp_md *ctx, __u64 l2_len,
+                            const struct iphdr *orig_iph, __u32 icmp_src_ip,
+                            __u16 next_mtu)
 {
     __u8 *data = (__u8 *)(long)ctx->data;
     __u8 *data_end = (__u8 *)(long)ctx->data_end;
@@ -354,7 +373,8 @@ xdp_dslite_encap(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
-    if (is_local_gateway_dst(lan, inner_iph) || is_local_lan_route(ctx, inner_iph)) {
+    if (is_non_unicast_dst(inner_iph) || is_local_gateway_dst(lan, inner_iph) ||
+        is_local_lan_route(ctx, inner_iph)) {
         increase_stats_count(STAT_BYPASS);
         return XDP_PASS;
     }
@@ -552,8 +572,7 @@ send_dslite_icmp_frag_needed(struct xdp_md *ctx, const struct b4_config *cfg,
     struct ipv4_quote quote = {};
     copy_ipv4_quote(&quote, inner_iph);
 
-    __u32 new_len =
-        OUTER_ETH_LEN + (__u32)OUTER_IPV6_LEN + (__u32)ICMP_FRAG_REPLY_L3_LEN;
+    __u32 new_len = OUTER_ETH_LEN + (__u32)OUTER_IPV6_LEN + (__u32)ICMP_FRAG_REPLY_L3_LEN;
     __u32 old_len = data_end - data;
     if (new_len > old_len) {
         increase_stats_count(STAT_ABORT);
@@ -682,8 +701,7 @@ handle_xdp_dslite_decap(struct xdp_md *ctx)
 
             if (ipv4_has_df(inner_iph_pre))
                 return send_dslite_icmp_frag_needed(ctx, cfg, inner_iph_pre,
-                                                    out_lan->gateway_ip,
-                                                    (__u16)next_mtu);
+                                                    out_lan->gateway_ip, (__u16)next_mtu);
 
             increase_stats_count(STAT_MTU_DROP);
             return XDP_DROP;

@@ -16,6 +16,13 @@ fi
 echo "== stopping minuteman (if running in mm-cpe) =="
 pkill -f "$MINUTEMAN_BIN" 2>/dev/null || true
 
+echo "== stopping dhclient (if running in mm-host, MM_DHCPV4=1 rigs) =="
+if [[ -f "$DHCLIENT_PIDFILE" ]]; then
+    kill "$(cat "$DHCLIENT_PIDFILE")" 2>/dev/null || true
+    rm -f "$DHCLIENT_PIDFILE"
+fi
+pkill -f "dhclient.*$VETH_HOST_CPE" 2>/dev/null || true
+
 echo "== stopping dnsmasq =="
 if [[ -f "$DNSMASQ_PIDFILE" ]]; then
     kill "$(cat "$DNSMASQ_PIDFILE")" 2>/dev/null || true

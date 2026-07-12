@@ -56,10 +56,26 @@ query and confirming zero packets arrive there. `-dns-proxy` requires at least o
 source; `run()` fails fast at startup if none are available (e.g. `-aftr` was given directly, skipping
 DHCPv6 discovery entirely, and no `-dns-server` was given either).
 
+A DHCPv4 server (RFC 2131/2132) is also implemented, behind `-dhcpv4`, orthogonal to all of the above: it
+hands LAN clients the private IPv4 address the DS-Lite softwire carries (`pkg/dhcpv4`). Each `-lan`
+interface serves its own subnet — taken from the `-lan` value's optional `/prefixlen` (default `/24`) — with
+its gateway IP as the offered router and (by default) DNS server, pointing clients at this CPE, i.e.
+`-dns-proxy`; `-dhcpv4-dns` overrides the DNS offered. The advertised interface MTU (option 26) is the WAN
+MTU minus the 40-byte DS-Lite tunnel overhead (or the explicit `-lan` MTU if set), so LAN clients size
+packets to fit the softwire. Getting DHCP to the server needed a *datapath* change: a DHCP DISCOVER/REQUEST
+is sent to the limited-broadcast address, and `xdp_dslite_encap` (attached to the LAN interface, running
+before minuteman's own AF_PACKET DHCP socket) was wrapping it into the softwire like any other IPv4 packet.
+`xdp_dslite_encap` now bypasses (`XDP_PASS`) non-unicast IPv4 destinations (limited broadcast + multicast,
+`is_non_unicast_dst`) — which is correct in its own right, since a point-to-point softwire to one AFTR must
+never carry broadcast/multicast — so those packets reach the local stack and the DHCP server; unicast DHCP
+renewals to the gateway were already bypassed by `is_local_gateway_dst`. Verified end-to-end against the
+netns rig with a real `dhclient` (DORA, the pool's first address, the gateway default route, and the
+DS-Lite-adjusted MTU all applied, then the DS-Lite data path exercised over that DHCP-assigned config).
+
 `internal/` holds `cliconfig` (CLI flag parsing), `lanprefix` (DHCPv6-PD LAN policy, including RA
 serving), and `wanextend` (NDProxy LAN policy, including RA serving and host-route management);
 `pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/`pkg/prefixdelegation`/`pkg/routeradvert`/`pkg/ndproxy`/
-`pkg/netlink`/`pkg/dnsproxy` are the reusable protocol packages.
+`pkg/netlink`/`pkg/dnsproxy`/`pkg/dhcpv4` are the reusable protocol packages.
 
 Also not yet implemented: the migration technologies other than DS-Lite that an HB46PP response can
 describe (`map_e`/`map_t`/`lw4o6`/`464xlat`/`ipip`). `pkg/hb46pp` already decodes the response's
@@ -154,6 +170,16 @@ checks the answer matches; a live run also confirmed via `tcpdump -i dslite0` on
 packets cross the softwire during a DNS-proxied query (see `pkg/dnsproxy`'s own entry in Architecture for
 why that's structurally guaranteed, not just empirically true this once).
 
+A fourth, independent toggle, `MM_DHCPV4` (`0` default or `1`), adds `-dhcpv4` and exercises the DHCPv4
+server. Because a LAN client can no longer be given a static IPv4 (it must obtain one from the server),
+`setup.sh` in this mode leaves `mm-host` without a static address or default route, and `smoketest.sh` — as
+its very first check, before anything else assumes the host has IPv4 — runs a real `dhclient` in `mm-host`
+to acquire them, then asserts the pool's first address (`.2`), the gateway default route, and the
+DS-Lite-adjusted interface MTU (`1460`, from option 26) all landed; every later check (DNS proxy, the
+DS-Lite data path) then runs over that DHCP-assigned config, so the whole rig doubles as an end-to-end
+DHCPv4 test. `dhclient` is given a small conf requesting `interface-mtu` so it applies option 26.
+`teardown.sh` also stops any `dhclient` left running in `mm-host`.
+
 `run-cpe.sh` and `smoketest.sh` deliberately omit `-aftr` so minuteman discovers it live against the rig —
 pass `-aftr <addr>` as an extra argument to either script to override with a static address instead.
 
@@ -173,13 +199,14 @@ The AFTR's decap step uses a kernel `ip6tnl` (mode `ipip6`) device, which needs 
 `setup.sh` checks for it up front with a specific diagnostic for the common Arch situation where a kernel
 package upgrade has replaced `/lib/modules/<old-version>/` before a reboot, leaving the currently *running*
 kernel without a matching module directory (`uname -r` disagrees with what's on disk) — reboot to fix that.
-The full smoketest (AFTR discovery, LAN IPv6 reachability, and the DS-Lite data path end-to-end through
-the AFTR's decap+NAPT44 to the simulated internet and back, ICMP and TCP) has been verified passing from a
-fresh setup for `MM_AFTR_DISCOVERY=dhcpv6`/`hb46pp` (both against the `dhcpv6-pd` WAN model), for
-`MM_WAN_MODEL=dhcpv6-pd`/`ndproxy` (both against `dhcpv6` AFTR discovery), and for `MM_DNS_PROXY=1` (against
-`dhcpv6`/`dhcpv6-pd`, UDP and TCP both); the `hb46pp`×`ndproxy`×`MM_DNS_PROXY=1` corners haven't
-specifically been re-run since, though all three axes are independent code paths (AFTR discovery, LAN IPv6
-provisioning, and DNS forwarding) with no shared state.
+The full smoketest (AFTR discovery, LAN IPv6 reachability, LAN IPv4 provisioning, and the DS-Lite data path
+end-to-end through the AFTR's decap+NAPT44 to the simulated internet and back, ICMP and TCP) has been
+verified passing from a fresh setup for `MM_AFTR_DISCOVERY=dhcpv6`/`hb46pp` (both against the `dhcpv6-pd`
+WAN model), for `MM_WAN_MODEL=dhcpv6-pd`/`ndproxy` (both against `dhcpv6` AFTR discovery), for
+`MM_DNS_PROXY=1`, and for `MM_DHCPV4=1` (both against `dhcpv6`/`dhcpv6-pd`); the default (all four toggles
+off) was also re-run after the `xdp_dslite_encap` non-unicast-bypass change to confirm no regression. The
+uncrossed corners of the four independent axes haven't each been re-run, but they are independent code
+paths (AFTR discovery, LAN IPv6 provisioning, DNS forwarding, LAN IPv4 provisioning) with no shared state.
 
 ## Code style
 
@@ -193,7 +220,11 @@ provisioning, and DNS forwarding) with no shared state.
 
 - **`bpf/datapath.bpf.c`** — the DS-Lite XDP datapath. Two independently attachable programs:
   - `xdp_dslite_encap` (`SEC("xdp")`, attach to LAN interfaces): parses inbound IPv4, bypasses DS-Lite for
-    LAN-local traffic (`is_local_gateway_dst` / `is_local_lan_route`, via `bpf_fib_lookup`), checks WAN path MTU
+    LAN-local traffic (`is_local_gateway_dst` / `is_local_lan_route`, via `bpf_fib_lookup`) and for
+    non-unicast IPv4 destinations (`is_non_unicast_dst`: limited broadcast + multicast, which a
+    point-to-point softwire must never carry — this is also what lets a LAN client's limited-broadcast DHCP
+    DISCOVER/REQUEST reach minuteman's own `-dhcpv4` server, which listens via an AF_PACKET socket
+    downstream of XDP), checks WAN path MTU
     accounting for the 40-byte IPv6 encap overhead (`TUNNEL_L3_OVERHEAD`), replies with a plain ICMPv4
     Fragmentation-Needed via `XDP_TX` when needed (`send_plain_icmp_frag_needed` — untunneled, since the LAN
     sender is directly reachable on the ingress interface), then wraps the packet in an outer
@@ -398,11 +429,27 @@ provisioning, and DNS forwarding) with no shared state.
   rather than framing individual length-prefixed DNS-over-TCP messages — RFC 7766 §6.2.1 allows pipelining
   multiple queries on one connection, which a byte relay handles for free without this package ever
   needing to parse a message boundary.
+- **`pkg/dhcpv4/`** — the LAN-side DHCPv4 *server* (RFC 2131/2132) minuteman runs behind `-dhcpv4` to hand
+  its LAN clients the private IPv4 the DS-Lite softwire carries. Server only, and only the directly-attached
+  single-subnet-per-interface case a home CPE serves (no BOOTP relay/`giaddr` forwarding, no shared
+  networks, no restart persistence — an in-memory pool). Follows the same pure-vs-I/O split as `pkg/ndproxy`:
+  `message.go`/`options.go` are the BOOTP + magic-cookie + option TLV wire codec; `lease.go`'s `Pool` is the
+  address allocator (sticky-per-client offers, lowest-free allocation, expiry, RELEASE/DECLINE), pure with
+  an explicit `now time.Time` like `ndproxy`'s `proxyState`; `handler.go`'s `handle` is the pure DORA +
+  RELEASE/DECLINE/INFORM decision (request → reply message, or nil to stay silent) — all three unit-tested
+  with no sockets. `packet.go` is the raw AF_PACKET I/O (a DHCP server can't use an ordinary UDP socket: it
+  must reply to a client that has no IP/ARP entry yet and honour the broadcast flag), building/parsing
+  IPv4+UDP itself (with checksums) and a classic-BPF filter for UDP dport 67, the same cooked-`SOCK_DGRAM`
+  approach `pkg/ndproxy`'s `packet.go` uses; `server.go`'s `Serve(ctx, []InterfaceConfig)` runs one
+  goroutine + socket + `Pool` per LAN interface. See the `xdp_dslite_encap` `is_non_unicast_dst` bypass
+  above for why the datapath had to change before any of this could receive a packet.
 - **`cmd/minuteman/main.go`** — thin CLI entrypoint. Flags: `-wan`, `-b4`, `-aftr` (optional — see below),
-  repeatable `-lan iface=gatewayIP[,mtu]`, `-wan-dst-mac` (fallback only), `-stats-interval`, `-dhcpv6-pd`
+  repeatable `-lan iface=gatewayIP[/prefixlen][,mtu]` (the `/prefixlen`, default `/24`, is the DHCPv4
+  subnet), `-wan-dst-mac` (fallback only), `-stats-interval`, `-dhcpv6-pd`
   (opt-in prefix delegation), `-ndproxy` (opt-in RFC 4389 proxying, mutually exclusive with `-dhcpv6-pd` —
   validated in `run()` before anything else happens), `-dns-proxy` (opt-in DNS proxy, orthogonal to both
-  IPv6-provisioning flags) with repeatable `-dns-server` to override its upstreams,
+  IPv6-provisioning flags) with repeatable `-dns-server` to override its upstreams, `-dhcpv4` (opt-in DHCPv4
+  server, orthogonal to everything else) with `-dhcpv4-lease` and repeatable `-dhcpv4-dns`,
   `-hb46pp-vendor-id`/`-hb46pp-product`/`-hb46pp-version`
   (HB46PP client-identity query parameters — see below; default to the documentation OUI `acde48` since
   minuteman has no IEEE OUI, overridable since a VNE may key rollout/workaround decisions off them, not just
@@ -431,12 +478,17 @@ provisioning, and DNS forwarding) with no shared state.
   shutdown-draining reason. If `-dns-proxy` is set, `runDNSProxy()` starts `pkg/dnsproxy.Serve` listening on
   every `-lan` interface's gateway IP, forwarding to `-dns-server` if any were given or else the DNS servers
   `resolveAFTR()` returned; `run()` fails fast before any of this if `-dns-proxy` is set but no DNS servers
-  are available from either source. Otherwise `main.go` just orchestrates
+  are available from either source. If `-dhcpv4` is set, `runDHCPv4()` builds one `pkg/dhcpv4.InterfaceConfig`
+  per `-lan` (subnet from its `/prefixlen`, gateway as router and — unless `-dhcpv4-dns` overrides — DNS,
+  MTU = the `-lan` MTU or else the WAN MTU minus the 40-byte tunnel overhead) and starts `pkg/dhcpv4.Serve`;
+  all these background goroutines are tracked on the same `sync.WaitGroup`. Otherwise `main.go` just
+  orchestrates
   `pkg/datapath.Loader` calls (`Load`/`AttachWAN`/`SetB4Config`/`AttachLAN`+`SetLANConfig` per `-lan`/`Stats`
   on a timer) — it never touches `cilium/ebpf` or BPF map layouts directly.
-- **`internal/cliconfig`** — parses `minuteman`'s flag values (`LANSpec`, `ParseLANSpec`, `LANSpecList`
+- **`internal/cliconfig`** — parses `minuteman`'s flag values (`LANSpec` — now also carrying the optional
+  DHCPv4 `Subnet` from the `-lan` value's `/prefixlen` — `ParseLANSpec`, `LANSpecList`
   implementing `flag.Value`, `AddrList` implementing `flag.Value` for a repeatable plain IP-address flag
-  like `-dns-server`, `ParseMAC`) into typed values for `main.go` to hand to `pkg/datapath`. Thin
+  like `-dns-server`/`-dhcpv4-dns`, `ParseMAC`) into typed values for `main.go` to hand to `pkg/datapath`. Thin
   CLI-flag glue only, not a home for protocol logic (that's `pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/
   `pkg/prefixdelegation`).
 - **`internal/lanprefix`** — the DHCPv6-PD *policy* layer: what to do with a delegated prefix, as opposed to
@@ -495,7 +547,7 @@ When implementing new functionality, follow this split: per-packet fast-path log
 `bpf/datapath.bpf.c`; anything that needs `cilium/ebpf` or knows about BPF map layouts goes in
 `pkg/datapath`; generic protocol/wire-format code goes in its own `pkg/` package the way
 `pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/`pkg/prefixdelegation`/`pkg/routeradvert`/`pkg/ndproxy`/
-`pkg/netlink`/`pkg/dnsproxy` do; CLI-specific glue and policy decisions belong in `internal/` or `cmd/` (e.g.
+`pkg/netlink`/`pkg/dnsproxy`/`pkg/dhcpv4` do; CLI-specific glue and policy decisions belong in `internal/` or `cmd/` (e.g.
 `internal/lanprefix`'s delegated-prefix-to-LAN-address and delegated-prefix-to-RA policy, or
 `internal/wanextend`'s WAN-prefix-discovery-to-RA and confirmed-target-to-host-route policy), calling into
 the `pkg/` packages rather than duplicating their logic.

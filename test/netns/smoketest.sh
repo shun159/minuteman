@@ -9,7 +9,8 @@
 # its MM_WAN_MODEL notes): DHCPv6-PD SLAAC from a delegated prefix, or
 # RFC 4389 NDProxy extending the WAN's own SLAAC prefix onto the LAN. If
 # setup.sh was run with MM_DNS_PROXY=1, also spot-checks minuteman's DNS
-# proxy (RFC 6333's B4 SHOULD).
+# proxy (RFC 6333's B4 SHOULD); if with MM_DHCPV4=1, has mm-host acquire its
+# IPv4 lease from minuteman's DHCPv4 server (RFC 2131) and checks it.
 #
 # Starts minuteman itself (if not already running) and stops it again on
 # exit, unless it detects an existing instance to leave alone.
@@ -88,6 +89,15 @@ if [[ $dns_proxy_enabled -eq 1 ]]; then
     dns_proxy_flags=(-dns-proxy)
 fi
 
+dhcpv4_enabled=0
+if [[ -f "$DHCPV4_ENABLED_FILE" && "$(cat "$DHCPV4_ENABLED_FILE")" == 1 ]]; then
+    dhcpv4_enabled=1
+fi
+dhcpv4_flags=()
+if [[ $dhcpv4_enabled -eq 1 ]]; then
+    dhcpv4_flags=(-dhcpv4)
+fi
+
 if ip netns pids "$NETNS_CPE" 2>/dev/null | xargs -r -I{} readlink -f /proc/{}/exe 2>/dev/null | grep -qx "$MINUTEMAN_BIN"; then
     echo "== minuteman already running in $NETNS_CPE, reusing it =="
 else
@@ -98,6 +108,7 @@ else
         -lan "$VETH_CPE_HOST=${LAN_CPE_ADDR%/*}" \
         "$wan_model_flag" \
         "${dns_proxy_flags[@]}" \
+        "${dhcpv4_flags[@]}" \
         -stats-interval 0 >"$RUNDIR/minuteman.log" 2>&1 &
     minuteman_pid=$!
     started_minuteman=1
@@ -108,6 +119,33 @@ else
     # and the first Router Advertisement -- give it real headroom before the
     # checks below assume all of that has finished.
     sleep 5
+fi
+
+# In DHCPv4 mode mm-host has no IPv4 yet (setup.sh left it unconfigured):
+# acquire its address/route/MTU from minuteman's DHCPv4 server now, before
+# any later check assumes the host has IPv4 (the DNS-proxy and DS-Lite
+# data-path checks both do).
+if [[ $dhcpv4_enabled -eq 1 ]]; then
+    echo "== DHCPv4 (RFC 2131): $NETNS_HOST acquires its IPv4 lease from minuteman =="
+    # Request interface-mtu (option 26) so dhclient applies the DS-Lite
+    # softwire MTU minuteman advertises, not just the address.
+    cat >"$DHCLIENT_CONF" <<EOF
+timeout 20;
+request subnet-mask, broadcast-address, routers, domain-name-servers, interface-mtu;
+EOF
+    if [[ $started_minuteman -eq 1 ]]; then
+        check "minuteman is serving DHCPv4 on $VETH_CPE_HOST (see $RUNDIR/minuteman.log)" \
+            grep -q "DHCPv4: serving $LAN_PREFIX on $VETH_CPE_HOST" "$RUNDIR/minuteman.log"
+    fi
+    check "$NETNS_HOST acquired an IPv4 lease via dhclient (DORA against minuteman)" \
+        ip netns exec "$NETNS_HOST" dhclient -4 -1 \
+            -cf "$DHCLIENT_CONF" -lf "$DHCLIENT_LEASES" -pf "$DHCLIENT_PIDFILE" "$VETH_HOST_CPE"
+    check "$NETNS_HOST got the pool's first address ($DHCPV4_HOST_ADDR/24)" \
+        bash -c "ip netns exec $NETNS_HOST ip -4 addr show dev $VETH_HOST_CPE | grep -q 'inet $DHCPV4_HOST_ADDR/24'"
+    check "$NETNS_HOST installed a default route via the DHCP-supplied router ${LAN_CPE_ADDR%/*}" \
+        bash -c "ip netns exec $NETNS_HOST ip -4 route show default | grep -q 'via ${LAN_CPE_ADDR%/*}'"
+    check "$NETNS_HOST applied the DS-Lite-adjusted interface MTU ($DHCPV4_LAN_MTU, WAN 1500 - 40 tunnel overhead)" \
+        bash -c "ip netns exec $NETNS_HOST ip link show $VETH_HOST_CPE | grep -q 'mtu $DHCPV4_LAN_MTU'"
 fi
 
 aftr_mode=dhcpv6

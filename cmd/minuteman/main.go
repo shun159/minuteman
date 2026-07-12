@@ -10,7 +10,9 @@
 // each -lan interface. If -dns-proxy is given, minuteman also runs a DNS
 // proxy (RFC 6333's B4 SHOULD) on every -lan interface's gateway IP,
 // forwarding LAN clients' DNS queries directly over IPv6 instead of
-// through the DS-Lite softwire.
+// through the DS-Lite softwire. If -dhcpv4 is given, minuteman also runs a
+// DHCPv4 server (RFC 2131) on every -lan interface, handing LAN clients an
+// address from that interface's subnet plus the CPE as their router and DNS.
 package main
 
 import (
@@ -32,11 +34,19 @@ import (
 	"github.com/shun159/miniteman/internal/wanextend"
 	"github.com/shun159/miniteman/pkg/aftrdiscovery"
 	"github.com/shun159/miniteman/pkg/datapath"
+	"github.com/shun159/miniteman/pkg/dhcpv4"
 	"github.com/shun159/miniteman/pkg/dnsproxy"
 	"github.com/shun159/miniteman/pkg/hb46pp"
 	"github.com/shun159/miniteman/pkg/prefixdelegation"
 	"github.com/shun159/miniteman/pkg/routeradvert"
 )
+
+// tunnelOverhead is the DS-Lite IPv4-in-IPv6 encapsulation overhead (the
+// 40-byte outer IPv6 header, matching the datapath's TUNNEL_L3_OVERHEAD).
+// It's subtracted from the WAN MTU to derive the interface MTU the DHCPv4
+// server advertises to LAN clients, so they size packets to fit the
+// softwire without relying on in-path PMTUD.
+const tunnelOverhead = 40
 
 // Default HB46PP client identity sent as provisioning query parameters,
 // overridable via -hb46pp-vendor-id/-hb46pp-product/-hb46pp-version.
@@ -78,14 +88,18 @@ func run() error {
 		requestPD      = flag.Bool("dhcpv6-pd", false, "request a delegated IPv6 prefix via DHCPv6-PD (RFC 3633) on the WAN interface and assign one /64 per -lan interface from it")
 		ndProxy        = flag.Bool("ndproxy", false, "extend the WAN interface's own SLAAC /64 onto every -lan interface via RFC 4389 Neighbor Discovery Proxy, for ISPs that hand out a single WAN /64 with no DHCPv6-PD delegation (mutually exclusive with -dhcpv6-pd)")
 		dnsProxyOn     = flag.Bool("dns-proxy", false, "run a DNS proxy (RFC 6333's B4 SHOULD) on every -lan interface's gateway IP, port 53/UDP+TCP, forwarding queries directly over IPv6 to -dns-server (or the DHCPv6-learned DNS servers, if -dns-server is omitted) instead of through the DS-Lite softwire")
+		dhcpv4On       = flag.Bool("dhcpv4", false, "run a DHCPv4 server (RFC 2131) on every -lan interface, handing LAN clients an address from that interface's subnet (see -lan's optional /prefixlen, default /24), with the gateway IP as router and DNS (pair with -dns-proxy) and a DS-Lite-adjusted MTU")
+		dhcpv4Lease    = flag.Duration("dhcpv4-lease", 12*time.Hour, "DHCPv4 lease duration handed to LAN clients (with -dhcpv4)")
 		hb46ppVendorID = flag.String("hb46pp-vendor-id", defaultHB46PPVendorID, "HB46PP vendorid query parameter sent during provisioning discovery fallback (vendor OUI, optionally -suffix)")
 		hb46ppProduct  = flag.String("hb46pp-product", defaultHB46PPProduct, "HB46PP product query parameter sent during provisioning discovery fallback")
 		hb46ppVersion  = flag.String("hb46pp-version", defaultHB46PPVersion, "HB46PP version query parameter sent during provisioning discovery fallback (digits/underscores only)")
 		lans           cliconfig.LANSpecList
 		dnsServersFlag cliconfig.AddrList
+		dhcpv4DNSFlag  cliconfig.AddrList
 	)
-	flag.Var(&lans, "lan", "LAN interface as iface=gatewayIP[,mtu] (repeatable, required at least once)")
+	flag.Var(&lans, "lan", "LAN interface as iface=gatewayIP[/prefixlen][,mtu] (repeatable, required at least once)")
 	flag.Var(&dnsServersFlag, "dns-server", "upstream DNS server for -dns-proxy to forward to (repeatable, IPv6 recommended -- see -dns-proxy); defaults to the DNS servers learned via DHCPv6 during AFTR discovery if omitted")
+	flag.Var(&dhcpv4DNSFlag, "dhcpv4-dns", "IPv4 DNS server to advertise to DHCPv4 clients (repeatable, with -dhcpv4); defaults to each -lan interface's own gateway IP (i.e. this CPE, pointing clients at -dns-proxy)")
 	flag.Parse()
 
 	if *wanIface == "" || *b4Addr == "" || len(lans) == 0 {
@@ -121,6 +135,11 @@ func run() error {
 	}
 	if *dnsProxyOn && len(dnsServers) == 0 {
 		return errors.New("-dns-proxy needs at least one DNS server: none were learned via DHCPv6 (likely because -aftr was given directly, skipping DHCPv6 discovery) and none were given via -dns-server")
+	}
+	for _, a := range dhcpv4DNSFlag {
+		if !a.Is4() {
+			return fmt.Errorf("-dhcpv4-dns %s must be an IPv4 address (DHCPv4 option 6 carries only IPv4 DNS servers)", a)
+		}
 	}
 
 	dp, err := datapath.Load()
@@ -179,6 +198,11 @@ func run() error {
 	}
 	if *dnsProxyOn {
 		runDNSProxy(ctx, lans, dnsServers, &bgWG)
+	}
+	if *dhcpv4On {
+		if err := runDHCPv4(ctx, lans, dhcpv4DNSFlag, wanNetIface.MTU, *dhcpv4Lease, &bgWG); err != nil {
+			return err
+		}
 	}
 	defer bgWG.Wait()
 
@@ -269,6 +293,53 @@ func runDNSProxy(ctx context.Context, lans cliconfig.LANSpecList, dnsServers []n
 			log.Printf("DNS proxy ended unexpectedly: %v", err)
 		}
 	}()
+}
+
+// runDHCPv4 builds a pkg/dhcpv4.InterfaceConfig for every -lan interface and
+// starts the DHCPv4 server, tracked on wg. Each interface serves its own
+// subnet (from -lan's /prefixlen), offers its gateway IP as router and (by
+// default) DNS -- pointing clients at the CPE, i.e. -dns-proxy -- and
+// advertises an interface MTU sized for the DS-Lite softwire: the -lan MTU
+// if set, else the WAN MTU minus the 40-byte tunnel overhead. A -lan without
+// an IPv4 subnet (an IPv6-only gateway) is a fatal misconfiguration under
+// -dhcpv4.
+func runDHCPv4(ctx context.Context, lans cliconfig.LANSpecList, dnsOverride []netip.Addr, wanMTU int, lease time.Duration, wg *sync.WaitGroup) error {
+	var cfgs []dhcpv4.InterfaceConfig
+	for _, spec := range lans {
+		if !spec.Subnet.IsValid() {
+			return fmt.Errorf("-dhcpv4: LAN interface %s has no IPv4 subnet (its -lan gateway %s is not IPv4)", spec.Iface, spec.GatewayIP)
+		}
+
+		dns := dnsOverride
+		if len(dns) == 0 {
+			dns = []netip.Addr{spec.GatewayIP} // point clients at this CPE (see -dns-proxy)
+		}
+
+		mtu := spec.MTU
+		if mtu == 0 && wanMTU > tunnelOverhead {
+			mtu = wanMTU - tunnelOverhead
+		}
+
+		cfgs = append(cfgs, dhcpv4.InterfaceConfig{
+			Iface:      spec.Iface,
+			ServerIP:   spec.GatewayIP,
+			Subnet:     spec.Subnet,
+			DNSServers: dns,
+			MTU:        uint16(mtu),
+			LeaseTime:  lease,
+		})
+		log.Printf("DHCPv4: serving %s on %s (router/DNS %s, lease %v, MTU %d)",
+			spec.Subnet, spec.Iface, spec.GatewayIP, lease, mtu)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := dhcpv4.Serve(ctx, cfgs); err != nil {
+			log.Printf("DHCPv4 server ended unexpectedly: %v", err)
+		}
+	}()
+	return nil
 }
 
 // resolveAFTR returns aftrFlag parsed as an IPv6 address if non-empty,
