@@ -53,6 +53,9 @@ Not yet implemented:
   WAN address changing, and the harder part is applying a *changed* AFTR to the live datapath safely
   (today `SetB4Config` is only ever called once, before the datapath is considered "up") without
   disrupting in-flight softwire traffic.
+- A handful of RFC 7084/6333 compliance gaps (RDNSS-in-RA is the highest-impact one — an IPv6-only SLAAC
+  LAN client currently gets no DNS server at all). See `docs/rfc-compliance-backlog.md` for the full,
+  priority-ordered list with the specific code each gap points at.
 
 ## Build commands
 
