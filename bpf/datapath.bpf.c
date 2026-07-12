@@ -142,6 +142,7 @@ enum stat_id {
     STAT_IPV6_FWD,
     STAT_IPV6_PASS,
     STAT_IPV6_RSS_REDIRECT,
+    STAT_ICMP_RATE_LIMITED,
     STAT_MAX,
 };
 
@@ -158,6 +159,72 @@ increase_stats_count(__u32 idx)
     __u64 *v = bpf_map_lookup_elem(&stats, &idx);
     if (v)
         *v += 1;
+}
+
+/*
+ * Rate limiting for datapath-originated ICMP errors (ICMPv6 Packet Too Big,
+ * ICMPv4 Fragmentation Needed in both plain and softwire-tunneled form).
+ * RFC 4443 SS2.4(f) makes rate-limiting originated ICMPv6 errors a MUST, and
+ * RFC 1812 SS4.3.2.8 recommends the same for ICMPv4 -- and since these
+ * replies are XDP_TX'd without ever entering the kernel stack, the kernel's
+ * own icmp_ratelimit/ratemask sysctls never see them, so the datapath must
+ * enforce its own limit or a line-rate stream of oversized packets yields a
+ * line-rate stream of ICMP errors (a reflection primitive).
+ *
+ * One token bucket per CPU (PERCPU_ARRAY, so no cross-CPU atomics -- the
+ * same reasoning as the stats map): ICMP_ERROR_RATE_PER_SEC sustained,
+ * ICMP_ERROR_BURST burst, each per CPU. With hardware RSS (or the optional
+ * software-RSS stage) spreading flows, the aggregate across N CPUs is
+ * N * rate -- on a typical 4-16 CPU CPE that lands in the same range as the
+ * kernel's own default global limit (icmp_msgs_per_sec = 1000). PMTUD needs
+ * only a handful of errors per flow, so legitimate traffic never notices.
+ */
+#define ICMP_ERROR_RATE_PER_SEC 100
+#define ICMP_ERROR_BURST 20
+#define ICMP_ERROR_REFILL_INTERVAL_NS (1000000000ULL / ICMP_ERROR_RATE_PER_SEC)
+
+struct icmp_rate_bucket {
+    __u64 last_refill_ns;
+    __u64 tokens;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct icmp_rate_bucket);
+} icmp_error_rate SEC(".maps");
+
+/*
+ * Takes one token from this CPU's ICMP-error bucket, refilling it first
+ * from the time elapsed since the last refill. Returns false when the
+ * bucket is empty -- the caller must then drop the offending packet
+ * *without* originating the ICMP error (mirroring what the kernel does
+ * when its own ICMP rate limit trips). last_refill_ns advances by whole
+ * refill intervals rather than jumping to now, so the sub-interval
+ * remainder isn't lost to truncation. A zeroed bucket (map initial state)
+ * computes a huge elapsed time on first use and clamps to a full burst,
+ * so no explicit initialization is needed.
+ */
+static __always_inline bool
+icmp_error_allowed(void)
+{
+    __u32 key = 0;
+    struct icmp_rate_bucket *b = bpf_map_lookup_elem(&icmp_error_rate, &key);
+    if (!b)
+        return true;
+
+    __u64 now = bpf_ktime_get_ns();
+    __u64 refill = (now - b->last_refill_ns) / ICMP_ERROR_REFILL_INTERVAL_NS;
+    if (refill > 0) {
+        __u64 tokens = b->tokens + refill;
+        b->tokens = tokens > ICMP_ERROR_BURST ? ICMP_ERROR_BURST : tokens;
+        b->last_refill_ns += refill * ICMP_ERROR_REFILL_INTERVAL_NS;
+    }
+    if (b->tokens == 0)
+        return false;
+    b->tokens -= 1;
+    return true;
 }
 
 static __always_inline struct b4_config *
@@ -325,6 +392,12 @@ send_plain_icmp_frag_needed(struct xdp_md *ctx, __u64 l2_len,
         return XDP_DROP;
     }
 
+    if (!icmp_error_allowed()) {
+        increase_stats_count(STAT_MTU_DROP);
+        increase_stats_count(STAT_ICMP_RATE_LIMITED);
+        return XDP_DROP;
+    }
+
     if (l2_len < sizeof(struct ethhdr) || l2_len > 64) {
         increase_stats_count(STAT_ABORT);
         return XDP_ABORTED;
@@ -397,6 +470,12 @@ send_icmpv6_pkt_too_big(struct xdp_md *ctx, __u64 l2_len, const struct ipv6hdr *
     if (ipv6_addr_is_unspecified(src6)) {
         increase_stats_count(STAT_IPV6_PASS);
         return XDP_PASS;
+    }
+
+    if (!icmp_error_allowed()) {
+        increase_stats_count(STAT_MTU_DROP);
+        increase_stats_count(STAT_ICMP_RATE_LIMITED);
+        return XDP_DROP;
     }
 
     if (l2_len < sizeof(struct ethhdr) || l2_len > 64) {
@@ -810,6 +889,12 @@ send_dslite_icmp_frag_needed(struct xdp_md *ctx, const struct b4_config *cfg,
 
     if (inner_iph->ihl != 5) {
         increase_stats_count(STAT_MTU_DROP);
+        return XDP_DROP;
+    }
+
+    if (!icmp_error_allowed()) {
+        increase_stats_count(STAT_MTU_DROP);
+        increase_stats_count(STAT_ICMP_RATE_LIMITED);
         return XDP_DROP;
     }
 

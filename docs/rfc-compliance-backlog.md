@@ -20,23 +20,69 @@ support at the B4/AFTR when the IPv6 path can't be guaranteed ≥1540.
 is an `XDP_PASS` fallback to a kernel `ip6tnl` for the decap side specifically, letting the kernel
 reassemble before minuteman ever sees the packet.
 
-## 2. B4 well-known address — RFC 6333 §5.7 + RFC 7335
+## 2. DHCPv6-PD takes the server's T1/T2 literally, including 0 — RFC 3633 §9 / RFC 8415 §18.2.4
 
-`192.0.0.2` (the B4's well-known IPv4 address for tunnel-originated ICMP) is unused anywhere in the
-codebase. The B4's own tunnel-side ICMP (its ICMPv4 Fragmentation-Needed replies) is sourced from the LAN
-gateway's private IPv4 instead.
+`pkg/prefixdelegation/maintain.go`'s `Maintain` sleeps until `AcquiredAt + T1` with the
+server-supplied T1 used as-is, and nothing anywhere derives client-side timers: a delegating router
+that sets T1=T2=0 is delegating the renewal timing to the requesting router (RFC 3633 §9), which is
+then supposed to pick its own (RFC 8415 §18.2.4 recommends T1 = 0.5 × and T2 = 0.8 × the shortest
+preferred lifetime). Taken literally, T1=0 makes `sleepUntil` return immediately, so every successful
+Renew flows straight into the next — a busy Renew loop hammering the delegating server for as long as
+it keeps answering (each iteration is one exchange RTT, no sleep at all). T1 > T2 (RFC 8415: such an
+IA_PD is invalid and must be ignored) isn't sanity-checked either, and `tryRenew`'s deadline of
+`AcquiredAt + T2` goes similarly wrong when T2=0.
 
-**Effect:** medium/low — affects the correctness of traceroute and third-party PMTUD tooling observing
-the tunnel from outside, not reachability itself.
+**Effect:** real delegating routers do send T1=T2=0; against one, minuteman becomes a renew storm.
+Never exercised by the netns rig (its Kea is configured with renew-timer 1800).
 
-## 3. Tunnel ICMPv6 relay — RFC 2473 §8
+**Fix:** when T1 and/or T2 is 0, derive them from the shortest preferred lifetime per RFC 8415
+§18.2.4 (with a sane floor); discard IA_PDs carrying 0 < T2 < T1.
+
+## 3. Every Renew restarts the LAN RA workers through their shutdown path — RFC 4861 §6.2.5 misapplied
+
+`internal/lanprefix.RAManager.Sync` deliberately restarts every RA worker on every lease change (to
+pick up refreshed lifetimes — its comment claims restarting has no churn equivalent to `Reconcile`'s),
+but "restart" is cancel-then-start, and `pkg/routeradvert.Serve`'s cancellation path sends the RFC
+4861 §6.2.5 graceful-shutdown RA: RouterLifetime=0, and (since RDNSS lifetime is tied to
+RouterLifetime in `buildRA`) RDNSS Lifetime=0 with it. So on every T1 Renew, every LAN client is told
+"this router is going away and stop using its DNS server", then re-told everything a moment later by
+the new worker's immediate first RA. The final RA is exactly the churn the comment says doesn't exist.
+
+**Effect:** periodic (every T1 interval) transient default-route withdrawal plus RDNSS invalidation on
+all LAN clients — a brief routing/resolver flap per renewal, worse on hosts that honour RDNSS
+lifetimes promptly. `internal/wanextend`'s raManager has the same shutdown-RA-on-restart shape but
+only restarts on an actual WAN prefix change, where deprecating the old state is at least arguably
+right.
+
+**Fix direction:** let `routeradvert.Serve` take lifetime/config updates in place (channel or atomic
+pointer consulted per send) so a Renew never restarts the worker; or plumb a "restarting, not shutting
+down" signal that suppresses the final RA.
+
+## 4. Tunnel-originated ICMPv4: no Time Exceeded, and the B4 well-known address is unused — RFC 1812 §5.3.1, RFC 6333 §5.7 + RFC 7335
+
+Two related gaps around ICMPv4 the B4 itself must originate:
+
+- **Inner TTL expiry produces no Time Exceeded** (RFC 1812 §5.3.1 MUST). `xdp_dslite_encap` XDP_PASSes
+  an inner TTL≤1 packet to the kernel, but a DS-Lite CPE kernel typically has no IPv4 default route,
+  so the kernel answers Destination Unreachable instead — traceroute from a LAN client through the
+  softwire terminates at the first hop with `!N`. `xdp_dslite_decap` XDP_PASSes the
+  *still-encapsulated* packet (its TTL check is pre-decap), which the kernel can't parse past (no
+  ip6tnl is bound to nexthdr 4), so inbound traceroute gets no reply at all at the B4 hop.
+- **192.0.0.2 unused** (RFC 6333 §5.7 + RFC 7335): the B4's tunnel-side ICMP (today only its ICMPv4
+  Fragmentation-Needed replies) is sourced from the LAN gateway's private IPv4 instead of the
+  well-known B4 address.
+
+**Effect:** traceroute and PMTUD-adjacent tooling misbehave in both directions at the B4 hop;
+reachability itself unaffected.
+
+## 5. Tunnel ICMPv6 relay — RFC 2473 §8
 
 No reactive translation exists of an ICMPv6 error about the softwire packet itself (e.g. a Packet Too Big
 or Time Exceeded from an intermediate IPv6 router on the B4↔AFTR path) into an ICMPv4 error toward the
 original IPv4 sender. The encap path's own proactive `bpf_check_mtu`-based PtB only covers the
 locally-known egress MTU, not a smaller MTU somewhere further along the IPv6 path.
 
-## 4. AFTR periodic re-discovery — RFC 4242, RFC 3315 WAN-change trigger
+## 6. AFTR periodic re-discovery — RFC 4242, RFC 3315 WAN-change trigger
 
 Already tracked in `CLAUDE.md`'s "Not yet implemented": `cmd/minuteman` discovers the AFTR once at
 startup and never re-runs discovery, doesn't watch the refresh interval either package reports, and
@@ -44,8 +90,17 @@ doesn't watch for the WAN address changing. Applying a *changed* AFTR to the liv
 `SetB4Config` is only ever called once, before the datapath is considered "up") without disrupting
 in-flight softwire traffic is the harder part of implementing this.
 
-## 5. Minor / acceptable for a home CPE
+## 7. Minor / acceptable for a home CPE
 
+- RDNSS is only advertised while `-dns-proxy` is on; with it off (the default), an IPv6-only SLAAC LAN
+  client is DNS-less again (RFC 7084 §L-4). The proxy-less alternative — advertising the WAN-learned
+  upstream resolvers directly in RDNSS — would cover the default configuration too.
 - RA MTU option (RFC 4861 §4.6.4) isn't advertised.
 - MLD (RFC 3810) is left entirely to the kernel — minuteman forwards no IPv6 multicast of its own. Fine
   for a home gateway; would need revisiting for a router expected to do multicast routing.
+- RFC 4389 proxy-loop detection is a documented non-goal of `pkg/ndproxy`; fine while WAN and LAN
+  can't be accidentally bridged, worth revisiting otherwise.
+- ICMP error quotes are fixed-size: the ICMPv6 Packet Too Big quotes only the invoking IPv6 header +
+  8 bytes, where RFC 4443 asks for as much as fits in the minimum MTU. Enough for every real PMTUD
+  consumer (ports/flow are within the 8 bytes); a full quote would need variable-length reply
+  construction in XDP.

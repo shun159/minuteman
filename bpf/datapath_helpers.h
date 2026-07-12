@@ -516,7 +516,11 @@ inner_ip4_hash(const struct iphdr *iph, void *data_end)
  * ::1 (loopback) is rejected as both source and destination: per RFC 4291
  * SS2.5.3 it must never appear on the wire of any link at all, so a router
  * must not FIB-lookup or redirect it either way -- local-delivery semantics
- * for it belong to the kernel, not this fastpath.
+ * for it belong to the kernel, not this fastpath. The unspecified address
+ * (::) is likewise rejected both ways: RFC 4291 SS2.5.2 forbids it as a
+ * destination outright, and without an explicit check a packet to :: would
+ * match the default route in bpf_fib_lookup like any other address and get
+ * redirected upstream -- the kernel input path drops it instead.
  */
 static __always_inline bool
 ipv6_is_forwardable(const struct ipv6hdr *ip6h)
@@ -530,6 +534,8 @@ ipv6_is_forwardable(const struct ipv6hdr *ip6h)
         return false; /* fe80::/10 link-local destination */
     if (ipv6_addr_is_loopback(&ip6h->daddr))
         return false; /* ::1 destination */
+    if (ipv6_addr_is_unspecified(&ip6h->daddr))
+        return false; /* :: destination */
 
     if (ipv6_addr_is_unspecified(&ip6h->saddr))
         return false; /* :: source */
