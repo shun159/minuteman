@@ -456,11 +456,21 @@ build_flow_key(struct flow_key *key, const struct iphdr *iph, void *data_end,
  * PRIMING records every flow it sees while the *old* AFTR is still active --
  * that's the whole point: at cutover, a table miss can't distinguish a new flow
  * from a pre-existing flow's next packet (UDP/QUIC/ICMP have no start marker),
- * so the distinction has to be learned beforehand. The insert is deliberately
- * lookup-first rather than a blind BPF_NOEXIST: a leftover stale-epoch entry on
- * this key would make a blind insert fail EEXIST, leaving a flow we *did*
- * observe stamped with the wrong epoch -- and so misclassified as new at
- * cutover. Adopting the entry re-stamps it instead.
+ * so the distinction has to be learned beforehand.
+ *
+ * Two details make the recording trustworthy enough to gate the cutover on:
+ *
+ *   - It is lookup-first, not a blind insert. A leftover stale-epoch entry on
+ *     this key must be re-stamped, not inserted over; a blind insert would fail
+ *     and leave a flow we *did* observe carrying the wrong epoch, so it would be
+ *     misclassified as new at cutover.
+ *   - The insert itself uses BPF_ANY, not BPF_NOEXIST. Two CPUs can both miss
+ *     the lookup for the same flow and race to create it; with BPF_NOEXIST the
+ *     loser gets EEXIST and would be counted as a failed recording even though
+ *     the flow is, in fact, recorded -- and the control plane would abandon a
+ *     perfectly good migration over it. With BPF_ANY the loser simply rewrites
+ *     the same {epoch, now}, so a failure here means what the cutover gate needs
+ *     it to mean: the table is genuinely full.
  *
  * DRAINING never creates an entry: a miss there means a flow that started after
  * the cutover, which belongs on the new AFTR and must not be pinned.
@@ -488,10 +498,11 @@ touch_flow_affinity(__u32 ctrl, const struct iphdr *iph, void *data_end, bool re
         return NULL;
 
     struct flow_affinity nv = {.last_seen_ns = now, .epoch = epoch};
-    if (bpf_map_update_elem(&flow_affinity_map, &key, &nv, BPF_NOEXIST) < 0) {
-        /* Table full. The control plane gates cutover on this counter: a flow
-         * we failed to record may be pre-existing and would break when the
-         * switch happens, so the migration is abandoned rather than cut over. */
+    if (bpf_map_update_elem(&flow_affinity_map, &key, &nv, BPF_ANY) < 0) {
+        /* The table is full (BPF_ANY can't fail on a duplicate). The control
+         * plane gates cutover on this counter: a flow we failed to record may be
+         * pre-existing, and cutting over would move it to an AFTR holding no
+         * state for it, so the migration is abandoned instead. */
         increase_stats_count(STAT_AFFINITY_INSERT_FAIL);
         return NULL;
     }

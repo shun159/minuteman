@@ -60,7 +60,17 @@ type Stats struct {
 	ICMPRateLimited uint64
 
 	// AFTR-migration flow affinity (see bpf/datapath.bpf.c's PRIMING/DRAINING).
-	AffinityInsert     uint64 // flows recorded during PRIMING
-	AffinityInsertFail uint64 // table full -- migration must be abandoned, not cut over
+	//
+	// AffinityInsert counts recording operations, not distinct flows: two CPUs
+	// racing to record the same flow both count (they write the same value, so
+	// it is only the tally that is approximate).
+	//
+	// AffinityInsertFail means the table is genuinely full -- the datapath
+	// records with BPF_ANY precisely so a duplicate-insert race between CPUs
+	// can't be mistaken for a failure. A migration must be abandoned rather
+	// than cut over while this is rising: an unrecorded flow may predate the
+	// switch, and would be moved to an AFTR holding no state for it.
+	AffinityInsert     uint64
+	AffinityInsertFail uint64
 	AffinityPinned     uint64 // packets held on the old AFTR during DRAINING
 }
