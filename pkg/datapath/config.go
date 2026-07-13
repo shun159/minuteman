@@ -67,25 +67,53 @@ func (l *Loader) SetB4Config(cfg B4Config) error {
 	return l.registerTxPort(cfg.WANIfindex)
 }
 
-// SwitchAFTR moves the live softwire endpoint pair to (b4, aftr): it writes the
-// free slot in full, then points the control word at it. The slot the datapath
-// is resolving is never mutated, so it can never read a half-updated endpoint
-// (a next_hop is copied into place on update, with no RCU replacement — see the
-// note on struct next_hop in bpf/datapath.bpf.c), and the sequence is encoded
-// here so a caller can't reintroduce that hazard by driving the slots directly.
-// The replaced endpoint is left valid in its slot, so decap keeps accepting its
-// in-flight return traffic until a later switch recycles that slot.
+// SwitchAFTR moves the live softwire endpoint pair to (b4, aftr) immediately,
+// breaking any in-flight flow: it writes a slot the datapath cannot currently
+// resolve, then points the control word at it. The slot in use is never
+// mutated, so the datapath can never read a half-updated endpoint (it copies a
+// next_hop in place on update, with no RCU replacement — see the note on struct
+// next_hop in bpf/datapath.bpf.c), and the sequence is encoded here so a caller
+// can't reintroduce that hazard by driving the slots directly. The endpoint
+// being replaced is left valid in its slot, so decap keeps accepting its return
+// traffic until a later switch recycles that slot.
 //
-// This switch is immediate: in-flight flows are moved to the new AFTR, which has
-// no NAT state for them, and break. That is correct when they are unrecoverable
-// anyway (a changed B4 address invalidates the AFTR's state), and is the only
-// behaviour available until graceful migration lands.
+// This is the *hard* switch, for when in-flight flows are unrecoverable anyway
+// (a changed B4 address invalidates the AFTR's NAT state) or when a graceful
+// migration has to be abandoned. To preserve in-flight flows across an
+// AFTR-only change, use BeginMigration/Cutover/CompleteMigration instead.
+//
+// It first ends any migration in progress, which is a correctness requirement,
+// not tidiness: during DRAINING *both* slots are live — encap resolves the
+// active one for new flows and the old one for flows pinned by PRIMING — so
+// with two slots there is no free slot left to write, and blindly taking
+// "(active+1)" would overwrite the pinned flows' slot out from under them.
+// Ending the migration frees one. A hard switch breaks in-flight flows by
+// definition, which is exactly what cutting a drain short does.
 func (l *Loader) SwitchAFTR(b4, aftr netip.Addr) error {
 	if err := validateSoftwireAddrs(b4, aftr); err != nil {
 		return err
 	}
 
 	c, err := l.readCtrl()
+	if err != nil {
+		return err
+	}
+	switch c.state {
+	case migPriming:
+		// Discards the slot prepared for the new AFTR; traffic never moved.
+		if err := l.AbortMigration(); err != nil {
+			return err
+		}
+	case migDraining:
+		// Ends the drain now: the old slot is retired and its still-pinned
+		// flows break -- accepted, since this is the hard-switch path.
+		if err := l.CompleteMigration(); err != nil {
+			return err
+		}
+	}
+
+	// Now STEADY, so exactly one slot is resolvable and the other is free.
+	c, err = l.readCtrl()
 	if err != nil {
 		return err
 	}
@@ -103,12 +131,12 @@ func (l *Loader) SwitchAFTR(b4, aftr netip.Addr) error {
 }
 
 // slotIsLive reports whether the datapath can currently resolve slot for
-// encapsulation. Today that is just the active slot; graceful migration will
-// add the old slot while flows are still pinned to it. A slot that isn't valid
-// yet can't be resolved whatever the control word says (resolve_softwire checks
-// nh->valid), so the initial write of a fresh slot is not a live write.
+// encapsulation: the active slot always, plus -- while DRAINING -- the old slot
+// that PRIMING's flows are still pinned to. A slot that isn't valid yet can't be
+// resolved whatever the control word says (resolve_softwire checks nh->valid),
+// so the initial write of a fresh slot is not a live write.
 func (l *Loader) slotIsLive(c migrationCtrl, slot uint32) (bool, error) {
-	resolvable := slot == c.activeSlot
+	resolvable := slot == c.activeSlot || (c.state == migDraining && slot == c.oldSlot)
 	if !resolvable {
 		return false, nil
 	}
@@ -126,8 +154,9 @@ func (l *Loader) slotIsLive(c migrationCtrl, slot uint32) (bool, error) {
 // whole point of the slot indirection: a next_hop is copied into place on
 // update with no RCU replacement, so overwriting a live slot lets a packet in
 // flight read a half-updated endpoint and be encapsulated to a garbage peer.
-// Enforcing it here rather than trusting each call site keeps the invariant
-// true as more callers (graceful migration) are added.
+// The rule is easy to violate by accident -- during DRAINING *both* slots are
+// live, so there is simply no free slot until the migration ends -- so it is
+// enforced here rather than merely documented at the call sites.
 func (l *Loader) writeNextHop(slot uint32, b4, aftr netip.Addr) error {
 	c, err := l.readCtrl()
 	if err != nil {

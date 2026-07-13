@@ -96,22 +96,21 @@ struct {
 
 /*
  * Migration control: one bit-packed __u32 that drives which next_hop slot a
- * softwire packet uses. Packing it into a single word keeps every transition a
- * single atomic store -- the same reason the active_nh index it subsumes was one
- * word. Each program loads it into a local exactly once per packet and never
- * re-reads it mid-packet, so the two halves of one packet can never see
+ * softwire packet uses, and (during an AFTR migration) whether flow affinity
+ * applies. Packing it into a single word keeps every state transition a single
+ * atomic store -- the same reason active_nh (which this subsumes) was one word.
+ * Each program loads it into a local exactly once per packet and never re-reads
+ * it mid-packet, so the first and second halves of one packet can never see
  * different generations.
  *
- * Only MIG_STEADY exists today; the state/old_slot/epoch fields are the seam a
- * graceful AFTR migration (flow affinity across a switch) hooks into, which is
- * why the word is laid out for it now rather than being widened later.
- *
- *   bits  0..7  active_slot  the slot encap uses
- *   bits  8..15 old_slot     (migration) the slot pre-cutover flows pin to
- *   bits 16..23 state        MIG_STEADY today
- *   bits 24..31 epoch        (migration) generation stamp
+ *   bits  0..7  active_slot  the slot encap uses by default
+ *   bits  8..15 old_slot     during DRAINING, the slot pre-cutover flows pin to
+ *   bits 16..23 state        MIG_STEADY / MIG_PRIMING / MIG_DRAINING
+ *   bits 24..31 epoch        this migration's generation (see flow_affinity)
  */
 #define MIG_STEADY 0
+#define MIG_PRIMING 1
+#define MIG_DRAINING 2
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -119,6 +118,50 @@ struct {
     __type(key, __u32);
     __type(value, __u32); /* packed: see MIG_* accessors */
 } migration_ctrl SEC(".maps");
+
+/*
+ * Inner-IPv4 flow key for AFTR migration affinity. Ports are only meaningful
+ * for unfragmented TCP/UDP; every fragment (the first one included) and every
+ * portless protocol degrades to ports=0, so all of one datagram's fragments --
+ * and successive datagrams of the same flow -- land on the same entry. Keying
+ * fragments by IPv4 ID instead would keep a single datagram together but never
+ * match across datagrams (a fresh ID each), destroying exactly the affinity
+ * PRIMING recorded. The coarse shared entry merely pins same-pair fragmented
+ * flows to one slot together: the value is only a generation stamp, so a
+ * collision is fate-sharing, not corruption.
+ *
+ * The key is always in the *forward* (LAN -> Internet) orientation; the decap
+ * path reverses the inner header's addresses/ports to reach the same key.
+ */
+struct flow_key {
+    __u32 src;
+    __u32 dst;
+    __be16 sport;
+    __be16 dport;
+    __u8 proto;
+    __u8 pad[3];
+};
+
+/*
+ * epoch stamps which migration recorded this flow. A lookup only honours an
+ * entry whose epoch matches the control word's, so leftovers from an earlier
+ * migration are ignored (and deleted lazily by userspace) -- the flow table
+ * never has to be drained to empty before the next migration can start.
+ */
+struct flow_affinity {
+    __u64 last_seen_ns;
+    __u32 epoch;
+    __u32 pad;
+};
+
+#define MAX_FLOW_AFFINITY 65536
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, MAX_FLOW_AFFINITY);
+    __type(key, struct flow_key);
+    __type(value, struct flow_affinity);
+} flow_affinity_map SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -201,6 +244,9 @@ enum stat_id {
     STAT_IPV6_PASS,
     STAT_IPV6_RSS_REDIRECT,
     STAT_ICMP_RATE_LIMITED,
+    STAT_AFFINITY_INSERT,
+    STAT_AFFINITY_INSERT_FAIL,
+    STAT_AFFINITY_PINNED,
     STAT_MAX,
 };
 
@@ -360,6 +406,119 @@ static __always_inline bool
 resolve_active_softwire(struct b4_config *out)
 {
     return resolve_softwire(out, get_next_hop(mig_active_slot(get_migration_ctrl())));
+}
+
+/*
+ * Builds the forward (LAN -> Internet) flow key for iph. reverse=true is for
+ * the decap path, whose inner header runs Internet -> LAN: swapping its
+ * addresses and ports yields the same key the encap path recorded, so both
+ * directions of one flow share one entry (a download-heavy flow would otherwise
+ * look idle to the drain GC, which only ever sees uplink packets).
+ *
+ * See struct flow_key for why fragments and portless protocols use ports=0.
+ */
+static __always_inline void
+build_flow_key(struct flow_key *key, const struct iphdr *iph, void *data_end,
+               bool reverse)
+{
+    __builtin_memset(key, 0, sizeof(*key));
+    key->proto = iph->protocol;
+
+    __be16 sport = 0, dport = 0;
+    bool fragmented = (iph->frag_off & bpf_htons(IP_MF | IP_OFFSET)) != 0;
+
+    if (!fragmented && iph->ihl == 5 &&
+        (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP)) {
+        struct l4_ports *p = (struct l4_ports *)((__u8 *)iph + sizeof(*iph));
+        if ((void *)(p + 1) <= data_end) {
+            sport = p->sport;
+            dport = p->dport;
+        }
+    }
+
+    if (reverse) {
+        key->src = iph->daddr;
+        key->dst = iph->saddr;
+        key->sport = dport;
+        key->dport = sport;
+    } else {
+        key->src = iph->saddr;
+        key->dst = iph->daddr;
+        key->sport = sport;
+        key->dport = dport;
+    }
+}
+
+/*
+ * Records or refreshes this flow's affinity entry during a migration, and
+ * reports whether the flow predates the cutover (a current-epoch entry).
+ *
+ * PRIMING records every flow it sees while the *old* AFTR is still active --
+ * that's the whole point: at cutover, a table miss can't distinguish a new flow
+ * from a pre-existing flow's next packet (UDP/QUIC/ICMP have no start marker),
+ * so the distinction has to be learned beforehand. The insert is deliberately
+ * lookup-first rather than a blind BPF_NOEXIST: a leftover stale-epoch entry on
+ * this key would make a blind insert fail EEXIST, leaving a flow we *did*
+ * observe stamped with the wrong epoch -- and so misclassified as new at
+ * cutover. Adopting the entry re-stamps it instead.
+ *
+ * DRAINING never creates an entry: a miss there means a flow that started after
+ * the cutover, which belongs on the new AFTR and must not be pinned.
+ */
+static __always_inline struct flow_affinity *
+touch_flow_affinity(__u32 ctrl, const struct iphdr *iph, void *data_end, bool reverse)
+{
+    struct flow_key key;
+    build_flow_key(&key, iph, data_end, reverse);
+
+    __u32 epoch = mig_epoch(ctrl);
+    __u64 now = bpf_ktime_get_ns();
+
+    struct flow_affinity *fa = bpf_map_lookup_elem(&flow_affinity_map, &key);
+    if (fa) {
+        if (mig_state(ctrl) == MIG_PRIMING)
+            fa->epoch = epoch; /* re-stamp a leftover from an older migration */
+        if (fa->epoch != epoch)
+            return NULL; /* stale generation: as good as absent */
+        fa->last_seen_ns = now;
+        return fa;
+    }
+
+    if (mig_state(ctrl) != MIG_PRIMING)
+        return NULL;
+
+    struct flow_affinity nv = {.last_seen_ns = now, .epoch = epoch};
+    if (bpf_map_update_elem(&flow_affinity_map, &key, &nv, BPF_NOEXIST) < 0) {
+        /* Table full. The control plane gates cutover on this counter: a flow
+         * we failed to record may be pre-existing and would break when the
+         * switch happens, so the migration is abandoned rather than cut over. */
+        increase_stats_count(STAT_AFFINITY_INSERT_FAIL);
+        return NULL;
+    }
+    increase_stats_count(STAT_AFFINITY_INSERT);
+    return NULL; /* newly recorded: still the active (old) AFTR this packet */
+}
+
+/*
+ * Picks the next_hop slot to encapsulate inner_iph into. In STEADY -- the
+ * overwhelmingly common case -- this is just the active slot and costs nothing
+ * beyond the control-word read that replaced the old active_nh read: no flow
+ * parsing, no map lookup. Flow affinity only engages during a migration.
+ */
+static __always_inline __u32
+pick_softwire_slot(__u32 ctrl, const struct iphdr *inner_iph, void *data_end)
+{
+    __u32 slot = mig_active_slot(ctrl);
+    if (mig_state(ctrl) == MIG_STEADY)
+        return slot;
+
+    struct flow_affinity *fa = touch_flow_affinity(ctrl, inner_iph, data_end, false);
+
+    if (mig_state(ctrl) == MIG_DRAINING && fa) {
+        increase_stats_count(STAT_AFFINITY_PINNED);
+        return mig_old_slot(ctrl);
+    }
+    return slot;
 }
 
 /*
@@ -850,8 +1009,18 @@ xdp_dslite_encap(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
+    /*
+     * Only now, once this packet is known to be headed into the softwire, pick
+     * its slot: the bypassed traffic above (LAN-local, broadcast/multicast,
+     * DHCP) must never be recorded as a flow. pick_softwire_slot applies flow
+     * affinity if an AFTR migration is in progress; in STEADY it's just the
+     * active slot.
+     */
+    __u32 ctrl = get_migration_ctrl();
+    __u32 slot = pick_softwire_slot(ctrl, inner_iph, data_end);
+
     struct b4_config cfg_storage;
-    if (!resolve_active_softwire(&cfg_storage)) {
+    if (!resolve_softwire(&cfg_storage, get_next_hop(slot))) {
         increase_stats_count(STAT_NO_CONFIG);
         return XDP_PASS;
     }
@@ -1115,6 +1284,9 @@ handle_xdp_dslite_decap(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
+    /* Loaded once for this packet (see get_migration_ctrl). */
+    __u32 ctrl_decap = get_migration_ctrl();
+
     /* Resolve against the matched slot so a return-path ICMP re-encapsulates
      * back through the AFTR this packet actually came from, not just the
      * active one (they differ briefly during a live AFTR switch). */
@@ -1130,6 +1302,18 @@ handle_xdp_dslite_decap(struct xdp_md *ctx)
     int ret = validate_dslite_ipv6(data_end, outer_iph, &inner_iph_pre, &inner_len);
     if (ret != -1)
         return ret;
+
+    /*
+     * Feed the migration's flow table from the downlink too (reversed key ==
+     * the forward key encap recorded). Decap makes no routing choice here --
+     * the packet has already arrived, and find_dslite_peer_nh above accepts
+     * either AFTR -- but without this a download-heavy flow (few uplink
+     * packets, many downlink) would look idle to the drain GC and have its
+     * pin expired out from under it mid-stream. In STEADY this is a single
+     * predictable branch and no map access at all.
+     */
+    if (mig_state(ctrl_decap) != MIG_STEADY)
+        touch_flow_affinity(ctrl_decap, inner_iph_pre, data_end, true);
 
     if (inner_iph_pre->ttl <= 1) {
         increase_stats_count(STAT_DECAP_PASS);

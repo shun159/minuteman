@@ -3,10 +3,8 @@ package datapath
 import "testing"
 
 // TestMigrationCtrlRoundTrip pins the bit layout the BPF side reads (see the
-// MIG_* accessors in bpf/datapath.bpf.c). A mismatch would silently route
-// packets to the wrong next-hop slot, so the packing is worth asserting
-// explicitly -- including the fields no state uses yet, since the datapath
-// already unpacks them.
+// MIG_* accessors in bpf/datapath.bpf.c): a mismatch here would silently route
+// packets to the wrong AFTR slot, so the packing is worth asserting explicitly.
 func TestMigrationCtrlRoundTrip(t *testing.T) {
 	cases := []struct {
 		name string
@@ -19,14 +17,19 @@ func TestMigrationCtrlRoundTrip(t *testing.T) {
 			want: 0x00000000,
 		},
 		{
-			name: "steady on slot 1",
-			ctrl: migrationCtrl{activeSlot: 1, oldSlot: 1, state: migSteady, epoch: 0},
-			want: 0x00000101,
+			name: "priming: traffic still on slot 0, epoch 1",
+			ctrl: migrationCtrl{activeSlot: 0, oldSlot: 0, state: migPriming, epoch: 1},
+			want: 0x01010000,
 		},
 		{
-			name: "reserved fields survive the round trip",
-			ctrl: migrationCtrl{activeSlot: 1, oldSlot: 0, state: 2, epoch: 1},
+			name: "draining: active slot 1, pre-existing flows pinned to slot 0",
+			ctrl: migrationCtrl{activeSlot: 1, oldSlot: 0, state: migDraining, epoch: 1},
 			want: 0x01020001,
+		},
+		{
+			name: "steady on slot 1 after completing",
+			ctrl: migrationCtrl{activeSlot: 1, oldSlot: 1, state: migSteady, epoch: 1},
+			want: 0x01000101,
 		},
 		{
 			name: "all fields at their byte maximum",
@@ -44,5 +47,16 @@ func TestMigrationCtrlRoundTrip(t *testing.T) {
 				t.Fatalf("unpackMigrationCtrl(%#08x) = %+v, want %+v", c.want, got, c.ctrl)
 			}
 		})
+	}
+}
+
+// TestMigrationCtrlEpochWraps documents that the epoch is a byte and wraps.
+// That's harmless: migrations are day-scale and stale entries are GC'd between
+// them, so a wrapped epoch colliding with a leftover entry can at worst pin one
+// flow to a slot that is still valid.
+func TestMigrationCtrlEpochWraps(t *testing.T) {
+	c := migrationCtrl{epoch: (255 + 1) & 0xff}
+	if got := unpackMigrationCtrl(c.pack()).epoch; got != 0 {
+		t.Fatalf("epoch after wrap = %d, want 0", got)
 	}
 }
