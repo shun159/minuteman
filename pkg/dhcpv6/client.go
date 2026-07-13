@@ -88,6 +88,15 @@ func InformationRequest(ctx context.Context, ifaceName string, requestedOptions 
 		return nil, fmt.Errorf("building client DUID: %w", err)
 	}
 
+	// Serialize with any other DHCPv6 exchange on this interface: they share
+	// the same :546 bind (see lockWAN). Released after conn.Close (deferred
+	// LIFO) so the next exchange binds cleanly.
+	release, err := lockWAN(ctx, ifaceName)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	conn, err := bindWAN(iface)
 	if err != nil {
 		return nil, fmt.Errorf("binding DHCPv6 client socket: %w", err)
@@ -150,6 +159,14 @@ func doExchange(ctx context.Context, ifaceName string, msgType, expectedType Mes
 	if err != nil {
 		return nil, fmt.Errorf("building client DUID: %w", err)
 	}
+
+	// Serialize with any other DHCPv6 exchange on this interface (see lockWAN);
+	// released after conn.Close via LIFO defers.
+	release, err := lockWAN(ctx, ifaceName)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 
 	conn, err := bindWAN(iface)
 	if err != nil {

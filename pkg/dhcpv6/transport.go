@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -15,6 +16,40 @@ const (
 	clientPort = 546
 	serverPort = 547
 )
+
+// wanLocks serializes DHCPv6 exchanges per WAN interface. Every exchange binds
+// the same [link-local%iface]:546 via bindWAN with no SO_REUSEADDR, so two
+// concurrent exchanges on one interface would collide with EADDRINUSE. A
+// process that runs exchanges concurrently on one interface -- e.g.
+// cmd/minuteman's long-lived DHCPv6-PD maintenance loop alongside its periodic
+// AFTR re-discovery, both on the WAN -- relies on this lock to take turns.
+var (
+	wanLocksMu sync.Mutex
+	wanLocks   = map[string]chan struct{}{}
+)
+
+// lockWAN acquires the per-interface DHCPv6 exchange lock for ifaceName,
+// honoring ctx so a waiter blocked behind a long-running exchange still
+// respects its own deadline/cancellation (a DHCPv6-PD Renew must be able to
+// give up at T2 even if an AFTR re-discovery is holding the socket). The
+// returned release must be called (typically deferred) once the exchange's
+// socket is closed. A nil error means the lock was acquired.
+func lockWAN(ctx context.Context, ifaceName string) (release func(), err error) {
+	wanLocksMu.Lock()
+	ch, ok := wanLocks[ifaceName]
+	if !ok {
+		ch = make(chan struct{}, 1)
+		wanLocks[ifaceName] = ch
+	}
+	wanLocksMu.Unlock()
+
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
 // allDHCPRelayAgentsAndServers is the link-scoped multicast address DHCPv6
 // clients send to (RFC 3315 §5.1).

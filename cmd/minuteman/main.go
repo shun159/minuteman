@@ -166,10 +166,12 @@ func run() error {
 	defer stop()
 
 	identity := hb46ppIdentity{vendorID: *hb46ppVendorID, product: *hb46ppProduct, version: *hb46ppVersion}
-	aftr, discoveredDNSServers, err := resolveAFTR(ctx, *aftrAddr, *wanIface, identity)
+	disc, err := resolveAFTR(ctx, *aftrAddr, *wanIface, identity)
 	if err != nil {
 		return err
 	}
+	aftr := disc.aftr
+	discoveredDNSServers := disc.dnsServers
 
 	dnsServers := discoveredDNSServers
 	if len(dnsServersFlag) > 0 {
@@ -266,6 +268,12 @@ func run() error {
 		if err := runDHCPv4(ctx, lans, dhcpv4DNSFlag, *dnsProxyOn, wanNetIface.MTU, *dhcpv4Lease, &bgWG); err != nil {
 			return err
 		}
+	}
+	// Keep the AFTR fresh (RFC 4242): re-run discovery on its reported refresh
+	// interval and apply a changed AFTR live. Only meaningful when the AFTR was
+	// discovered -- a static -aftr has no refresh semantics.
+	if *aftrAddr == "" {
+		runAFTRRediscovery(ctx, dp, b4, *wanIface, identity, disc, &bgWG)
 	}
 	defer bgWG.Wait()
 
@@ -475,83 +483,210 @@ func runDHCPv4(ctx context.Context, lans cliconfig.LANSpecList, dnsOverride []ne
 	return nil
 }
 
+// aftrDiscovery is one AFTR discovery outcome, carrying what the periodic
+// re-discovery loop needs to pace itself and to switch the datapath.
+type aftrDiscovery struct {
+	aftr       netip.Addr
+	dnsServers []netip.Addr  // RFC 3646 servers from the DHCPv6 Reply (for -dns-proxy); nil for a static -aftr
+	refresh    time.Duration // RFC 4242 / HB46PP ttl; 0 for a static -aftr (no re-discovery)
+	// hb46ppToken is the token an HB46PP provisioning response asked us to
+	// echo on the next request (v6mig-1 §3.3); "" on the DHCPv6/DNS path or
+	// when the server sent none.
+	hb46ppToken string
+}
+
+// aftrSwitchRetry is how soon the re-discovery loop retries after a *failed
+// live switch*, and the fallback wait when a discovery reports a
+// non-positive refresh interval, rather than waiting a full (day-scale)
+// refresh: short enough to recover promptly, long enough not to hammer the
+// server. (A failed *discovery* instead backs off per hb46pp.RetryDelay for
+// its failure class.)
+const aftrSwitchRetry = 5 * time.Minute
+
+// aftrRediscoveryTimeout bounds one periodic re-discovery attempt. Unlike the
+// initial discovery (which blocks until it succeeds -- no AFTR, no service),
+// a periodic attempt is best-effort: the current AFTR still works, so if an
+// attempt can't finish promptly it's abandoned and retried next interval.
+// Bounding it also bounds how long it holds the shared DHCPv6 WAN lock (see
+// pkg/dhcpv6.lockWAN), so a stuck Information-Request can't starve DHCPv6-PD
+// renewal.
+const aftrRediscoveryTimeout = 2 * time.Minute
+
+// nextRefreshWait clamps a reported refresh interval to a positive sleep: a
+// discovery that reports 0 (a DHCPv6 server may send information-refresh-time=0)
+// falls back to aftrSwitchRetry instead of busy-looping. Used for both the
+// actual sleep and the logged "next refresh in ..." so the two agree.
+func nextRefreshWait(refresh time.Duration) time.Duration {
+	if refresh <= 0 {
+		return aftrSwitchRetry
+	}
+	return refresh
+}
+
 // resolveAFTR returns aftrFlag parsed as an IPv6 address if non-empty,
-// otherwise discovers the AFTR live via DHCPv6 on wanIface (RFC 3736
-// Information-Request + RFC 6334 OPTION_AFTR_NAME, resolved via DNS). If
-// the DHCPv6 Reply carries no AFTR-Name, it falls back to HB46PP
-// provisioning (capability dslite, identified as identity) using the DNS
-// servers from that same Reply, retrying the whole DHCPv6-then-HB46PP
-// chain on HB46PP failure with the HB46PP spec's backoff for the failure
-// class. Discovery blocks until it succeeds or ctx is cancelled -- there's
-// no working DS-Lite path without an AFTR address, so waiting (with
-// visible retry behavior) is preferable to an arbitrary timeout.
+// otherwise discovers the AFTR live (see discoverAFTROnce), retrying on
+// failure with the HB46PP spec's backoff for the failure class. Discovery
+// blocks until it succeeds or ctx is cancelled -- there's no working DS-Lite
+// path without an AFTR address, so waiting (with visible retry behavior) is
+// preferable to an arbitrary timeout.
 //
-// The second return is the DNS servers learned along the way (RFC 3646
-// OPTION_DNS_SERVERS from the same DHCPv6 Reply), for -dns-proxy to use as
-// its default upstreams -- nil when aftrFlag was given directly, since
-// that path skips the DHCPv6 exchange entirely.
-func resolveAFTR(ctx context.Context, aftrFlag, wanIface string, identity hb46ppIdentity) (netip.Addr, []netip.Addr, error) {
+// Every discovery failure is retried, including a persistent one (a malformed
+// OPTION_AFTR_NAME, or an AFTR name that never resolves): minuteman stays up
+// (its native-IPv6 forwarding keeps working) and logs each attempt rather than
+// exiting. Only ctx cancellation ends the loop. This is deliberately more
+// tolerant than exiting on a hard error would be -- restarting wouldn't fix an
+// ISP-side misconfiguration, and the visible retry log surfaces it either way.
+func resolveAFTR(ctx context.Context, aftrFlag, wanIface string, identity hb46ppIdentity) (aftrDiscovery, error) {
 	if aftrFlag != "" {
 		aftr, err := netip.ParseAddr(aftrFlag)
 		if err != nil {
-			return netip.Addr{}, nil, fmt.Errorf("parsing -aftr: %w", err)
+			return aftrDiscovery{}, fmt.Errorf("parsing -aftr: %w", err)
 		}
-		return aftr, nil, nil
+		return aftrDiscovery{aftr: aftr}, nil
 	}
 
 	log.Printf("no -aftr given, discovering AFTR via DHCPv6 on %s", wanIface)
 	for {
-		result, err := aftrdiscovery.Discover(ctx, wanIface)
+		disc, err := discoverAFTROnce(ctx, wanIface, identity, "")
 		if err == nil {
-			log.Printf("discovered AFTR %s -> %s (DNS servers: %v)", result.AFTRName, result.AFTRAddr, result.DNSServers)
-			return result.AFTRAddr, result.DNSServers, nil
+			return disc, nil
 		}
-		if !errors.Is(err, aftrdiscovery.ErrNoAFTRName) {
-			return netip.Addr{}, nil, fmt.Errorf("discovering AFTR: %w", err)
-		}
-
-		// result is aftrdiscovery's documented partial result here: the
-		// Reply had DNS servers but no AFTR-Name.
-		log.Printf("DHCPv6 Reply carried no AFTR-Name, trying HB46PP provisioning (DNS servers: %v)", result.DNSServers)
-		aftr, err := discoverViaHB46PP(ctx, result.DNSServers, identity)
-		if err == nil {
-			return aftr, result.DNSServers, nil
+		if ctx.Err() != nil {
+			return aftrDiscovery{}, ctx.Err()
 		}
 
 		delay := hb46pp.RetryDelay(err)
-		log.Printf("HB46PP provisioning failed: %v (retrying discovery in %v)", err, delay.Round(time.Second))
+		log.Printf("AFTR discovery failed: %v (retrying in %v)", err, delay.Round(time.Second))
 		select {
 		case <-ctx.Done():
-			return netip.Addr{}, nil, ctx.Err()
+			return aftrDiscovery{}, ctx.Err()
 		case <-time.After(delay):
 		}
 	}
 }
 
+// discoverAFTROnce runs one DHCPv6-then-HB46PP discovery attempt on wanIface
+// (RFC 3736 Information-Request + RFC 6334 OPTION_AFTR_NAME, resolved via
+// DNS; falling back to HB46PP provisioning of the dslite capability when the
+// Reply carries no AFTR-Name, using the DNS servers that Reply did carry).
+// prevToken, if set, is echoed on the HB46PP request (v6mig-1 §3.3). The
+// DHCPv6 exchange itself blocks (retrying per RFC 3315) until it gets a
+// Reply or ctx is cancelled.
+func discoverAFTROnce(ctx context.Context, wanIface string, identity hb46ppIdentity, prevToken string) (aftrDiscovery, error) {
+	result, err := aftrdiscovery.Discover(ctx, wanIface)
+	if err == nil {
+		log.Printf("discovered AFTR %s -> %s (DNS servers: %v)", result.AFTRName, result.AFTRAddr, result.DNSServers)
+		return aftrDiscovery{
+			aftr:       result.AFTRAddr,
+			dnsServers: result.DNSServers,
+			refresh:    result.RefreshInterval,
+		}, nil
+	}
+	if !errors.Is(err, aftrdiscovery.ErrNoAFTRName) {
+		return aftrDiscovery{}, fmt.Errorf("discovering AFTR: %w", err)
+	}
+
+	// result is aftrdiscovery's documented partial result here: the Reply had
+	// DNS servers but no AFTR-Name.
+	log.Printf("DHCPv6 Reply carried no AFTR-Name, trying HB46PP provisioning (DNS servers: %v)", result.DNSServers)
+	return discoverViaHB46PP(ctx, result.DNSServers, identity, prevToken)
+}
+
 // discoverViaHB46PP runs one HB46PP provisioning exchange advertising the
-// dslite capability and returns the AFTR address it yields. dnsServers
-// (from the DHCPv6 Reply) are the VNE's own resolvers, which is what the
-// 4over6.info TXT lookup must go through.
-func discoverViaHB46PP(ctx context.Context, dnsServers []netip.Addr, identity hb46ppIdentity) (netip.Addr, error) {
+// dslite capability (echoing prevToken if set) and returns the AFTR it
+// yields plus the metadata the re-discovery loop needs. dnsServers (from the
+// DHCPv6 Reply) are the VNE's own resolvers, which is what the 4over6.info
+// TXT lookup must go through.
+func discoverViaHB46PP(ctx context.Context, dnsServers []netip.Addr, identity hb46ppIdentity, prevToken string) (aftrDiscovery, error) {
 	result, err := hb46pp.Discover(ctx, hb46pp.Config{
 		Client: hb46pp.ClientInfo{
 			VendorID:     identity.vendorID,
 			Product:      identity.product,
 			Version:      identity.version,
 			Capabilities: []string{"dslite"},
+			Token:        prevToken,
 		},
 		DNSServers: dnsServers,
 	})
 	if err != nil {
-		return netip.Addr{}, err
+		return aftrDiscovery{}, err
 	}
 	if !result.AFTRAddr.IsValid() {
-		return netip.Addr{}, fmt.Errorf("provisioning server returned no DS-Lite parameters (offered order: %v)", result.Provisioning.Order)
+		return aftrDiscovery{}, fmt.Errorf("provisioning server returned no DS-Lite parameters (offered order: %v)", result.Provisioning.Order)
 	}
 	log.Printf("HB46PP: provisioned by %q (%s): AFTR %s -> %s (refresh in %v)",
 		result.Provisioning.EnablerName, result.Provisioning.ServiceName,
 		result.AFTRName, result.AFTRAddr, result.RefreshInterval)
-	return result.AFTRAddr, nil
+	return aftrDiscovery{
+		aftr:        result.AFTRAddr,
+		dnsServers:  dnsServers,
+		refresh:     result.RefreshInterval,
+		hb46ppToken: result.Provisioning.Token,
+	}, nil
+}
+
+// runAFTRRediscovery periodically re-runs AFTR discovery (RFC 4242, paced by
+// the refresh interval each discovery reports) and applies a *changed* AFTR
+// to the live datapath via dp.SwitchAFTR. A re-discovery that yields the same
+// AFTR is a no-op (only the refresh interval and HB46PP token are re-armed);
+// a failed re-discovery keeps the current AFTR and retries sooner. It's
+// registered on wg so run() waits for it on shutdown, and started only when
+// the AFTR was discovered (a static -aftr has no refresh semantics).
+//
+// Known limitations, each tracked in docs/rfc-compliance-backlog.md:
+//   - The WAN address (this B4's own IPv6 address) changing isn't handled --
+//     today it's the static -b4 flag, so there's no live value to switch to.
+//     The AFTR's NAT state is keyed to the B4 address, so a WAN-address change
+//     needs a hard switch (and a dynamic B4).
+//   - A VNE that round-robins its AFTR name across several addresses sees a
+//     switch each refresh (the equality check compares a single resolved
+//     address, not set membership) -- benign at day-scale intervals.
+//   - If a re-discovery's DNS servers differ from the startup ones, a running
+//     -dns-proxy keeps forwarding to the startup set (it isn't reconfigured
+//     here).
+func runAFTRRediscovery(ctx context.Context, dp *datapath.Loader, b4 netip.Addr, wanIface string, identity hb46ppIdentity, initial aftrDiscovery, wg *sync.WaitGroup) {
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		current := initial
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(nextRefreshWait(current.refresh)):
+			}
+
+			// Bound the attempt (see aftrRediscoveryTimeout): it's best-effort
+			// and must not hold the shared DHCPv6 WAN lock indefinitely.
+			attemptCtx, cancel := context.WithTimeout(ctx, aftrRediscoveryTimeout)
+			next, err := discoverAFTROnce(attemptCtx, wanIface, identity, current.hb46ppToken)
+			cancel()
+			if err != nil {
+				if ctx.Err() != nil { // lifetime ctx cancelled -> shutdown
+					return
+				}
+				delay := hb46pp.RetryDelay(err)
+				log.Printf("AFTR re-discovery failed: %v (keeping %s, retrying in %v)", err, current.aftr, delay.Round(time.Second))
+				current.refresh = delay
+				continue
+			}
+
+			if next.aftr == current.aftr {
+				log.Printf("AFTR re-discovery: unchanged (%s), next refresh in %v", current.aftr, nextRefreshWait(next.refresh).Round(time.Second))
+				current = next
+				continue
+			}
+
+			if err := dp.SwitchAFTR(b4, next.aftr); err != nil {
+				log.Printf("AFTR re-discovery: switching to %s failed: %v (keeping %s)", next.aftr, err, current.aftr)
+				current.refresh = aftrSwitchRetry
+				continue
+			}
+			log.Printf("AFTR re-discovery: switched %s -> %s (next refresh in %v)", current.aftr, next.aftr, nextRefreshWait(next.refresh).Round(time.Second))
+			current = next
+		}
+	}()
 }
 
 // attachLAN attaches the encap program to spec's interface and configures
