@@ -46,15 +46,16 @@ Not yet implemented:
   and preserves those technologies' parameter objects raw (`json.RawMessage` on `hb46pp.Provisioning`),
   so implementing one means adding its typed parameter struct there, its datapath, and extending
   `cmd/minuteman`'s policy beyond the current dslite-only capability request.
-- The rest of AFTR re-discovery. The periodic half is implemented: `cmd/minuteman`'s
+- The WAN/link-change half of AFTR re-discovery. What *is* implemented: `cmd/minuteman`'s
   `runAFTRRediscovery` re-runs discovery on the refresh interval each result reports (echoing the HB46PP
-  `Token`) and applies a changed AFTR live via `pkg/datapath.SwitchAFTR`'s write-inactive-slot-then-flip
-  sequence, with DHCPv6 exchanges on the WAN serialized against DHCPv6-PD maintenance by
-  `pkg/dhcpv6`'s per-interface lock. Still missing: the WAN/link-change re-discovery triggers (RFC 9915;
-  blocked on dynamic B4 — today `-b4` is a static flag, so a changed WAN address has no live value to
-  switch to) and flow-affinity draining so an AFTR-only change doesn't break in-flight softwire flows
-  (today it's a hard switch). The agreed designs for both are recorded in
-  `docs/rfc-compliance-backlog.md`'s AFTR re-discovery and dynamic-B4 entries.
+  `Token`, with DHCPv6 exchanges on the WAN serialized against DHCPv6-PD maintenance by `pkg/dhcpv6`'s
+  per-interface lock), and a changed AFTR is applied by `migrateAFTR` *without breaking the flows that
+  predate it* — the datapath primes a flow-affinity table on the old AFTR, cuts over, then keeps those
+  flows pinned to the old AFTR until they fall idle (see `pkg/datapath/migration.go` and the control
+  word in `bpf/datapath.bpf.c`). Still missing: the WAN/link-change re-discovery triggers (RFC 9915),
+  which are blocked on dynamic B4 — today `-b4` is a static flag, so a changed WAN address has no live
+  value to switch to (and can't be drained at all: the AFTR's NAT state is keyed to the B4 address, so
+  it dies with it). See `docs/rfc-compliance-backlog.md`'s AFTR re-discovery and dynamic-B4 entries.
 - A handful of RFC 7084/6333 compliance gaps (softwire fragmentation, RFC 6333 §5.3's MUST, is the
   highest-impact one remaining). See `docs/rfc-compliance-backlog.md` for the full, priority-ordered
   list with the specific code each gap points at.

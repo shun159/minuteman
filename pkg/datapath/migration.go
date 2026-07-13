@@ -108,11 +108,14 @@ func (l *Loader) BeginMigration(b4, aftr netip.Addr) error {
 // after the cutover) routes to the new one. Both slots stay valid, so decap
 // accepts return traffic from either AFTR for the whole drain.
 //
-// The caller must check that the datapath recorded every flow it saw --
-// Stats().AffinityInsertFail must still be zero -- before calling this. A flow
-// that PRIMING failed to record may be pre-existing, and would be silently
-// moved to the new AFTR (which has no NAT state for it) at cutover; abandoning
-// the migration and staying on a working AFTR is the safe response.
+// The caller must check that the datapath recorded every flow it saw -- that
+// Stats().AffinityInsertFail did not rise during PRIMING -- before calling
+// this. A flow that PRIMING failed to record may be pre-existing, and would be
+// silently moved to the new AFTR (which has no NAT state for it) at cutover;
+// abandoning the migration and staying on a working AFTR is the safe response.
+// That counter only rises when the table is genuinely full: the datapath
+// records with BPF_ANY, so two CPUs racing to record the same flow can't be
+// mistaken for a lost one and abandon a perfectly good migration.
 func (l *Loader) Cutover() error {
 	c, err := l.readCtrl()
 	if err != nil {
