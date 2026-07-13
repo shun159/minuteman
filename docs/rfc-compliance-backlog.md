@@ -119,10 +119,13 @@ known limits carried here for follow-up:
     records flips the AFTR each refresh. Benign at day-scale intervals; a proper fix exposes all
     resolved addresses and no-ops on membership.
 
-Stage (b) — flow-affinity migration for AFTR-only changes (design revised 2026-07-13; supersedes the
-earlier "register new flows at cutover" sketch, which was unimplementable — at cutover, a flow-table
-miss cannot distinguish a genuinely new flow from a pre-existing flow's next packet, since UDP/QUIC/
-ICMP have no start marker. The fix is to observe flows *before* switching):
+Stage (b) — flow-affinity migration for AFTR-only changes (DONE): the datapath mechanism is in
+`bpf/datapath.bpf.c` + `pkg/datapath/migration.go`, and `cmd/minuteman`'s `migrateAFTR` drives it from
+the re-discovery loop, so a changed AFTR no longer breaks the flows that predate it. Design as below
+(revised 2026-07-13; it supersedes the earlier "register new flows at cutover" sketch, which was
+unimplementable — at cutover, a flow-table miss cannot distinguish a genuinely new flow from a
+pre-existing flow's next packet, since UDP/QUIC/ICMP have no start marker. The fix is to observe flows
+*before* switching):
 
 - **State machine**: `STEADY(A)` → on a discovered AFTR change, `PRIMING` (old slot stays active;
   every observed inner-IPv4 flow is recorded into a `flow_affinity` HASH — value

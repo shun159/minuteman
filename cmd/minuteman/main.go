@@ -523,6 +523,162 @@ func nextRefreshWait(refresh time.Duration) time.Duration {
 	return refresh
 }
 
+// AFTR migration policy (the datapath mechanism is pkg/datapath's
+// BeginMigration/Cutover/CompleteMigration; see docs/rfc-compliance-backlog.md's
+// AFTR re-discovery entry for why it is shaped this way).
+const (
+	// aftrPrimingDuration is how long the datapath records flows before the
+	// cutover. It is the window in which a flow must send or receive at least
+	// one packet to be recognised as pre-existing -- and that recording is the
+	// only way to tell, afterwards, a pre-existing flow's next packet from a
+	// brand-new flow's first one. Anything worth protecting (a call, a stream,
+	// a download, a game) has sub-second gaps, so a minute is generous; a flow
+	// that stays completely silent throughout is the accepted, bounded cost.
+	aftrPrimingDuration = 60 * time.Second
+
+	// aftrDrainInterval is how often the drain reclaims idle flows and checks
+	// whether anything is still pinned to the old AFTR.
+	aftrDrainInterval = 30 * time.Second
+
+	// aftrMaxDrainDuration caps how long the old AFTR is held open for the
+	// flows still pinned to it. It is only a safety valve: the drain normally
+	// ends when the last pinned flow falls idle. Keeping two AFTRs alive
+	// indefinitely isn't an option, so a flow still running after this does
+	// break -- which is why the cap is generous rather than tight.
+	aftrMaxDrainDuration = 2 * time.Hour
+)
+
+// aftrFlowIdle bounds how long a pinned flow may go silent -- in *either*
+// direction, since the datapath refreshes from both -- before the drain stops
+// holding the old AFTR for it. An active flow refreshes continuously, so these
+// only need to exceed a normal gap in its traffic; and once the AFTR's own NAT
+// entry has timed out, the pin is worthless anyway.
+var aftrFlowIdle = datapath.FlowIdleTimeouts{
+	TCP:   30 * time.Minute,
+	Other: 5 * time.Minute,
+}
+
+// errMigrationAbandoned reports that a migration was called off *safely*: the
+// datapath was left on the AFTR it was already using, which still works. The
+// caller should keep that AFTR and try again later rather than treat it as a
+// failure to act on.
+var errMigrationAbandoned = errors.New("AFTR migration abandoned")
+
+// abortMigration rolls a pre-cutover migration back to the AFTR still carrying
+// traffic. On success it returns cause unchanged, so an abandonment stays an
+// abandonment.
+//
+// If the rollback itself fails it returns a plain error that deliberately does
+// *not* carry cause's sentinel: a failed rollback is not a benign abandonment.
+// It leaves the datapath stuck in PRIMING, which blocks every later migration
+// (BeginMigration requires STEADY), so the caller must see a failure rather
+// than a "we safely stayed put".
+func abortMigration(dp *datapath.Loader, cause error) error {
+	if err := dp.AbortMigration(); err != nil {
+		return fmt.Errorf("rolling the migration back after %v failed, "+
+			"leaving the datapath mid-migration: %w", cause, err)
+	}
+	return cause
+}
+
+// migrateAFTR moves the datapath from oldAFTR to newAFTR without breaking the
+// flows that predate the move.
+//
+// It primes first: for aftrPrimingDuration the datapath keeps using oldAFTR but
+// records every softwire flow it sees. Only then does it cut over, after which
+// a recorded flow still routes to oldAFTR while anything new goes to newAFTR --
+// the distinction cannot be made at the cutover itself, because a flow-table
+// miss looks identical for a new flow and for a pre-existing flow's next packet
+// (UDP/QUIC/ICMP have no start marker), so it has to be learned beforehand.
+// oldAFTR is finally retired once nothing is pinned to it (or the drain cap
+// expires).
+//
+// It blocks until the migration finishes, is abandoned, or ctx is cancelled.
+// That is deliberate: it serialises migrations against the re-discovery loop
+// that calls it (which runs on a day-scale refresh, so blocking it for a drain
+// costs nothing), and the datapath only supports one migration at a time.
+//
+// Except on ctx cancellation -- where the process is exiting and the XDP
+// programs are about to be detached anyway -- it never returns leaving a
+// migration half-applied: any failure before the cutover aborts back to
+// oldAFTR, and after the cutover it keeps retrying the retirement.
+func migrateAFTR(ctx context.Context, dp *datapath.Loader, b4, oldAFTR, newAFTR netip.Addr) error {
+	// The affinity counters are cumulative across the process, so baseline
+	// them: what matters is whether *this* priming pass lost any flow.
+	before, err := dp.Stats()
+	if err != nil {
+		return fmt.Errorf("reading datapath stats: %w", err)
+	}
+
+	if err := dp.BeginMigration(b4, newAFTR); err != nil {
+		return err
+	}
+	log.Printf("AFTR migration: priming %v on %s before moving to %s", aftrPrimingDuration, oldAFTR, newAFTR)
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(aftrPrimingDuration):
+	}
+
+	after, err := dp.Stats()
+	if err != nil {
+		return abortMigration(dp, fmt.Errorf("reading datapath stats: %w", err))
+	}
+
+	// A flow the datapath couldn't record may well be one that predates the
+	// switch, and cutting over would move it to an AFTR holding no NAT state
+	// for it. Staying on an AFTR that still works is the safe answer. (The
+	// datapath only counts a genuinely full table here -- see the BPF_ANY note
+	// on touch_flow_affinity -- so this isn't tripped by a benign insert race
+	// between CPUs recording the same flow.)
+	if lost := after.AffinityInsertFail - before.AffinityInsertFail; lost > 0 {
+		log.Printf("AFTR migration: abandoning -- the flow-affinity table filled up, so %d flow(s) went "+
+			"unrecorded and would break at the cutover; staying on %s", lost, oldAFTR)
+		return abortMigration(dp, errMigrationAbandoned)
+	}
+
+	if err := dp.Cutover(); err != nil {
+		return abortMigration(dp, err)
+	}
+	log.Printf("AFTR migration: cut over to %s; the %d flow(s) recorded on %s stay there until they fall idle",
+		newAFTR, after.AffinityInsert-before.AffinityInsert, oldAFTR)
+
+	deadline := time.Now().Add(aftrMaxDrainDuration)
+	ticker := time.NewTicker(aftrDrainInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+
+		remaining, err := dp.GCFlowAffinity(aftrFlowIdle)
+		if err != nil {
+			log.Printf("AFTR migration: draining %s: %v (retrying)", oldAFTR, err)
+			continue
+		}
+		if remaining > 0 && time.Now().Before(deadline) {
+			continue
+		}
+		if remaining > 0 {
+			log.Printf("AFTR migration: drain cap of %v reached with %d flow(s) still on %s; retiring it anyway",
+				aftrMaxDrainDuration, remaining, oldAFTR)
+		}
+
+		if err := dp.CompleteMigration(); err != nil {
+			// Retried rather than returned: leaving the datapath mid-drain
+			// would block every later migration.
+			log.Printf("AFTR migration: retiring %s: %v (retrying)", oldAFTR, err)
+			continue
+		}
+		log.Printf("AFTR migration: complete, %s retired", oldAFTR)
+		return nil
+	}
+}
+
 // resolveAFTR returns aftrFlag parsed as an IPv6 address if non-empty,
 // otherwise discovers the AFTR live (see discoverAFTROnce), retrying on
 // failure with the HB46PP spec's backoff for the failure class. Discovery
@@ -626,10 +782,11 @@ func discoverViaHB46PP(ctx context.Context, dnsServers []netip.Addr, identity hb
 }
 
 // runAFTRRediscovery periodically re-runs AFTR discovery (RFC 4242, paced by
-// the refresh interval each discovery reports) and applies a *changed* AFTR
-// to the live datapath via dp.SwitchAFTR. A re-discovery that yields the same
-// AFTR is a no-op (only the refresh interval and HB46PP token are re-armed);
-// a failed re-discovery keeps the current AFTR and retries sooner. It's
+// the refresh interval each discovery reports) and applies a *changed* AFTR to
+// the live datapath via migrateAFTR, which preserves the flows that predate the
+// change. A re-discovery that yields the same AFTR is a no-op (only the refresh
+// interval and HB46PP token are re-armed); a failed or abandoned migration
+// keeps the current AFTR -- which still works -- and retries sooner. It's
 // registered on wg so run() waits for it on shutdown, and started only when
 // the AFTR was discovered (a static -aftr has no refresh semantics).
 //
@@ -637,7 +794,8 @@ func discoverViaHB46PP(ctx context.Context, dnsServers []netip.Addr, identity hb
 //   - The WAN address (this B4's own IPv6 address) changing isn't handled --
 //     today it's the static -b4 flag, so there's no live value to switch to.
 //     The AFTR's NAT state is keyed to the B4 address, so a WAN-address change
-//     needs a hard switch (and a dynamic B4).
+//     can't be drained at all (every flow's state dies with the address) and
+//     needs a hard switch (dp.SwitchAFTR) plus a dynamic B4.
 //   - A VNE that round-robins its AFTR name across several addresses sees a
 //     switch each refresh (the equality check compares a single resolved
 //     address, not set membership) -- benign at day-scale intervals.
@@ -678,12 +836,23 @@ func runAFTRRediscovery(ctx context.Context, dp *datapath.Loader, b4 netip.Addr,
 				continue
 			}
 
-			if err := dp.SwitchAFTR(b4, next.aftr); err != nil {
-				log.Printf("AFTR re-discovery: switching to %s failed: %v (keeping %s)", next.aftr, err, current.aftr)
+			// Migrate rather than switch outright: this blocks for the priming
+			// window and the drain that follow, which is fine -- re-discovery
+			// runs on a day-scale refresh, and serialising here is what keeps
+			// the datapath's one-migration-at-a-time rule true.
+			if err := migrateAFTR(ctx, dp, b4, current.aftr, next.aftr); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				if !errors.Is(err, errMigrationAbandoned) {
+					// migrateAFTR leaves the datapath on the old AFTR, so it is
+					// still working; just try the whole move again later.
+					log.Printf("AFTR migration to %s failed: %v (staying on %s)", next.aftr, err, current.aftr)
+				}
 				current.refresh = aftrSwitchRetry
 				continue
 			}
-			log.Printf("AFTR re-discovery: switched %s -> %s (next refresh in %v)", current.aftr, next.aftr, nextRefreshWait(next.refresh).Round(time.Second))
+			log.Printf("AFTR re-discovery: now on %s (next refresh in %v)", next.aftr, nextRefreshWait(next.refresh).Round(time.Second))
 			current = next
 		}
 	}()
