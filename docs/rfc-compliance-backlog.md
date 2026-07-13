@@ -92,24 +92,29 @@ in-flight softwire traffic is the harder part of implementing this.
 
 **Fix direction**:
 
-Stage (a) — safe live switching + the re-discovery loop itself:
-- Replace the single `b4_config_map[0]` with a small fixed-slot `next_hops` array (value:
-  `{valid, aftr_addr, b4_addr}` — MACs/egress deliberately *not* frozen in; the per-packet
-  `lookup_aftr_nexthop` FIB resolution stays) plus a single-`__u32` `active_nh` index. Encap reads
-  `next_hops[active_nh]`; decap's `is_expected_dslite_peer` accepts any `valid` slot (2 fixed slots
-  suffice). This indirection is required for *any* live switch, draining or not:
-  `bpf_map_update_elem` on an ARRAY map copies the new value into the element **in place**
-  (`array_map_update_elem` → `copy_map_value`, `kernel/bpf/arraymap.c` — verified against mainline;
-  no RCU replacement without `BPF_F_LOCK`), so overwriting the live `b4_config` mid-traffic can yield
-  a torn half-old/half-new read. Write-new-slot-then-flip-one-word-index is the safe idiom.
-- `cmd/minuteman` grows the re-discovery loop: consume the refresh intervals
-  `aftrdiscovery.Result`/`hb46pp.Result` already report (echoing `hb46pp` `Token` back), and watch
-  the WAN address (`internal/wanextend.WatchChanges`'s shape). Policy: a re-discovery whose result
-  still contains the current AFTR is a **no-op** (DNS round-robin must not cause churn); a
-  WAN-address change is a hard switch — the AFTR's NAT state is keyed to the B4 address, so
-  in-flight flows are unrecoverable regardless and draining would be pointless; an AFTR-only change
-  is a hard switch in stage (a), a drain in stage (b).
-- The netns rig needs a second AFTR plus a record/provisioning swap mechanism to exercise this.
+Stage (a1) — safe live switching (DONE, merged): the single `b4_config_map[0]` is replaced with a
+fixed-slot `next_hops` array (`{valid, b4_addr, aftr_addr}`) selected by a single-`__u32` `active_nh`
+index; `SwitchAFTR` writes the inactive slot then flips the index (never mutating the slot in use),
+and decap (`find_dslite_peer_nh`) accepts any valid slot. See `pkg/datapath/config.go`.
+
+Stage (a2) — the re-discovery loop (DONE): `cmd/minuteman`'s `runAFTRRediscovery` re-runs discovery on
+the refresh interval each result reports (RFC 4242 / HB46PP ttl), echoing the HB46PP `Token`, and calls
+`SwitchAFTR` when the AFTR address changes (no-op when unchanged; keeps the current AFTR and retries
+sooner on failure). Runs only when the AFTR was discovered (a static `-aftr` has no refresh). Each
+periodic attempt is time-bounded, and DHCPv6 exchanges on the WAN are serialized by a per-interface lock
+(`pkg/dhcpv6.lockWAN`) so this loop can't collide with DHCPv6-PD maintenance on the `:546` bind. Two
+known limits carried here for follow-up:
+  - **No WAN-address-change trigger.** RFC 3315 says re-discovery should also fire when the WAN address
+    changes, and such a change is a hard switch (the AFTR's NAT state is keyed to the B4 address, so
+    in-flight flows are unrecoverable regardless). This needs a **dynamic B4** first — today `-b4` is a
+    static required flag, so there's no live WAN address to track or switch to. Dynamic B4 (discover
+    the WAN interface's own global IPv6 and watch it, `internal/wanextend.WatchChanges`'s shape) is its
+    own item and a prerequisite; the current static-`-b4` model is not viable for a real deployment
+    where the WAN address is SLAAC/DHCPv6-assigned.
+  - **AFTR-name round-robin causes a switch each refresh.** The no-op check compares a single resolved
+    address (`aftrdiscovery` returns `addrs[0]`), not set membership, so a name with multiple AAAA
+    records flips the AFTR each refresh. Benign at day-scale intervals; a proper fix exposes all
+    resolved addresses and no-ops on membership.
 
 Stage (b) — drain-window flow affinity, only for AFTR-only changes:
 - On switch, open a bounded drain window (~30-60 min) and register *new* inner-IPv4 flows (5-tuple
@@ -125,7 +130,22 @@ Stage (b) — drain-window flow affinity, only for AFTR-only changes:
   unpin live flows mid-stream). No PROG_ARRAY/tail-call dispatch — the action variants stay an
   inline switch — and the native-IPv6 fastpath is untouched (no AFTR involvement).
 
-## 7. Minor / acceptable for a home CPE
+## 7. Dynamic B4 address — RFC 6333 (prerequisite for #6's WAN-change trigger)
+
+`-b4` is a required *static* flag: the B4's own IPv6 softwire source address is fixed at startup. A real
+CPE's WAN address is SLAAC- or DHCPv6-assigned and changes over time (renumbering, lease expiry,
+reconnect); when it does, minuteman keeps encapsulating from a stale source and the softwire breaks with
+no recovery short of a restart. This also blocks #6's WAN-address-change re-discovery trigger, which has
+no live B4 to switch to.
+
+**Fix direction:** make `-b4` optional — when omitted, discover the WAN interface's own global IPv6
+address (the netlink address-listing already used by `internal/wanextend.DiscoverPrefix`) and use it as
+the B4, then watch it (`internal/wanextend.WatchChanges`'s shape) and drive a hard `SwitchAFTR(newB4,
+aftr)` when it changes (the datapath already switches both endpoints atomically). Keep `-b4` as an
+explicit override. Needs care around which global address to pick when several are present, and around
+sequencing against the AFTR re-discovery loop (a WAN change should also re-trigger AFTR discovery).
+
+## 8. Minor / acceptable for a home CPE
 
 - RDNSS is only advertised while `-dns-proxy` is on; with it off (the default), an IPv6-only SLAAC LAN
   client is DNS-less again (RFC 7084 §L-4). The proxy-less alternative — advertising the WAN-learned
