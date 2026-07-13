@@ -60,46 +60,88 @@ func (l *Loader) SetB4Config(cfg B4Config) error {
 	if err := l.writeNextHop(0, cfg.B4Addr, cfg.AFTRAddr); err != nil {
 		return err
 	}
-	if err := l.writeActiveNextHop(0); err != nil {
+	if err := l.writeCtrl(migrationCtrl{activeSlot: 0, oldSlot: 0, state: migSteady}); err != nil {
 		return err
 	}
 
 	return l.registerTxPort(cfg.WANIfindex)
 }
 
-// SwitchAFTR atomically moves the live softwire endpoint pair to (b4, aftr).
-// It writes the currently-*inactive* slot in full, then flips active_nh to
-// it: the slot the datapath is reading is never mutated, so it can never see
-// a half-updated endpoint (the datapath copies a next_hop in place on update,
-// with no RCU replacement — see the note on struct next_hop in
-// bpf/datapath.bpf.c). This is the only supported way to change the AFTR on a
-// running datapath; it encodes the write-inactive-then-flip sequence so a
-// caller can't reintroduce the torn-read/blackhole hazard by driving the
-// slots directly. The old endpoint is left valid in its slot, so decap keeps
-// accepting its in-flight return traffic until a later switch recycles that
-// slot. Both endpoints are validated before anything is written.
+// SwitchAFTR moves the live softwire endpoint pair to (b4, aftr): it writes the
+// free slot in full, then points the control word at it. The slot the datapath
+// is resolving is never mutated, so it can never read a half-updated endpoint
+// (a next_hop is copied into place on update, with no RCU replacement — see the
+// note on struct next_hop in bpf/datapath.bpf.c), and the sequence is encoded
+// here so a caller can't reintroduce that hazard by driving the slots directly.
+// The replaced endpoint is left valid in its slot, so decap keeps accepting its
+// in-flight return traffic until a later switch recycles that slot.
+//
+// This switch is immediate: in-flight flows are moved to the new AFTR, which has
+// no NAT state for them, and break. That is correct when they are unrecoverable
+// anyway (a changed B4 address invalidates the AFTR's state), and is the only
+// behaviour available until graceful migration lands.
 func (l *Loader) SwitchAFTR(b4, aftr netip.Addr) error {
 	if err := validateSoftwireAddrs(b4, aftr); err != nil {
 		return err
 	}
 
-	active, err := l.activeNextHop()
+	c, err := l.readCtrl()
 	if err != nil {
 		return err
 	}
-	inactive := (active + 1) % numNextHops
+	free := (c.activeSlot + 1) % numNextHops
 
-	if err := l.writeNextHop(inactive, b4, aftr); err != nil {
+	if err := l.writeNextHop(free, b4, aftr); err != nil {
 		return err
 	}
-	return l.writeActiveNextHop(inactive)
+	return l.writeCtrl(migrationCtrl{
+		activeSlot: free,
+		oldSlot:    free,
+		state:      migSteady,
+		epoch:      c.epoch,
+	})
+}
+
+// slotIsLive reports whether the datapath can currently resolve slot for
+// encapsulation. Today that is just the active slot; graceful migration will
+// add the old slot while flows are still pinned to it. A slot that isn't valid
+// yet can't be resolved whatever the control word says (resolve_softwire checks
+// nh->valid), so the initial write of a fresh slot is not a live write.
+func (l *Loader) slotIsLive(c migrationCtrl, slot uint32) (bool, error) {
+	resolvable := slot == c.activeSlot
+	if !resolvable {
+		return false, nil
+	}
+	var nh bpfNextHop
+	if err := l.objs.NextHops.Lookup(&slot, &nh); err != nil {
+		return false, fmt.Errorf("reading next-hop slot %d: %w", slot, err)
+	}
+	return nh.Valid != 0, nil
 }
 
 // writeNextHop writes an endpoint pair into slot, marking it valid. The
-// addresses must already be validated (validateSoftwireAddrs). Unexported:
-// callers reach it only through SetB4Config (initial) and SwitchAFTR (live),
-// which guarantee the slot written is never the one the datapath is using.
+// addresses must already be validated (validateSoftwireAddrs).
+//
+// It refuses to write a slot the datapath is currently resolving. That's the
+// whole point of the slot indirection: a next_hop is copied into place on
+// update with no RCU replacement, so overwriting a live slot lets a packet in
+// flight read a half-updated endpoint and be encapsulated to a garbage peer.
+// Enforcing it here rather than trusting each call site keeps the invariant
+// true as more callers (graceful migration) are added.
 func (l *Loader) writeNextHop(slot uint32, b4, aftr netip.Addr) error {
+	c, err := l.readCtrl()
+	if err != nil {
+		return err
+	}
+	live, err := l.slotIsLive(c, slot)
+	if err != nil {
+		return err
+	}
+	if live {
+		return fmt.Errorf("refusing to write next-hop slot %d: the datapath is resolving it "+
+			"(state=%d active=%d old=%d); end the migration first", slot, c.state, c.activeSlot, c.oldSlot)
+	}
+
 	val := bpfNextHop{Valid: 1}
 	val.B4Addr.In6U.U6Addr8 = b4.As16()
 	val.AftrAddr.In6U.U6Addr8 = aftr.As16()
@@ -109,25 +151,15 @@ func (l *Loader) writeNextHop(slot uint32, b4, aftr netip.Addr) error {
 	return nil
 }
 
-// writeActiveNextHop flips active_nh to slot — a single-__u32 update, the
-// atomic step that makes a switch take effect. Unexported for the same reason
-// as writeNextHop.
-func (l *Loader) writeActiveNextHop(slot uint32) error {
-	key := uint32(0)
-	if err := l.objs.ActiveNh.Put(&key, &slot); err != nil {
-		return fmt.Errorf("setting active next-hop to slot %d: %w", slot, err)
+// clearNextHop invalidates a slot, so encap can't resolve it and decap stops
+// accepting that AFTR's traffic. Only ever applied to a slot the control word
+// no longer points at (see CompleteMigration/AbortMigration).
+func (l *Loader) clearNextHop(slot uint32) error {
+	var val bpfNextHop // Valid == 0
+	if err := l.objs.NextHops.Put(&slot, &val); err != nil {
+		return fmt.Errorf("clearing next-hop slot %d: %w", slot, err)
 	}
 	return nil
-}
-
-// activeNextHop reads the currently-active next-hop slot index.
-func (l *Loader) activeNextHop() (uint32, error) {
-	key := uint32(0)
-	var slot uint32
-	if err := l.objs.ActiveNh.Lookup(&key, &slot); err != nil {
-		return 0, fmt.Errorf("reading active next-hop: %w", err)
-	}
-	return slot, nil
 }
 
 // SetLANConfig installs the configuration for a LAN interface, keyed by its

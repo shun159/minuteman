@@ -94,12 +94,31 @@ struct {
     __type(value, struct next_hop);
 } next_hops SEC(".maps");
 
+/*
+ * Migration control: one bit-packed __u32 that drives which next_hop slot a
+ * softwire packet uses. Packing it into a single word keeps every transition a
+ * single atomic store -- the same reason the active_nh index it subsumes was one
+ * word. Each program loads it into a local exactly once per packet and never
+ * re-reads it mid-packet, so the two halves of one packet can never see
+ * different generations.
+ *
+ * Only MIG_STEADY exists today; the state/old_slot/epoch fields are the seam a
+ * graceful AFTR migration (flow affinity across a switch) hooks into, which is
+ * why the word is laid out for it now rather than being widened later.
+ *
+ *   bits  0..7  active_slot  the slot encap uses
+ *   bits  8..15 old_slot     (migration) the slot pre-cutover flows pin to
+ *   bits 16..23 state        MIG_STEADY today
+ *   bits 24..31 epoch        (migration) generation stamp
+ */
+#define MIG_STEADY 0
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, __u32); /* the currently-active next_hops slot index */
-} active_nh SEC(".maps");
+    __type(value, __u32); /* packed: see MIG_* accessors */
+} migration_ctrl SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -273,12 +292,38 @@ get_b4_config(void)
     return bpf_map_lookup_elem(&b4_config_map, &key);
 }
 
+/* Loads the migration control word. Callers must do this exactly once per
+ * packet and pass the local copy down (never re-look it up mid-packet). */
 static __always_inline __u32
-get_active_nh_slot(void)
+get_migration_ctrl(void)
 {
     __u32 key = 0;
-    __u32 *slot = bpf_map_lookup_elem(&active_nh, &key);
-    return slot ? *slot : 0;
+    __u32 *c = bpf_map_lookup_elem(&migration_ctrl, &key);
+    return c ? *c : 0; /* unset == STEADY on slot 0 */
+}
+
+static __always_inline __u32
+mig_active_slot(__u32 ctrl)
+{
+    return ctrl & 0xff;
+}
+
+static __always_inline __u32
+mig_old_slot(__u32 ctrl)
+{
+    return (ctrl >> 8) & 0xff;
+}
+
+static __always_inline __u32
+mig_state(__u32 ctrl)
+{
+    return (ctrl >> 16) & 0xff;
+}
+
+static __always_inline __u32
+mig_epoch(__u32 ctrl)
+{
+    return (ctrl >> 24) & 0xff;
 }
 
 /*
@@ -299,12 +344,22 @@ resolve_softwire(struct b4_config *out, const struct next_hop *nh)
     return true;
 }
 
-/* Resolves against the currently-active slot (encap and native-IPv6 paths). */
+static __always_inline struct next_hop *
+get_next_hop(__u32 slot)
+{
+    return bpf_map_lookup_elem(&next_hops, &slot);
+}
+
+/*
+ * Resolves against the slot the control word currently makes active. Used by
+ * the native-IPv6 fastpath (which needs only this B4's own address as an ICMPv6
+ * source and never touches an AFTR, so flow affinity doesn't apply to it) and
+ * by any caller that has no inner flow to key on.
+ */
 static __always_inline bool
 resolve_active_softwire(struct b4_config *out)
 {
-    __u32 slot = get_active_nh_slot();
-    return resolve_softwire(out, bpf_map_lookup_elem(&next_hops, &slot));
+    return resolve_softwire(out, get_next_hop(mig_active_slot(get_migration_ctrl())));
 }
 
 /*
@@ -782,13 +837,6 @@ xdp_dslite_encap(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
-    struct b4_config cfg_storage;
-    if (!resolve_active_softwire(&cfg_storage)) {
-        increase_stats_count(STAT_NO_CONFIG);
-        return XDP_PASS;
-    }
-    struct b4_config *cfg = &cfg_storage;
-
     __u32 ingress_ifindex = ctx->ingress_ifindex;
     struct lan_config *lan = get_lan_config(ingress_ifindex);
     if (!lan) {
@@ -801,6 +849,13 @@ xdp_dslite_encap(struct xdp_md *ctx)
         increase_stats_count(STAT_BYPASS);
         return XDP_PASS;
     }
+
+    struct b4_config cfg_storage;
+    if (!resolve_active_softwire(&cfg_storage)) {
+        increase_stats_count(STAT_NO_CONFIG);
+        return XDP_PASS;
+    }
+    struct b4_config *cfg = &cfg_storage;
 
     __u16 inner_len = bpf_ntohs(inner_iph->tot_len);
     __u32 wan_mtu = 0;
