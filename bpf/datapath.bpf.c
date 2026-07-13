@@ -18,10 +18,14 @@ char LICENSE[] SEC("license") = "GPL";
 #define CFG_F_CPU_FANOUT (1U << 1)
 
 /*
- * DS-Lite (RFC 6333) B4 element configuration: our IPv6 B4 address and the
- * AFTR's IPv6 address form the IPv4-in-IPv6 softwire (nexthdr IPPROTO_IPIP).
- * src_mac/dst_mac are used only as a fallback when bpf_fib_lookup() can't
- * resolve the WAN next hop (e.g. no neighbor entry yet).
+ * DS-Lite (RFC 6333) B4 element configuration. This is the effective config
+ * for one packet: the WAN-global fields (src_mac/dst_mac, used only as a
+ * fallback when bpf_fib_lookup() can't resolve the WAN next hop; wan_ifindex;
+ * flags) come from b4_config_map, while b4_addr/aftr_addr -- the IPv4-in-IPv6
+ * softwire endpoints (nexthdr IPPROTO_IPIP) -- come from the active (or, on
+ * decap, the matched) next_hop slot and are overlaid per packet by
+ * resolve_softwire(). The copy stored in b4_config_map leaves b4_addr/
+ * aftr_addr zero; they're never read from there.
  */
 struct b4_config {
     struct in6_addr b4_addr;
@@ -31,6 +35,27 @@ struct b4_config {
     __u32 wan_ifindex;
     __u32 flags;
 };
+
+/*
+ * One softwire endpoint pair (this B4's address + its AFTR's), swappable at
+ * runtime for live AFTR re-discovery (RFC 4242 refresh / WAN-address change).
+ * Userspace never mutates the slot the datapath is currently using: it writes
+ * a *new* slot in full, then flips active_nh (a single __u32) to point at it.
+ * bpf_map_update_elem on an ARRAY map copies the value in place (no RCU
+ * replacement), so overwriting the live slot could be read half-updated; the
+ * write-inactive-then-flip idiom avoids that. decap accepts any valid slot
+ * (find_dslite_peer_nh), so a brief overlap during a switch still decaps
+ * return traffic from both the old and new AFTR.
+ */
+struct next_hop {
+    __u32 valid;
+    struct in6_addr b4_addr;
+    struct in6_addr aftr_addr;
+};
+
+/* Number of next_hop slots. Two is enough for one live switch at a time (the
+ * old AFTR plus the new one); the array is sized to match in Go. */
+#define NUM_NEXT_HOPS 2
 
 struct lan_config {
     __u32 gateway_ip; /* host byte order */
@@ -61,6 +86,20 @@ struct {
     __type(key, __u32);
     __type(value, struct b4_config);
 } b4_config_map SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, NUM_NEXT_HOPS);
+    __type(key, __u32); /* slot index */
+    __type(value, struct next_hop);
+} next_hops SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32); /* the currently-active next_hops slot index */
+} active_nh SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -232,6 +271,60 @@ get_b4_config(void)
 {
     __u32 key = CFG_KEY;
     return bpf_map_lookup_elem(&b4_config_map, &key);
+}
+
+static __always_inline __u32
+get_active_nh_slot(void)
+{
+    __u32 key = 0;
+    __u32 *slot = bpf_map_lookup_elem(&active_nh, &key);
+    return slot ? *slot : 0;
+}
+
+/*
+ * Assembles the effective per-packet config: the WAN-global template from
+ * b4_config_map overlaid with one next_hop slot's softwire addresses.
+ * Returns false (caller passes to the kernel) if the global config isn't set
+ * yet or nh is missing/invalid.
+ */
+static __always_inline bool
+resolve_softwire(struct b4_config *out, const struct next_hop *nh)
+{
+    struct b4_config *g = get_b4_config();
+    if (!g || !nh || !nh->valid)
+        return false;
+    *out = *g;
+    out->b4_addr = nh->b4_addr;
+    out->aftr_addr = nh->aftr_addr;
+    return true;
+}
+
+/* Resolves against the currently-active slot (encap and native-IPv6 paths). */
+static __always_inline bool
+resolve_active_softwire(struct b4_config *out)
+{
+    __u32 slot = get_active_nh_slot();
+    return resolve_softwire(out, bpf_map_lookup_elem(&next_hops, &slot));
+}
+
+/*
+ * Finds the valid next_hop slot whose (b4_addr, aftr_addr) matches the outer
+ * IPv6 header's (daddr, saddr) -- i.e. the softwire this decapsulating packet
+ * belongs to. Scanning all slots (not just the active one) lets return
+ * traffic from a just-replaced AFTR keep decapping through a switch.
+ */
+static __always_inline struct next_hop *
+find_dslite_peer_nh(const struct ipv6hdr *outer_iph)
+{
+#pragma unroll
+    for (int i = 0; i < NUM_NEXT_HOPS; i++) {
+        __u32 slot = i;
+        struct next_hop *nh = bpf_map_lookup_elem(&next_hops, &slot);
+        if (nh && nh->valid && ipv6_addr_equal(&outer_iph->daddr, &nh->b4_addr) &&
+            ipv6_addr_equal(&outer_iph->saddr, &nh->aftr_addr))
+            return nh;
+    }
+    return NULL;
 }
 
 static __always_inline struct lan_config *
@@ -675,25 +768,26 @@ xdp_dslite_encap(struct xdp_md *ctx)
         __u64 l2_len6 = 0;
         struct ipv6hdr *ip6h = 0;
         if (parse_l2_ipv6(data, data_end, &l2_len6, &ip6h) == 1) {
-            struct b4_config *cfg6 = get_b4_config();
-            if (!cfg6) {
+            struct b4_config cfg6;
+            if (!resolve_active_softwire(&cfg6)) {
                 increase_stats_count(STAT_NO_CONFIG);
                 return XDP_PASS;
             }
             int action = maybe_redirect_ipv6_to_cpu(ctx, ip6h, data_end);
             if (action)
                 return action;
-            return handle_ipv6_forward(ctx, l2_len6, ip6h, cfg6);
+            return handle_ipv6_forward(ctx, l2_len6, ip6h, &cfg6);
         }
         increase_stats_count(STAT_PASS);
         return XDP_PASS;
     }
 
-    struct b4_config *cfg = get_b4_config();
-    if (!cfg) {
+    struct b4_config cfg_storage;
+    if (!resolve_active_softwire(&cfg_storage)) {
         increase_stats_count(STAT_NO_CONFIG);
         return XDP_PASS;
     }
+    struct b4_config *cfg = &cfg_storage;
 
     __u32 ingress_ifindex = ctx->ingress_ifindex;
     struct lan_config *lan = get_lan_config(ingress_ifindex);
@@ -768,13 +862,6 @@ xdp_dslite_encap(struct xdp_md *ctx)
 
     increase_stats_count(STAT_ENCAP);
     return redirect_to_ifindex(cfg->wan_ifindex, STAT_REDIRECT_WAN);
-}
-
-static __always_inline bool
-is_expected_dslite_peer(const struct b4_config *cfg, const struct ipv6hdr *outer_iph)
-{
-    return ipv6_addr_equal(&outer_iph->daddr, &cfg->b4_addr) &&
-           ipv6_addr_equal(&outer_iph->saddr, &cfg->aftr_addr);
 }
 
 static __always_inline int
@@ -962,21 +1049,26 @@ handle_xdp_dslite_decap(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
-    struct b4_config *cfg = get_b4_config();
-    if (!cfg) {
-        increase_stats_count(STAT_NO_CONFIG);
-        return XDP_PASS;
-    }
-
     if (outer_iph->nexthdr != IPPROTO_IPIP) {
         increase_stats_count(STAT_DECAP_NOT_DSLITE);
         return XDP_PASS;
     }
 
-    if (!is_expected_dslite_peer(cfg, outer_iph)) {
+    struct next_hop *nh = find_dslite_peer_nh(outer_iph);
+    if (!nh) {
         increase_stats_count(STAT_DECAP_PASS);
         return XDP_PASS;
     }
+
+    /* Resolve against the matched slot so a return-path ICMP re-encapsulates
+     * back through the AFTR this packet actually came from, not just the
+     * active one (they differ briefly during a live AFTR switch). */
+    struct b4_config cfg_storage;
+    if (!resolve_softwire(&cfg_storage, nh)) {
+        increase_stats_count(STAT_NO_CONFIG);
+        return XDP_PASS;
+    }
+    struct b4_config *cfg = &cfg_storage;
 
     struct iphdr *inner_iph_pre = 0;
     __u16 inner_len = 0;
@@ -1111,22 +1203,21 @@ xdp_dslite_decap(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
-    struct b4_config *cfg = get_b4_config();
-    if (!cfg)
-        return XDP_PASS;
-
     if (outer_iph->nexthdr != IPPROTO_IPIP) {
         /*
          * Native (non-softwire) IPv6 arriving on the WAN gets the forwarding
          * fastpath (WAN -> LAN) instead of being passed to the kernel.
          */
+        struct b4_config cfg6;
+        if (!resolve_active_softwire(&cfg6))
+            return XDP_PASS;
         int v6action = maybe_redirect_ipv6_to_cpu(ctx, outer_iph, data_end);
         if (v6action)
             return v6action;
-        return handle_ipv6_forward(ctx, l2_len, outer_iph, cfg);
+        return handle_ipv6_forward(ctx, l2_len, outer_iph, &cfg6);
     }
 
-    if (!is_expected_dslite_peer(cfg, outer_iph))
+    if (!find_dslite_peer_nh(outer_iph))
         return XDP_PASS;
 
     struct iphdr *inner_iph = 0;
@@ -1163,11 +1254,11 @@ xdp_ipv6_fwd_cpu(struct xdp_md *ctx)
         return XDP_PASS;
     }
 
-    struct b4_config *cfg = get_b4_config();
-    if (!cfg) {
+    struct b4_config cfg;
+    if (!resolve_active_softwire(&cfg)) {
         increase_stats_count(STAT_NO_CONFIG);
         return XDP_PASS;
     }
 
-    return handle_ipv6_forward(ctx, l2_len, ip6h, cfg);
+    return handle_ipv6_forward(ctx, l2_len, ip6h, &cfg);
 }
