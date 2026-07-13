@@ -32,6 +32,9 @@ const (
 	statIPv6Pass
 	statIPv6RSSRedirect
 	statICMPRateLimited
+	statAffinityInsert
+	statAffinityInsertFail
+	statAffinityPinned
 	statMax
 )
 
@@ -63,6 +66,10 @@ func (l *Loader) Stats() (Stats, error) {
 		statIPv6Pass:        &s.IPv6Pass,
 		statIPv6RSSRedirect: &s.IPv6RSSRedirect,
 		statICMPRateLimited: &s.ICMPRateLimited,
+
+		statAffinityInsert:     &s.AffinityInsert,
+		statAffinityInsertFail: &s.AffinityInsertFail,
+		statAffinityPinned:     &s.AffinityPinned,
 	}
 
 	for id, dst := range fields {

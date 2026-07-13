@@ -58,4 +58,9 @@ type Stats struct {
 	IPv6Pass        uint64
 	IPv6RSSRedirect uint64
 	ICMPRateLimited uint64
+
+	// AFTR-migration flow affinity (see bpf/datapath.bpf.c's PRIMING/DRAINING).
+	AffinityInsert     uint64 // flows recorded during PRIMING
+	AffinityInsertFail uint64 // table full -- migration must be abandoned, not cut over
+	AffinityPinned     uint64 // packets held on the old AFTR during DRAINING
 }
