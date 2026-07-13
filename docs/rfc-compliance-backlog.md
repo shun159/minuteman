@@ -82,13 +82,16 @@ or Time Exceeded from an intermediate IPv6 router on the B4↔AFTR path) into an
 original IPv4 sender. The encap path's own proactive `bpf_check_mtu`-based PtB only covers the
 locally-known egress MTU, not a smaller MTU somewhere further along the IPv6 path.
 
-## 6. AFTR periodic re-discovery — RFC 4242, RFC 3315 WAN-change trigger
+## 6. AFTR periodic re-discovery — RFC 9915 Information Refresh Time + WAN/link-change triggers
 
-Already tracked in `CLAUDE.md`'s "Not yet implemented": `cmd/minuteman` discovers the AFTR once at
-startup and never re-runs discovery, doesn't watch the refresh interval either package reports, and
-doesn't watch for the WAN address changing. Applying a *changed* AFTR to the live datapath safely (today
-`SetB4Config` is only ever called once, before the datapath is considered "up") without disrupting
-in-flight softwire traffic is the harder part of implementing this.
+(RFC lineage: the original citations here were RFC 4242 / RFC 3315; 4242 was absorbed into RFC 8415,
+which RFC 9915 — the current DHCPv6 Internet Standard, STD 102, 2026 — obsoletes. RFC 9915 keeps the
+Information-Refresh-Time-expiry re-fetch and adds link-event triggers (disconnect/reconnect, on-link
+prefix changes). Code comments still cite the original RFCs the mechanisms came from.)
+
+The periodic-refresh half is implemented (stages a1/a2 below); what remains is the WAN/link-change
+trigger family (blocked on dynamic B4, #7) and the flow-affinity drain (stage b below): today an
+AFTR-only change is a hard switch, breaking in-flight softwire flows.
 
 **Fix direction**:
 
@@ -98,7 +101,7 @@ index; `SwitchAFTR` writes the inactive slot then flips the index (never mutatin
 and decap (`find_dslite_peer_nh`) accepts any valid slot. See `pkg/datapath/config.go`.
 
 Stage (a2) — the re-discovery loop (DONE): `cmd/minuteman`'s `runAFTRRediscovery` re-runs discovery on
-the refresh interval each result reports (RFC 4242 / HB46PP ttl), echoing the HB46PP `Token`, and calls
+the refresh interval each result reports (Information Refresh Time / HB46PP ttl), echoing the HB46PP `Token`, and calls
 `SwitchAFTR` when the AFTR address changes (no-op when unchanged; keeps the current AFTR and retries
 sooner on failure). Runs only when the AFTR was discovered (a static `-aftr` has no refresh). Each
 periodic attempt is time-bounded, and DHCPv6 exchanges on the WAN are serialized by a per-interface lock
@@ -116,19 +119,62 @@ known limits carried here for follow-up:
     records flips the AFTR each refresh. Benign at day-scale intervals; a proper fix exposes all
     resolved addresses and no-ops on membership.
 
-Stage (b) — drain-window flow affinity, only for AFTR-only changes:
-- On switch, open a bounded drain window (~30-60 min) and register *new* inner-IPv4 flows (5-tuple
-  key; `BPF_NOEXIST` insert + re-lookup to settle the multi-RX-queue race) pointing at the new slot.
-  A flow-table **miss** during the window means a pre-switch flow → old slot. Window end: drop the
-  table, clear the old slot's `valid` (closing decap acceptance of the old AFTR). Inverting the
-  tracking this way — new flows during the window only, not all flows always — keeps steady-state
-  per-packet cost at zero and needs no GC daemon; the trade-off (flows outliving the window break)
-  is already bounded by the old AFTR's own NAT idle timeouts, and it's extendable to always-on
-  tracking + `last_seen_ns` GC if unbounded draining ever matters.
-- Corners: portless/fragmented traffic degrades to a ports=0 key; a full flow table forwards
-  unpinned via the active slot (never drops); plain `HASH`, not `LRU_HASH` (eviction would silently
-  unpin live flows mid-stream). No PROG_ARRAY/tail-call dispatch — the action variants stay an
-  inline switch — and the native-IPv6 fastpath is untouched (no AFTR involvement).
+Stage (b) — flow-affinity migration for AFTR-only changes (design revised 2026-07-13; supersedes the
+earlier "register new flows at cutover" sketch, which was unimplementable — at cutover, a flow-table
+miss cannot distinguish a genuinely new flow from a pre-existing flow's next packet, since UDP/QUIC/
+ICMP have no start marker. The fix is to observe flows *before* switching):
+
+- **State machine**: `STEADY(A)` → on a discovered AFTR change, `PRIMING` (old slot stays active;
+  every observed inner-IPv4 flow is recorded into a `flow_affinity` HASH — value
+  `{last_seen_ns, epoch}` — while the new slot is written inactive) → `DRAINING` (flip active to the
+  new slot; a lookup hit with the *current* epoch → old slot, a miss or stale epoch → new slot) →
+  `STEADY(B)` (flip control first, then clear the old slot's `valid`, then delete stale entries
+  asynchronously). Priming ~30-60s: flows worth protecting (video, VoIP, gaming) have ms-to-seconds
+  inter-packet gaps and are captured almost surely; a flow idle through all of PRIMING is
+  misclassified as new — the bounded, accepted trade-off that replaces the unsolvable at-cutover
+  classification.
+- **Control word**: one 4-byte-aligned `__u32` (bit-packed `{epoch, state, old_slot, active_slot}`),
+  subsuming stage (a1)'s `active_nh` so every transition stays a single-word atomic flip. Each
+  program loads it once per packet into a local and never re-reads it mid-packet. Steady-state cost
+  stays zero: the control read replaces the existing `active_nh` read, and all flow
+  parsing/lookup/insert is state-gated.
+- **epoch** decouples cleanup from the next migration: stale entries from a previous migration are
+  ignored on lookup (epoch mismatch) and deleted asynchronously — the map need not be empty before
+  switching again. 8-bit wrap is harmless (migrations are day-scale and GC runs between them; a
+  collision's worst case is one flow briefly pinned to a still-valid slot).
+- **PRIMING inserts must be lookup-first**, not blind `BPF_NOEXIST`: a stale-epoch entry at the same
+  key makes a blind insert fail `EEXIST`, leaving an observed pre-existing flow recorded under the
+  wrong epoch → misclassified as new at cutover. Lookup, refresh `epoch`/`last_seen_ns` through the
+  value pointer when present, `BPF_NOEXIST`-insert when absent (the insert-vs-lookup-first
+  performance question is settled by this correctness requirement).
+- **A PRIMING insert failure (map full) aborts the migration**: an unrecorded flow may be
+  pre-existing and would break at cutover. Stay on the old AFTR and retry later while it still
+  works; hard-switch only if it doesn't. Cutover is gated on an affinity-insert-failure counter
+  reading zero (`stats` pattern). Outside PRIMING, fail-open-to-active-slot remains the rule (never
+  drop). At home-CPE scale (~64k entries ≈ 1.5 MB) a full table should be rare.
+- **Drain end is GC-driven, not a fixed window**: an active stream refreshes the old AFTR's NAT
+  state indefinitely — idle timeouts bound only *idle* flows (cf. RFC 6908's cold-vs-hot-standby
+  session-survival distinction), so a fixed 30-60 min window would cut long streams mid-flight.
+  Expire entries on `last_seen_ns` idle timeouts (long for TCP, minutes for UDP), updated from
+  *both* directions — encap by the forward 5-tuple, decap by the reversed one, or a downlink-heavy
+  flow looks idle — and retire the old slot when no current-epoch entries remain, with a generous
+  max-drain time as a safety valve only. v1 skips TCP FIN/RST parsing entirely (flags only
+  accelerate retirement; half-close and spoofed/reordered RSTs make immediate deletion wrong —
+  RST-with-grace is a later refinement).
+- **Fragments normalize to a ports=0 key** — `(src, dst, proto)`, *every* fragment including the
+  first, reversed on decap. Keying by IPv4 ID would keep one datagram's fragments together but never
+  match across datagrams (fresh ID each), destroying the affinity PRIMING recorded; keying the first
+  fragment by ports would split one datagram's fragments across slots. The coarse shared entry
+  merely pins same-pair fragmented flows to one slot together (value is only slot choice +
+  last_seen, so collisions are fate-sharing, not corruption).
+- Plain `HASH`, not `LRU_HASH` (eviction would silently unpin live flows mid-stream). No
+  PROG_ARRAY/tail-call dispatch — the action variants stay an inline switch — and the native-IPv6
+  fastpath is untouched (no AFTR involvement).
+- **WAN-address change** (once dynamic B4 exists, #7): hard switch only when the old B4 address is
+  removed/unusable. While it remains valid-but-deprecated (SLAAC renumbering grace), the old slot
+  keeps the old `b4_addr` — per-slot `b4_addr` already supports exactly this — and draining works
+  normally. RFC 7785 (Informational) recommends the AFTR migrate its state to a new B4 address, but
+  that's an operational SHOULD to hope for, not rely on.
 
 ## 7. Dynamic B4 address — RFC 6333 (prerequisite for #6's WAN-change trigger)
 
