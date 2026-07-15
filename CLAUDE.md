@@ -55,7 +55,7 @@ Not yet implemented:
   word in `bpf/datapath.bpf.c`). Still missing: the WAN/link-change re-discovery triggers (RFC 9915),
   which are blocked on dynamic B4 — today `-b4` is a static flag, so a changed WAN address has no live
   value to switch to (and can't be drained at all: the AFTR's NAT state is keyed to the B4 address, so
-  it dies with it). See `docs/rfc-compliance-backlog.md`'s AFTR re-discovery and dynamic-B4 entries.
+  it dies with it). See `docs/rfc-compliance-backlog.md`'s dynamic-B4 entry.
 - A handful of RFC 7084/6333 compliance gaps (softwire fragmentation, RFC 6333 §5.3's MUST, is the
   highest-impact one remaining). See `docs/rfc-compliance-backlog.md` for the full, priority-ordered
   list with the specific code each gap points at.
