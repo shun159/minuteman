@@ -89,6 +89,74 @@ func buildRouteMessage(rtmType uint16, flags uint16, seq uint32, ifindex int, ds
 	return buildMessage(rtmType, flags, seq, body)
 }
 
+// buildGetRouteMessage builds an RTM_GETROUTE request asking the kernel which
+// route -- and, crucially, which source address -- it would use to reach dst
+// out ifindex. This is the `ip route get <dst> oif <ifindex>` query: a single
+// route resolution (no NLM_F_DUMP), so the kernel runs its full RFC 6724
+// source-address selection and returns the chosen preferred source in
+// RTA_PREFSRC. RTA_OIF constrains the lookup to the WAN interface so the answer
+// is the source the softwire's own ip6tnl would pick toward the AFTR.
+func buildGetRouteMessage(seq uint32, ifindex int, dst netip.Addr) []byte {
+	dstAddr := dst.As16()
+	rtaDst := encodeRtAttr(unix.RTA_DST, dstAddr[:])
+
+	oif := make([]byte, 4)
+	binary.NativeEndian.PutUint32(oif, uint32(ifindex))
+	rtaOif := encodeRtAttr(unix.RTA_OIF, oif)
+
+	body := make([]byte, 0, unix.SizeofRtMsg+len(rtaDst)+len(rtaOif))
+	body = append(body,
+		unix.AF_INET6, // Family
+		128,           // Dst_len: a full address, not a prefix
+		0,             // Src_len
+		0,             // Tos
+		0,             // Table (unset: the kernel resolves as for a real send)
+		0,             // Protocol
+		0,             // Scope (RT_SCOPE_UNIVERSE)
+		unix.RTN_UNICAST,
+	)
+	body = binary.NativeEndian.AppendUint32(body, 0) // Flags
+	body = append(body, rtaDst...)
+	body = append(body, rtaOif...)
+
+	return buildMessage(unix.RTM_GETROUTE, unix.NLM_F_REQUEST, seq, body)
+}
+
+// parseRoutePrefsrc parses an RTM_GETROUTE reply (rtmsg, header stripped) and
+// returns its RTA_PREFSRC -- the source address the kernel would use for the
+// queried destination. ok is false for a non-AF_INET6 reply or one without an
+// RTA_PREFSRC (e.g. the destination is unreachable, or resolves to a route with
+// no usable source on the constrained interface -- which at startup means the
+// WAN's default route hasn't been (re)learned yet, so the caller retries).
+func parseRoutePrefsrc(payload []byte) (netip.Addr, bool) {
+	if len(payload) < unix.SizeofRtMsg {
+		return netip.Addr{}, false
+	}
+	if payload[0] != unix.AF_INET6 {
+		return netip.Addr{}, false
+	}
+
+	attrs := payload[unix.SizeofRtMsg:]
+	for len(attrs) >= unix.SizeofRtAttr {
+		attrLen := binary.NativeEndian.Uint16(attrs[0:2])
+		attrType := binary.NativeEndian.Uint16(attrs[2:4])
+		if int(attrLen) < unix.SizeofRtAttr || int(attrLen) > len(attrs) {
+			break
+		}
+		if attrType == unix.RTA_PREFSRC {
+			if addr, ok := netip.AddrFromSlice(attrs[unix.SizeofRtAttr:attrLen]); ok {
+				return addr, true
+			}
+		}
+		next := nlmsgAlign(int(attrLen))
+		if next > len(attrs) {
+			break
+		}
+		attrs = attrs[next:]
+	}
+	return netip.Addr{}, false
+}
+
 // buildMessage prepends an nlmsghdr to body.
 func buildMessage(rtmType uint16, flags uint16, seq uint32, body []byte) []byte {
 	hdr := unix.NlMsghdr{

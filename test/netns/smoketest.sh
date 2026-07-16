@@ -71,6 +71,20 @@ retry() {
     return 1
 }
 
+# retry_slow is retry with a longer horizon (25 * 2s = 50s), for the one
+# condition that genuinely takes tens of seconds: minuteman's dynamic-B4 watcher
+# polls the WAN source every b4WatchInterval (30s), so a renumbering it must
+# notice can take a full interval plus DAD on the new address.
+retry_slow() {
+    for _ in $(seq 1 25); do
+        if "$@"; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
 # dslite_capture runs "$@" while sniffing the AFTR's dslite0 softwire endpoint,
 # so a caller can tell whether the traffic it generated actually crossed the
 # DS-Lite tunnel. dslite0 only ever carries softwire-decapsulated (or about-to-
@@ -125,6 +139,17 @@ if [[ -f "$DUALSTACK_ENABLED_FILE" && "$(cat "$DUALSTACK_ENABLED_FILE")" == 1 ]]
     dualstack_enabled=1
 fi
 
+dynamic_b4_enabled=0
+if [[ -f "$DYNAMIC_B4_FILE" && "$(cat "$DYNAMIC_B4_FILE")" == 1 ]]; then
+    dynamic_b4_enabled=1
+fi
+# -b4 is omitted under MM_DYNAMIC_B4=1 (minuteman selects it dynamically); pinned
+# to WAN_CPE_ADDR otherwise.
+b4_flags=(-b4 "${WAN_CPE_ADDR%/*}")
+if [[ $dynamic_b4_enabled -eq 1 ]]; then
+    b4_flags=()
+fi
+
 if ip netns pids "$NETNS_CPE" 2>/dev/null | xargs -r -I{} readlink -f /proc/{}/exe 2>/dev/null | grep -qx "$MINUTEMAN_BIN"; then
     echo "== minuteman already running in $NETNS_CPE, reusing it =="
 else
@@ -144,7 +169,7 @@ else
     fi
     ip netns exec "$NETNS_CPE" "$MINUTEMAN_BIN" \
         -wan "$VETH_CPE_ISP" \
-        -b4 "${WAN_CPE_ADDR%/*}" \
+        "${b4_flags[@]}" \
         -lan "$VETH_CPE_HOST=${LAN_CPE_ADDR%/*}" \
         "$wan_model_flag" \
         "${dns_proxy_flags[@]}" \
@@ -329,6 +354,49 @@ sleep 0.3
 check "LAN client can reach a TCP service on the simulated internet host" \
     ip netns exec "$NETNS_HOST" curl -sf --max-time 3 "http://${PUBLIC_INET_ADDR%/*}:8080/"
 wait "$nc_pid" 2>/dev/null
+
+if [[ $dynamic_b4_enabled -eq 1 && $started_minuteman -eq 1 ]]; then
+    echo "== Dynamic B4 (RFC 7785 B4-address change): a WAN-address change re-selects the softwire source =="
+    # At startup minuteman had no -b4, so it asked the kernel (RFC 6724) which
+    # source to use toward the AFTR and got WAN_CPE_ADDR (the only WAN global).
+    check "minuteman selected the B4 source dynamically toward the AFTR (see $RUNDIR/minuteman.log)" \
+        grep -q "dynamic B4: kernel selected ${WAN_CPE_ADDR%/*} " "$RUNDIR/minuteman.log"
+
+    # Renumber the WAN: add a clean second global (WAN_CPE_ADDR2) as a candidate,
+    # then deprecate the address minuteman is currently using so the kernel's
+    # RFC 6724 source selection -- and thus minuteman's watchB4/handleWANChange
+    # -- must move off it. (Deprecating rather than deleting keeps the old
+    # address reachable, so anything still routing via it, e.g. a PD return route
+    # on mm-isp, is unaffected; only *source* selection avoids it.)
+    echo "-- renumbering mm-cpe WAN: add ${WAN_CPE_ADDR2%/*}, deprecate ${WAN_CPE_ADDR%/*}"
+    ip netns exec "$NETNS_CPE" ip addr add "$WAN_CPE_ADDR2" dev "$VETH_CPE_ISP"
+    ip netns exec "$NETNS_CPE" ip addr change "$WAN_CPE_ADDR" dev "$VETH_CPE_ISP" preferred_lft 0
+
+    # watchB4 polls every 30s; give it a full interval (plus the new address's
+    # DAD) to notice the change and hard-switch. It re-selects whichever source
+    # the kernel now prefers among the remaining non-deprecated WAN globals
+    # (WAN_CPE_ADDR2, or the WAN's own SLAAC address) -- parse that from the log
+    # rather than assuming which, then assert it moved off the deprecated one.
+    check "minuteman re-selected the softwire source after the WAN address change" \
+        retry_slow grep -q "switched softwire source to " "$RUNDIR/minuteman.log"
+    switched_b4="$(sed -n 's/.*switched softwire source to \([^ ]*\) .*/\1/p' "$RUNDIR/minuteman.log" | tail -n1)"
+    check "the re-selected B4 ($switched_b4) is no longer the deprecated ${WAN_CPE_ADDR%/*}" \
+        test -n "$switched_b4" -a "$switched_b4" != "${WAN_CPE_ADDR%/*}"
+
+    # Follow through on the ISP side: point the AFTR's ip6tnl at whatever B4
+    # minuteman picked -- the NAT-state-follows-the-address step a real AFTR does
+    # via its own B4 re-learning. Until this lands the AFTR rejects the new outer
+    # source, so this is also what makes the re-test below prove the switch took.
+    echo "-- pointing the AFTR's softwire tunnel at the re-selected B4 $switched_b4"
+    ip netns exec "$NETNS_AFTR" ip -6 tunnel change "$AFTR_TUN" mode ipip6 \
+        local "${CORE_AFTR_ADDR%/*}" remote "$switched_b4" encaplimit none
+
+    # The softwire must work end to end again, now sourced from the new B4. This
+    # only succeeds if minuteman really moved to $switched_b4 (the AFTR now
+    # accepts only that source, and decap now expects return traffic to it).
+    check "LAN client reaches the internet through the softwire after renumbering (B4 now $switched_b4)" \
+        retry ip netns exec "$NETNS_HOST" ping -c 2 -W 2 -I "$VETH_HOST_CPE" "${PUBLIC_INET_ADDR%/*}"
+fi
 
 if [[ $dualstack_enabled -eq 1 ]]; then
     echo "== Dual-stack (RFC 6333): IPv4 via softwire, IPv6 native -- A vs AAAA =="

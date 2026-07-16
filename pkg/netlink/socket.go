@@ -9,6 +9,7 @@
 package netlink
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 
@@ -94,6 +95,71 @@ func (s *Socket) Addrs(ifindex int) ([]netip.Prefix, error) {
 			}
 		}
 	}
+}
+
+// SourceForDest asks the kernel which local IPv6 address it would use as the
+// source when sending to dst out ifindex -- an RTM_GETROUTE query (`ip route
+// get <dst> oif <ifindex>`), so the kernel runs its own RFC 6724 source-address
+// selection (deprecated-avoidance, scope match, longest-match) and returns the
+// chosen source in RTA_PREFSRC. minuteman uses this to pick the B4's own
+// softwire source toward the AFTR without reimplementing that selection.
+//
+// ok is false when the kernel reports the destination unreachable out ifindex
+// (an ENETUNREACH/EHOSTUNREACH/ENETDOWN errno) or replies with a route carrying
+// no RTA_PREFSRC: at startup, before the WAN's RA-learned default route is back,
+// the interface has no usable global source yet, so the caller retries. Any
+// *other* netlink errno (e.g. EINVAL from a malformed request) is returned as an
+// error rather than absorbed into that retry, so a real bug surfaces instead of
+// looping forever.
+func (s *Socket) SourceForDest(ifindex int, dst netip.Addr) (src netip.Addr, ok bool, err error) {
+	s.seq++
+	seq := s.seq
+	if err := unix.Send(s.fd, buildGetRouteMessage(seq, ifindex, dst), 0); err != nil {
+		return netip.Addr{}, false, fmt.Errorf("netlink: sending RTM_GETROUTE: %w", err)
+	}
+
+	buf := make([]byte, unix.Getpagesize())
+	n, _, err := unix.Recvfrom(s.fd, buf, 0)
+	if err != nil {
+		return netip.Addr{}, false, fmt.Errorf("netlink: reading RTM_GETROUTE reply: %w", err)
+	}
+	msgs, err := walkMessages(buf[:n])
+	if err != nil {
+		return netip.Addr{}, false, err
+	}
+	for _, m := range msgs {
+		switch m.Type {
+		case unix.NLMSG_ERROR:
+			// A route-get for an unreachable dst comes back as an errno, not a
+			// route with no prefsrc. Reachability-class errnos mean "no source
+			// yet" (the WAN route isn't back) -> retry; any other errno is a real
+			// error (e.g. a malformed request), returned rather than absorbed into
+			// the caller's retry so it can't loop forever. parseAckErrno returns
+			// nil for the errno==0 case, which an RTM_GETROUTE reply never is.
+			if err := parseAckErrno(m.Raw, seq); err != nil {
+				if isNoRouteErrno(err) {
+					return netip.Addr{}, false, nil
+				}
+				return netip.Addr{}, false, fmt.Errorf("netlink: RTM_GETROUTE: %w", err)
+			}
+		case unix.RTM_NEWROUTE:
+			if src, ok := parseRoutePrefsrc(m.Raw[unix.SizeofNlMsghdr:]); ok {
+				return src, true, nil
+			}
+		}
+	}
+	return netip.Addr{}, false, nil
+}
+
+// isNoRouteErrno reports whether an RTM_GETROUTE NLMSG_ERROR errno means "no
+// route/source to the destination yet" -- expected at startup while the WAN's
+// RA-learned route is still absent, so SourceForDest reports it as ok=false for
+// the caller to retry rather than as a hard error. Every other errno (a
+// malformed request, an unexpected kernel error) is surfaced instead.
+func isNoRouteErrno(err error) bool {
+	return errors.Is(err, unix.ENETUNREACH) ||
+		errors.Is(err, unix.EHOSTUNREACH) ||
+		errors.Is(err, unix.ENETDOWN)
 }
 
 // AddRoute installs a route to dst (typically a /128 host route) out

@@ -49,6 +49,14 @@ VETH_ISP_CPE=v-isp-cpe     # in mm-isp
 WAN_CPE_ADDR=fd00:1::2/64     # minuteman -b4 (statically pinned; see setup.sh comments)
 WAN_ISP_ADDR=fd00:1::1/64
 WAN_PREFIX=fd00:1::/64
+# A second WAN global on the same /64, added by smoketest.sh's MM_DYNAMIC_B4
+# renumbering scenario as a clean candidate source: it then deprecates
+# WAN_CPE_ADDR (preferred_lft 0) so the kernel's RFC 6724 source selection -- and
+# thus minuteman's dynamic B4 -- must move off it (to this address or the WAN's
+# own SLAAC one), re-points the AFTR's ip6tnl remote at whatever minuteman picked,
+# and re-tests the softwire. Same prefix, so it needs no new routing. Unused
+# unless MM_DYNAMIC_B4=1.
+WAN_CPE_ADDR2=fd00:1::9/64
 
 # ISP core (isp <-> aftr), IPv6
 VETH_ISP_AFTR=v-isp-aftr   # in mm-isp
@@ -172,6 +180,16 @@ DHCLIENT_PIDFILE="$RUNDIR/dhclient.pid"
 # static IPv4 too.
 DUALSTACK_ENABLED_FILE="$RUNDIR/dualstack-enabled"
 DUALSTACK_PCAP="$RUNDIR/dualstack-dslite.pcap"
+
+# Whether minuteman is started WITHOUT -b4 -- a sixth independent toggle
+# (orthogonal to the five above). When on, minuteman selects its B4 softwire
+# source dynamically from the WAN's kernel-chosen source toward the AFTR (RFC
+# 6724) and re-selects it when the WAN address changes (the DS-Lite B4-address
+# change of RFC 7785); when off (the
+# default), -b4 pins WAN_CPE_ADDR statically as before. smoketest.sh additionally
+# drives a renumbering scenario in this mode (see WAN_CPE_ADDR2 below). Off by
+# default (MM_DYNAMIC_B4 unset or "0").
+DYNAMIC_B4_FILE="$RUNDIR/dynamic-b4"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MINUTEMAN_BIN="$REPO_ROOT/bin/minuteman"
