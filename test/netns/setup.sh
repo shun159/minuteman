@@ -105,6 +105,15 @@ case "$DUALSTACK" in
     ;;
 esac
 
+DYNAMIC_B4="${MM_DYNAMIC_B4:-0}"
+case "$DYNAMIC_B4" in
+0 | 1) ;;
+*)
+    echo "error: MM_DYNAMIC_B4 must be '0' or '1' (got '$DYNAMIC_B4')" >&2
+    exit 1
+    ;;
+esac
+
 # veth TX checksum/GSO/TSO/SG offloads leave TCP segments with an unfinalized
 # (CHECKSUM_PARTIAL) checksum, on the assumption that a real NIC (or the
 # kernel stack at final delivery) will fill it in later. minuteman's XDP
@@ -387,6 +396,7 @@ echo "$WAN_MODEL" >"$WAN_MODEL_FILE"
 echo "$DNS_PROXY" >"$DNS_PROXY_ENABLED_FILE"
 echo "$DHCPV4" >"$DHCPV4_ENABLED_FILE"
 echo "$DUALSTACK" >"$DUALSTACK_ENABLED_FILE"
+echo "$DYNAMIC_B4" >"$DYNAMIC_B4_FILE"
 
 echo "== mm-cpe: B4 element (minuteman runs here) =="
 # ip_forward/net.ipv6.conf.all.forwarding=1 (required for bpf_fib_lookup() in

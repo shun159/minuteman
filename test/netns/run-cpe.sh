@@ -69,9 +69,17 @@ if [[ -f "$DHCPV4_ENABLED_FILE" && "$(cat "$DHCPV4_ENABLED_FILE")" == 1 ]]; then
     dhcpv4_flags=(-dhcpv4)
 fi
 
+# -b4 is omitted under MM_DYNAMIC_B4=1 so minuteman selects it dynamically from
+# the WAN's kernel-chosen source toward the AFTR (RFC 6724); otherwise it's
+# pinned to WAN_CPE_ADDR as before.
+b4_flags=(-b4 "${WAN_CPE_ADDR%/*}")
+if [[ -f "$DYNAMIC_B4_FILE" && "$(cat "$DYNAMIC_B4_FILE")" == 1 ]]; then
+    b4_flags=()
+fi
+
 exec ip netns exec "$NETNS_CPE" "$MINUTEMAN_BIN" \
     -wan "$VETH_CPE_ISP" \
-    -b4 "${WAN_CPE_ADDR%/*}" \
+    "${b4_flags[@]}" \
     -lan "$VETH_CPE_HOST=${LAN_CPE_ADDR%/*}" \
     "$wan_model_flag" \
     "${dns_proxy_flags[@]}" \

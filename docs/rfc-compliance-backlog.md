@@ -3,7 +3,7 @@
 minuteman works as a DS-Lite B4 (verified end-to-end against the netns rig — see
 `test/netns/README.md`), but measured strictly against RFC 7084 (IPv6 CE Router Requirements) and
 RFC 6333, these gaps remain. Ordered by real-world impact, highest first. Last checked against the
-codebase 2026-07-15.
+codebase 2026-07-16.
 
 ## 1. Softwire fragmentation — RFC 6333 §5.3 (MUST) (highest remaining impact)
 
@@ -82,38 +82,23 @@ or Time Exceeded from an intermediate IPv6 router on the B4↔AFTR path) into an
 original IPv4 sender. The encap path's own proactive `bpf_check_mtu`-based PtB only covers the
 locally-known egress MTU, not a smaller MTU somewhere further along the IPv6 path.
 
-## 6. Dynamic B4 address, and the AFTR WAN/link-change re-discovery trigger it unblocks — RFC 6333, RFC 9915
-
-`-b4` is a required *static* flag: the B4's own IPv6 softwire source address is fixed at startup. A real
-CPE's WAN address is SLAAC- or DHCPv6-assigned and changes over time (renumbering, lease expiry,
-reconnect); when it does, minuteman keeps encapsulating from a stale source and the softwire breaks with
-no recovery short of a restart. The current static-`-b4` model is not viable for a real deployment where
-the WAN address isn't pinned.
-
-This is also the last unimplemented piece of AFTR re-discovery — the rest is done (periodic
-Information-Refresh-Time / HB46PP-ttl refresh in `cmd/minuteman`'s `runAFTRRediscovery`, and, on an
-AFTR-only change, the flow-affinity migration in `pkg/datapath/migration.go` + `migrateAFTR` that keeps
-in-flight flows on the old AFTR until they drain). What's missing is RFC 9915's WAN/link-change
-re-discovery *trigger*, which has no live B4 to act on. Unlike an AFTR-only change, a WAN-address change
-can't be drained: the AFTR's NAT state is keyed to the B4 address, so it dies with the address. So it's
-a *hard* `SwitchAFTR` (the datapath switches both endpoints atomically), which should also re-trigger
-AFTR discovery.
-
-**Fix direction:** make `-b4` optional — when omitted, discover the WAN interface's own global IPv6
-address (the netlink address-listing already used by `internal/wanextend.DiscoverPrefix`) and use it as
-the B4, then watch it (`internal/wanextend.WatchChanges`'s shape) and drive a hard `SwitchAFTR(newB4,
-aftr)` plus a fresh AFTR discovery when it changes. Keep `-b4` as an explicit override. Needs care around
-which global address to pick when several are present, and around sequencing against the AFTR
-re-discovery loop. (RFC 7785, Informational, recommends the AFTR migrate its state to a new B4 address so
-a valid-but-deprecated old address could in principle be drained rather than hard-switched — an
-operational SHOULD to hope for, not rely on.)
-
-## 7. Minor / acceptable for a home CPE
+## 6. Minor / acceptable for a home CPE
 
 - AFTR re-discovery flips the AFTR each refresh when the AFTR *name* has several AAAA records: the
   no-op check compares one resolved address (`aftrdiscovery` returns `addrs[0]`), not set membership.
   Benign at day-scale intervals — a graceful flow-affinity migration each time, not a hard break — but
   a proper fix exposes all resolved addresses and no-ops when the current AFTR is still among them.
+- Dynamic-B4 change detection is polling (`cmd/minuteman`'s `watchB4`, ~30s), not event-driven. A netlink
+  `RTNLGRP_IPV6_IFADDR` event subscription would react in sub-second but adds a new pkg/netlink surface
+  plus debounce/DAD handling; home-CPE renumbering usually rides link events slower than a poll interval
+  anyway, so this is a latency nicety, not a correctness gap.
+- A WAN-address change hard-switches the softwire, breaking in-flight flows, because the AFTR's NAT
+  state is keyed to the B4 address and dies with it. RFC 7785 §4 (Informational) recommends the AFTR
+  migrate that state to the new B4 (Rec 3, using the last-seen B4 source address for return traffic) so a
+  valid-but-deprecated old address could instead be drained — an operational SHOULD to hope for, not rely
+  on. The per-slot `b4_addr` already supports a future drain. (This is not a DHCPv6 / RFC 9915 behaviour:
+  RFC 9915 defines only periodic Information-Refresh-Time refresh (§21.23 / §18.2.12), not a
+  link/address-change re-discovery trigger — the B4-address-change trigger is the RFC 7785 concern above.)
 - RDNSS is only advertised while `-dns-proxy` is on; with it off (the default), an IPv6-only SLAAC LAN
   client is DNS-less again (RFC 7084 §L-4). The proxy-less alternative — advertising the WAN-learned
   upstream resolvers directly in RDNSS — would cover the default configuration too.

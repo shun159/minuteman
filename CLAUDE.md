@@ -19,6 +19,13 @@ further down — this is just the index of what exists and which flag turns it o
 - **AFTR discovery** (automatic unless `-aftr` is given) — an in-process, stdlib-only DHCPv6 client
   (RFC 3736 + RFC 6334 `OPTION_AFTR_NAME`) with an HB46PP (JAIPA v6mig-1) fallback when the Reply carries
   no AFTR-Name, so minuteman needs no per-VNE configuration and spawns no external DHCP/DNS daemon.
+  Re-discovery is periodic (RFC 4242 refresh) and, with a dynamic B4 (below), also triggered by a WAN
+  address change (the DS-Lite B4-address change of RFC 7785) — a changed AFTR migrates gracefully
+  (in-flight flows kept on the old AFTR until they drain), a changed B4 hard-switches.
+- **Dynamic B4** (automatic unless `-b4` is given) — the B4's own softwire source is selected from the
+  WAN's kernel-chosen source toward the AFTR (RFC 6724, via an `RTM_GETROUTE`/`RTA_PREFSRC` query) and
+  re-selected when the WAN address changes (renumbering/lease/reconnect), so the softwire survives a WAN
+  renumbering instead of needing a restart. `-b4` still pins it statically.
 - **DHCPv6 Prefix Delegation** (`-dhcpv6-pd`, RFC 3633) — acquires and maintains a delegated prefix,
   carves one `/64` per `-lan` interface from it, and RAs it out (RFC 4861) for LAN SLAAC.
 - **NDProxy** (`-ndproxy`, RFC 4389) — the alternative WAN model some ISPs use instead of PD (one shared
@@ -46,16 +53,6 @@ Not yet implemented:
   and preserves those technologies' parameter objects raw (`json.RawMessage` on `hb46pp.Provisioning`),
   so implementing one means adding its typed parameter struct there, its datapath, and extending
   `cmd/minuteman`'s policy beyond the current dslite-only capability request.
-- The WAN/link-change half of AFTR re-discovery. What *is* implemented: `cmd/minuteman`'s
-  `runAFTRRediscovery` re-runs discovery on the refresh interval each result reports (echoing the HB46PP
-  `Token`, with DHCPv6 exchanges on the WAN serialized against DHCPv6-PD maintenance by `pkg/dhcpv6`'s
-  per-interface lock), and a changed AFTR is applied by `migrateAFTR` *without breaking the flows that
-  predate it* — the datapath primes a flow-affinity table on the old AFTR, cuts over, then keeps those
-  flows pinned to the old AFTR until they fall idle (see `pkg/datapath/migration.go` and the control
-  word in `bpf/datapath.bpf.c`). Still missing: the WAN/link-change re-discovery triggers (RFC 9915),
-  which are blocked on dynamic B4 — today `-b4` is a static flag, so a changed WAN address has no live
-  value to switch to (and can't be drained at all: the AFTR's NAT state is keyed to the B4 address, so
-  it dies with it). See `docs/rfc-compliance-backlog.md`'s dynamic-B4 entry.
 - A handful of RFC 7084/6333 compliance gaps (softwire fragmentation, RFC 6333 §5.3's MUST, is the
   highest-impact one remaining). See `docs/rfc-compliance-backlog.md` for the full, priority-ordered
   list with the specific code each gap points at.
@@ -99,9 +96,10 @@ sudo ./test/netns/smoketest.sh   # starts minuteman itself + pings/curls end-to-
 sudo ./test/netns/teardown.sh    # tears everything down (always safe to re-run)
 ```
 
-Six independent env-var toggles select what `setup.sh` builds and what `smoketest.sh` asserts —
+Seven independent env-var toggles select what `setup.sh` builds and what `smoketest.sh` asserts —
 `MM_AFTR_DISCOVERY` (`dhcpv6`/`hb46pp`), `MM_WAN_MODEL` (`dhcpv6-pd`/`ndproxy`), `MM_DNS_PROXY`,
-`MM_DHCPV4`, `MM_DUALSTACK`, `MM_IPV6_SW_RSS` — plus the full list of verified-passing combinations. See
+`MM_DHCPV4`, `MM_DUALSTACK`, `MM_IPV6_SW_RSS`, `MM_DYNAMIC_B4` (omit `-b4` and drive a WAN-renumbering
+scenario) — plus the full list of verified-passing combinations. See
 **`test/netns/README.md`** for all of that detail; it's a rig-operation runbook, not something most tasks
 need loaded up front.
 
@@ -427,7 +425,9 @@ orphaned the running kernel's module directory — reboot to fix that).
   read error rather than swallowing it (a fake `conn` makes that testable). See the `xdp_dslite_encap`
   `is_non_unicast_dst` bypass above for why the datapath had to change before any of this could receive a
   packet.
-- **`cmd/minuteman/main.go`** — thin CLI entrypoint. Flags: `-wan`, `-b4`, `-aftr` (optional — see below),
+- **`cmd/minuteman/main.go`** — thin CLI entrypoint. Flags: `-wan`, `-b4` (optional — omitted means the
+  softwire source is tracked dynamically; see `resolveB4`/`watchB4`/`runAFTRRediscovery` below), `-aftr`
+  (optional — see below),
   repeatable `-lan iface=gatewayIP[/prefixlen][,mtu]` (the `/prefixlen`, default `/24`, is the DHCPv4
   subnet), `-wan-dst-mac` (fallback only), `-stats-interval`, `-dhcpv6-pd`
   (opt-in prefix delegation), `-ndproxy` (opt-in RFC 4389 proxying, mutually exclusive with `-dhcpv6-pd` —
@@ -451,7 +451,19 @@ orphaned the running kernel's module directory — reboot to fix that).
   from the partial DHCPv6 result, client identity from the three `-hb46pp-*` flags bundled into an
   `hb46ppIdentity`), looping the whole DHCPv6→HB46PP chain with `hb46pp.RetryDelay`-paced sleeps on HB46PP
   failure — same block-until-success-or-ctx-cancel stance, but at the spec's backoff cadence so a real
-  VNE's provisioning server isn't hammered. When `-dhcpv6-pd` is set, `runPrefixDelegation()` similarly blocks
+  VNE's provisioning server isn't hammered. The B4 softwire source is `-b4` if given, else resolved
+  dynamically by `resolveB4()` — a `pkg/netlink.Socket.SourceForDest` (`RTM_GETROUTE`/`RTA_PREFSRC`) query
+  run after `AttachWAN`, retrying until the WAN's RA-learned route to the AFTR is back, so the kernel's
+  RFC 6724 logic picks the exact source its own ip6tnl would. `runAFTRRediscovery()` (started whenever the
+  AFTR *or* the B4 is dynamic) is the *single owner* of the live softwire endpoints, a `rediscovery` struct
+  driving one goroutine: it runs periodic AFTR re-discovery (applying a changed AFTR via the
+  flow-preserving `migrateAFTR`) and, for a dynamic B4, folds in a WAN-address-change signal from a
+  `watchB4()` poller — on which `handleWANChange()` hard-switches the source (`dp.SwitchAFTR`, since a B4
+  change can't be drained: RFC 7785 §4 recommends the AFTR migrate its NAT state to the new B4, but that
+  can't be relied on, so minuteman cuts cleanly) then re-triggers AFTR discovery. The watcher only signals (size-1
+  latest-wins channel); the loop re-queries the source itself so no stale value rides the channel, and
+  `migrateAFTR`'s long waits also select on the signal (returning `errMigrationInterrupted`) so a WAN
+  change interrupts even a multi-hour drain. When `-dhcpv6-pd` is set, `runPrefixDelegation()` similarly blocks
   on `pkg/prefixdelegation.Acquire`, then applies the initial LAN assignment via
   `internal/lanprefix.Reconcile` synchronously (before the datapath is considered "up"), syncs an
   `internal/lanprefix.RAManager` against the result (starting one `pkg/routeradvert.Serve` goroutine per

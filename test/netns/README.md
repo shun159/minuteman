@@ -83,6 +83,16 @@ adds `-ipv6-sw-rss` to that invocation and additionally asserts the `IPv6RSSRedi
 (the cpumap fanout engaged). Composes with all four toggles above; pairs naturally with `MM_DHCPV4=1` for
 the "host has both a DHCPv4 and an IPv6 address" case.
 
+A seventh independent toggle, `MM_DYNAMIC_B4` (`0` default or `1`), starts minuteman *without* `-b4` so it
+selects the softwire source dynamically from the WAN's kernel-chosen source toward the AFTR (RFC 6724) and
+re-selects it when the WAN address changes (the DS-Lite B4-address change of RFC 7785). `smoketest.sh` first asserts minuteman logged the
+startup selection (`WAN_CPE_ADDR`), then drives a renumbering scenario: it adds a second WAN global and
+deprecates the first (`preferred_lft 0`), waits out minuteman's 30s `watchB4` poll for the hard-switch
+(parsing the re-selected address from the log rather than assuming which candidate the kernel picks —
+`WAN_CPE_ADDR2` or the WAN's own SLAAC address), points the AFTR's `ip6tnl` `remote` at it (the
+NAT-state-follows-the-address step a real AFTR does via its own B4 re-learning), and re-runs the DS-Lite
+data-path check — which only passes if the switch actually took. Composes with the other toggles.
+
 `run-cpe.sh` and `smoketest.sh` deliberately omit `-aftr` so minuteman discovers it live against the rig —
 pass `-aftr <addr>` as an extra argument to either script to override with a static address instead.
 
@@ -115,6 +125,8 @@ verified passing from a fresh setup for:
 - `MM_DUALSTACK=1` (against both WAN models, one with `MM_DHCPV4=1`) plus `MM_IPV6_SW_RSS=1`; the
   datapath's ICMPv6-Packet-Too-Big origination was verified separately by forcing a small WAN egress MTU
   and confirming a LAN client caches the advertised path MTU
+- `MM_DYNAMIC_B4=1` (against `dhcpv6` AFTR discovery + `dhcpv6-pd`): startup dynamic B4 selection plus the
+  WAN-renumbering hard-switch and softwire recovery, all end-to-end
 - the default (all toggles off), re-run after the `xdp_dslite_encap` non-unicast-bypass change to confirm
   no regression
 

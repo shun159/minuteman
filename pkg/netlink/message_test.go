@@ -2,6 +2,7 @@ package netlink
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net/netip"
 	"slices"
 	"testing"
@@ -141,6 +142,96 @@ func TestBuildRouteMessage(t *testing.T) {
 	}
 }
 
+func TestBuildGetRouteMessage(t *testing.T) {
+	dst := netip.MustParseAddr("2001:db8:aa::1")
+	msg := buildGetRouteMessage(9, 4, dst)
+
+	if got := binary.NativeEndian.Uint16(msg[4:6]); got != unix.RTM_GETROUTE {
+		t.Errorf("nlmsghdr.Type = %d, want RTM_GETROUTE", got)
+	}
+	// A route *query* must not carry NLM_F_DUMP: it resolves the one route for
+	// dst (running source selection), rather than listing the table.
+	flags := binary.NativeEndian.Uint16(msg[6:8])
+	if flags&unix.NLM_F_DUMP != 0 {
+		t.Errorf("flags = %#x, must not include NLM_F_DUMP", flags)
+	}
+	if flags&unix.NLM_F_REQUEST == 0 {
+		t.Errorf("flags = %#x, want NLM_F_REQUEST set", flags)
+	}
+
+	rt := msg[unix.SizeofNlMsghdr:]
+	if rt[0] != unix.AF_INET6 {
+		t.Errorf("rtmsg.Family = %d, want AF_INET6", rt[0])
+	}
+	if rt[1] != 128 {
+		t.Errorf("rtmsg.Dst_len = %d, want 128 (a full address)", rt[1])
+	}
+
+	// RTA_DST then RTA_OIF, same layout the route builder is checked for.
+	attrs := rt[unix.SizeofRtMsg:]
+	dstAttrLen := binary.NativeEndian.Uint16(attrs[0:2])
+	if binary.NativeEndian.Uint16(attrs[2:4]) != unix.RTA_DST {
+		t.Fatal("first attr is not RTA_DST")
+	}
+	gotDst, ok := netip.AddrFromSlice(attrs[unix.SizeofRtAttr : unix.SizeofRtAttr+16])
+	if !ok || gotDst != dst {
+		t.Errorf("RTA_DST = %v, want %v", gotDst, dst)
+	}
+	oifOff := nlmsgAlign(int(dstAttrLen))
+	if binary.NativeEndian.Uint16(attrs[oifOff+2:oifOff+4]) != unix.RTA_OIF {
+		t.Fatal("second attr is not RTA_OIF")
+	}
+	if got := binary.NativeEndian.Uint32(attrs[oifOff+unix.SizeofRtAttr : oifOff+unix.SizeofRtAttr+4]); got != 4 {
+		t.Errorf("RTA_OIF = %d, want 4", got)
+	}
+}
+
+func TestParseRoutePrefsrc(t *testing.T) {
+	prefsrc := netip.MustParseAddr("2001:db8:aa::10")
+
+	// A synthetic RTM_NEWROUTE payload (rtmsg header + RTA_DST then RTA_PREFSRC),
+	// which is the shape the kernel returns for a route-get. PREFSRC deliberately
+	// isn't the first attribute, to check the walk finds it.
+	dstAddr := netip.MustParseAddr("2001:db8:aa::1").As16()
+	srcAddr := prefsrc.As16()
+	payload := make([]byte, unix.SizeofRtMsg)
+	payload[0] = unix.AF_INET6
+	payload = append(payload, encodeRtAttr(unix.RTA_DST, dstAddr[:])...)
+	payload = append(payload, encodeRtAttr(unix.RTA_PREFSRC, srcAddr[:])...)
+
+	got, ok := parseRoutePrefsrc(payload)
+	if !ok {
+		t.Fatal("parseRoutePrefsrc returned ok=false for a reply carrying RTA_PREFSRC")
+	}
+	if got != prefsrc {
+		t.Errorf("prefsrc = %v, want %v", got, prefsrc)
+	}
+}
+
+func TestParseRoutePrefsrcAbsent(t *testing.T) {
+	// An unreachable destination resolves to a route with no source: RTA_PREFSRC
+	// is absent, so the caller must be told to retry rather than get a zero addr.
+	dstAddr := netip.MustParseAddr("2001:db8:aa::1").As16()
+	payload := make([]byte, unix.SizeofRtMsg)
+	payload[0] = unix.AF_INET6
+	payload = append(payload, encodeRtAttr(unix.RTA_DST, dstAddr[:])...)
+
+	if _, ok := parseRoutePrefsrc(payload); ok {
+		t.Error("parseRoutePrefsrc returned ok=true with no RTA_PREFSRC")
+	}
+}
+
+func TestParseRoutePrefsrcWrongFamily(t *testing.T) {
+	payload := make([]byte, unix.SizeofRtMsg)
+	payload[0] = unix.AF_INET // not AF_INET6
+	src := netip.MustParseAddr("192.0.2.1").As4()
+	payload = append(payload, encodeRtAttr(unix.RTA_PREFSRC, src[:])...)
+
+	if _, ok := parseRoutePrefsrc(payload); ok {
+		t.Error("parseRoutePrefsrc accepted a non-AF_INET6 reply")
+	}
+}
+
 func buildAckMessage(t *testing.T, seq uint32, errno int32) []byte {
 	t.Helper()
 	buf := make([]byte, unix.SizeofNlMsghdr+unix.SizeofNlMsgerr)
@@ -249,4 +340,32 @@ func TestParseIfAddrMsg(t *testing.T) {
 			t.Fatal("parseIfAddrMsg with truncated payload: ok = true, want false")
 		}
 	})
+}
+
+func TestIsNoRouteErrno(t *testing.T) {
+	// parseAckErrno wraps the kernel errno with %w, so test through that shape
+	// (not just the bare errno) to prove errors.Is unwraps it.
+	wrap := func(e error) error { return fmt.Errorf("netlink: error: %w", e) }
+
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"ENETUNREACH is no-route", wrap(unix.ENETUNREACH), true},
+		{"EHOSTUNREACH is no-route", wrap(unix.EHOSTUNREACH), true},
+		{"ENETDOWN is no-route", wrap(unix.ENETDOWN), true},
+		// A malformed-request / unexpected errno must NOT be treated as
+		// "no route yet" -- it has to surface instead of looping forever.
+		{"EINVAL is not no-route", wrap(unix.EINVAL), false},
+		{"EPERM is not no-route", wrap(unix.EPERM), false},
+		{"non-errno error is not no-route", fmt.Errorf("netlink: ack too short"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isNoRouteErrno(tt.err); got != tt.want {
+				t.Errorf("isNoRouteErrno(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
 }
