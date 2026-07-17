@@ -481,7 +481,7 @@ orphaned the running kernel's module directory — reboot to fix that).
   `-dns-proxy` is set but no DNS servers are available from either source. It's started *before*
   `runPrefixDelegation`/`runNDProxy` and returns the map of `-lan` interface → the link-local address it
   actually bound; that map is passed to those two so their RA workers advertise an RFC 8106 RDNSS option
-  (RFC 7084 §L-4, so an IPv6-only SLAAC client gets a DNS server) pointing *only* at addresses this proxy
+  (RFC 7084 §L-11, so an IPv6-only SLAAC client gets a DNS server) pointing *only* at addresses this proxy
   really bound — never a DNS server nothing answers on. A LAN link-local still DAD-tentative at bind time
   (`EADDRNOTAVAIL`) is retried on the tentative cadence; any other bind error (port 53 in use, etc.) fails
   immediately. If `-dhcpv4` is set, `runDHCPv4()` builds one `pkg/dhcpv4.InterfaceConfig`

@@ -7,6 +7,7 @@ Minuteman is an XDP/eBPF-based DS-Lite CPE gateway for Linux.
 
 * DS-Lite B4 datapath using XDP
 * AFTR discovery using DHCPv6 or HB46PP
+* Dynamic B4 source selection, re-selected on WAN address change (optional; omit `-b4`)
 * DHCPv6 Prefix Delegation
 * Neighbor Discovery Proxy
 * Optional DNS proxy
@@ -39,8 +40,8 @@ bin/minuteman
 ```sh
 sudo bin/minuteman \
     -wan <interface> \
-    -b4 <IPv6 address> \
     -lan <interface>=<IPv4 gateway>[/prefix][,mtu] \
+    [-b4 <IPv6 address>] \
     [options]
 ```
 
@@ -49,7 +50,7 @@ sudo bin/minuteman \
 | Option                       | Description                                                                                                                           |
 | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `-wan <interface>`           | WAN interface. Required.                                                                                                              |
-| `-b4 <IPv6 address>`         | B4 IPv6 address used as the local DS-Lite tunnel endpoint. Required.                                                                  |
+| `-b4 <IPv6 address>`         | B4 IPv6 address used as the local DS-Lite tunnel endpoint. Optional: when omitted, it is tracked dynamically from the WAN's kernel-chosen source toward the AFTR (RFC 6724) and re-selected on a WAN address change (RFC 7785). |
 | `-lan <spec>`                | LAN interface in `interface=gateway[/prefix][,mtu]` format. Repeatable and required at least once. The IPv4 prefix defaults to `/24`. |
 | `-aftr <IPv6 address>`       | AFTR address. When omitted, Minuteman discovers it using DHCPv6 or HB46PP.                                                            |
 | `-wan-dst-mac <MAC>`         | Fallback WAN next-hop MAC address when FIB lookup cannot resolve the neighbor.                                                        |

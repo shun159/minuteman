@@ -1,9 +1,10 @@
 # RFC compliance backlog
 
 minuteman works as a DS-Lite B4 (verified end-to-end against the netns rig — see
-`test/netns/README.md`), but measured strictly against RFC 7084 (IPv6 CE Router Requirements) and
-RFC 6333, these gaps remain. Ordered by real-world impact, highest first. Last checked against the
-codebase 2026-07-16.
+`test/netns/README.md`), but measured strictly against the base RFC 7084 (IPv6 CE Router Requirements)
+and RFC 6333, these gaps remain. Ordered by real-world impact, highest first. Last checked against the
+codebase 2026-07-17. (RFC 7084's own updates — RFC 9096 renumbering reaction and RFC 9818 LAN-side
+prefix delegation — are not targeted; see the RFC 9096 item in §6 and `docs/supported-rfcs.md`.)
 
 ## 1. Softwire fragmentation — RFC 6333 §5.3 (MUST) (highest remaining impact)
 
@@ -102,8 +103,16 @@ locally-known egress MTU, not a smaller MTU somewhere further along the IPv6 pat
   RFC 9915 defines only periodic Information-Refresh-Time refresh (§21.23 / §18.2.12), not a
   link/address-change re-discovery trigger — the B4-address-change trigger is the RFC 7785 concern above.)
 - RDNSS is only advertised while `-dns-proxy` is on; with it off (the default), an IPv6-only SLAAC LAN
-  client is DNS-less again (RFC 7084 §L-4). The proxy-less alternative — advertising the WAN-learned
-  upstream resolvers directly in RDNSS — would cover the default configuration too.
+  client is DNS-less again (RFC 7084 §L-11). The proxy-less alternative — advertising the WAN-learned
+  upstream resolvers directly in RDNSS — would cover the default configuration too. Also, §L-11 asks for
+  both RDNSS *and* the DNS Search List (DNSSL) option; minuteman sends only RDNSS.
+- RFC 7084's renumbering update (RFC 9096) isn't implemented, and it is now the most relevant gap given
+  dynamic B4 handles WAN renumbering. Most actionable: L-15/L-16 (LAN SLAAC/DHCPv6-PD lifetimes MUST/SHOULD
+  be capped to the WAN prefix's *remaining* lifetime) — `internal/lanprefix` currently advertises the
+  delegated prefix's own lifetimes without capping to what the WAN prefix has left. Also L-13 (signal
+  stale config) and WPD-9/WPD-10 (don't auto-RELEASE on restart; stable WAN IAID — `pkg/prefixdelegation`
+  already uses a fixed client IAID, so WPD-10 is likely met, but it does send a shutdown Release). RFC 7084's
+  other update, RFC 9818 (LAN-side prefix delegation, LPD-1..LPD-10), is out of scope for a single-tier CPE.
 - RA MTU option (RFC 4861 §4.6.4) isn't advertised.
 - MLD (RFC 3810) is left entirely to the kernel — minuteman forwards no IPv6 multicast of its own. Fine
   for a home gateway; would need revisiting for a router expected to do multicast routing.

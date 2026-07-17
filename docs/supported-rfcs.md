@@ -32,7 +32,7 @@ Provisioning Protocol many Japanese VNEs use instead of the DHCPv6 AFTR-Name —
 | RFC | Title | Support | Notes |
 |-----|-------|:---:|-------|
 | **3736** | Stateless DHCP Service for IPv6 | ✅ | Information-Request used to discover the AFTR-Name / DNS servers (`pkg/dhcpv6`). |
-| **3315** | Dynamic Host Configuration Protocol for IPv6 (DHCPv6) | ✅ | Base client machinery (`pkg/dhcpv6`): retransmission timing (§5.5, §14), message validation, DUID. *Obsoleted by RFC 9915 — the code is written against 3315's structure and section numbers.* |
+| **3315** | Dynamic Host Configuration Protocol for IPv6 (DHCPv6) | ◐ | A 3315-era **client subset** only (`pkg/dhcpv6`): the Information-Request and IA_PD exchanges minuteman needs, with retransmission timing (§5.5, §14), message validation, and DUID — not a full DHCPv6 implementation. *Obsoletion chain: RFC 3315 → RFC 8415 → RFC 9915 (STD 102); the current normative reference is RFC 9915, though the code is written against 3315's structure and section numbers.* |
 | **9915** | Dynamic Host Configuration Protocol for IPv6 (DHCPv6) — STD 102, obsoletes 8415 | ◐ | Current consolidated DHCPv6. Used for the refresh model: Information Refresh Time (§21.23) / Refreshing Configuration Information (§18.2.12), driving periodic AFTR re-discovery. Note: 9915 defines **no** link/address-change re-discovery trigger — that is RFC 7785's concern (see backlog #2 for the §14.2 T1/T2 gap). |
 | **4242** | Information Refresh Time Option for DHCPv6 | ✅ | The refresh-interval hint that paces periodic AFTR re-discovery. |
 | **6334** | DHCPv6 Option for Dual-Stack Lite (`OPTION_AFTR_NAME`) | ✅ | Decoded and resolved to the AFTR address (`pkg/aftrdiscovery`). |
@@ -44,7 +44,7 @@ Provisioning Protocol many Japanese VNEs use instead of the DHCPv6 AFTR-Name —
 
 | RFC | Title | Support | Notes |
 |-----|-------|:---:|-------|
-| **3633** | IPv6 Prefix Options for DHCP version 6 | ✅ | IA_PD / IAPREFIX acquire + Renew/Rebind maintenance (`pkg/prefixdelegation`). T1/T2 = 0 handling is a gap — see backlog #2 (RFC 9915 §14.2). |
+| **3633** | IPv6 Prefix Options for DHCP version 6 | ◐ | IA_PD / IAPREFIX acquire + Renew/Rebind maintenance (`pkg/prefixdelegation`). Not merely a minor gap: T1/T2 = 0 is taken literally, which becomes a renew storm against a server that sends it — see backlog #2 (needs RFC 9915 §14.2 client-timer behavior + invalid-T1/T2 handling). |
 
 ## LAN-facing services
 
@@ -56,7 +56,9 @@ Provisioning Protocol many Japanese VNEs use instead of the DHCPv6 AFTR-Name —
 | **2131** | Dynamic Host Configuration Protocol (DHCPv4) | ◐ | `-dhcpv4` server, directly-attached single subnet per interface (`pkg/dhcpv4`). No BOOTP relay (§giaddr rejected), no shared networks, no restart persistence. DHCPREQUEST substates per §4.3.2, renewal timers per §4.4.5. |
 | **2132** | DHCP Options and BOOTP Vendor Extensions | ✅ | Option TLV codec incl. Interface MTU (§5.1) for the DS-Lite-adjusted MTU. |
 | **3396** | Encoding Long Options in DHCPv4 | ✅ | Values past 255 bytes split across repeated option instances. |
-| **7084** | Basic Requirements for IPv6 Customer Edge Routers | ◐ | Aspirational compliance target. §L-4 (RDNSS to SLAAC clients) drives the RA RDNSS option; several requirements remain open (see backlog). |
+| **7084** | Basic Requirements for IPv6 Customer Edge Routers | ◐ | Aspirational compliance target for the *base* document. §L-11 (DNS via RA, referencing RFC 6106/8106) drives the RA RDNSS option — but minuteman advertises **RDNSS only**, not the DNSSL option L-11 also calls for. Several base requirements remain open (see backlog). The updates below (RFC 9096, RFC 9818) are **not** targeted. |
+| **9096** | Improving the Reaction of Customer Edge Routers to IPv6 Renumbering Events (updates 7084) | ✗ | Not implemented. Adds WPD-9/WPD-10 (WAN: don't auto-RELEASE on restart; stable WAN IAID) and L-13(replaced)/L-15/L-16 (LAN: signal stale config; cap LAN SLAAC/DHCPv6 lifetimes to the WAN prefix's remaining lifetime). Newly relevant given dynamic B4 handles WAN renumbering — see backlog. |
+| **9818** | IPv6 Prefix Delegation on the Local Area Network (updates 7084) | ✗ | Out of scope. Adds LPD-1..LPD-10 (running DHCPv6-PD on the *LAN* side to delegate sub-prefixes to downstream routers). minuteman is a single-tier CPE: LAN hosts SLAAC from one carved /64, no downstream delegation. |
 | **6333** (§ B4 SHOULD) | DNS proxy | ✅ | `-dns-proxy`: opaque UDP/TCP relay to upstream resolvers, bypassing the softwire (`pkg/dnsproxy`). |
 | **7766** | DNS Transport over TCP — Implementation Requirements | ✅ | TCP DNS relayed as a byte stream, so query pipelining (§6.2.1) works for free. |
 
