@@ -20,23 +20,25 @@ support at the B4/AFTR when the IPv6 path can't be guaranteed ≥1540.
 is an `XDP_PASS` fallback to a kernel `ip6tnl` for the decap side specifically, letting the kernel
 reassemble before minuteman ever sees the packet.
 
-## 2. DHCPv6-PD takes the server's T1/T2 literally, including 0 — RFC 3633 §9 / RFC 8415 §18.2.4
+## 2. DHCPv6-PD takes the server's T1/T2 literally, including 0 — RFC 3633 §9 / RFC 9915 §14.2
 
 `pkg/prefixdelegation/maintain.go`'s `Maintain` sleeps until `AcquiredAt + T1` with the
 server-supplied T1 used as-is, and nothing anywhere derives client-side timers: a delegating router
-that sets T1=T2=0 is delegating the renewal timing to the requesting router (RFC 3633 §9), which is
-then supposed to pick its own (RFC 8415 §18.2.4 recommends T1 = 0.5 × and T2 = 0.8 × the shortest
-preferred lifetime). Taken literally, T1=0 makes `sleepUntil` return immediately, so every successful
-Renew flows straight into the next — a busy Renew loop hammering the delegating server for as long as
-it keeps answering (each iteration is one exchange RTT, no sleep at all). T1 > T2 (RFC 8415: such an
-IA_PD is invalid and must be ignored) isn't sanity-checked either, and `tryRenew`'s deadline of
-`AcquiredAt + T2` goes similarly wrong when T2=0.
+that sets T1=T2=0 is delegating the renewal timing to the requesting router (RFC 3633 §9), which
+RFC 9915 §14.2 ("Client Behavior when T1 and/or T2 Are 0") then requires to choose its own times —
+explicitly *not immediately*, and avoiding message storms (0.5 × / 0.8 × the shortest preferred
+lifetime, the ratio DHCPv6 recommends for server-set timers, is the usual choice). Taken literally,
+T1=0 makes `sleepUntil` return immediately, so every successful Renew flows straight into the next — a
+busy Renew loop hammering the delegating server for as long as it keeps answering (each iteration is
+one exchange RTT, no sleep at all). T1 > T2 (RFC 9915 §21.21: a requesting router discards such an
+IA_PD) isn't sanity-checked either, and `tryRenew`'s deadline of `AcquiredAt + T2` goes similarly
+wrong when T2=0.
 
 **Effect:** real delegating routers do send T1=T2=0; against one, minuteman becomes a renew storm.
 Never exercised by the netns rig (its Kea is configured with renew-timer 1800).
 
-**Fix:** when T1 and/or T2 is 0, derive them from the shortest preferred lifetime per RFC 8415
-§18.2.4 (with a sane floor); discard IA_PDs carrying 0 < T2 < T1.
+**Fix:** when T1 and/or T2 is 0, derive them from the shortest preferred lifetime per RFC 9915 §14.2
+(with a sane floor, and no immediate transmit); discard IA_PDs carrying 0 < T2 < T1.
 
 ## 3. Every Renew restarts the LAN RA workers through their shutdown path — RFC 4861 §6.2.5 misapplied
 
