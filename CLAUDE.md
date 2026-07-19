@@ -73,9 +73,10 @@ Not yet implemented:
   fragmentation slow path** feature below): the reassembly half is conformant, the fragmentation half is a
   reachability fallback that fragments the inner IPv4 rather than the RFC-canonical outer IPv6, so it stays
   an open gap. The remaining gaps are in `docs/rfc-compliance-backlog.md`, priority-ordered with the
-  specific code each points at. Non-protocol operability/test-ergonomics improvements (out-of-band stats
-  via a pinned BPF map + a `stats` subcommand, daemon/detach mode) are tracked separately in
-  `docs/operability-backlog.md`.
+  specific code each points at. Non-protocol operability/test-ergonomics improvements are tracked
+  separately in `docs/operability-backlog.md` — its #1 (out-of-band stats via a bpffs-pinned map + the
+  `minuteman stats` subcommand) is done, #2 (daemon/detach) partially (systemd unit example +
+  `-pidfile`; no `sd_notify`).
 
 ## Build commands
 
@@ -127,6 +128,12 @@ need loaded up front.
 
 `run-cpe.sh` and `smoketest.sh` deliberately omit `-aftr` so minuteman discovers it live against the rig —
 pass `-aftr <addr>` as an extra argument to either script to override with a static address instead.
+
+Datapath counters are read out-of-band via `minuteman stats [-json]` against the bpffs-pinned stats map
+(`smoketest.sh`'s assertions do this as before/after deltas through its `read_stat` helper); both scripts
+launch minuteman via `nsenter --net`, *not* `ip netns exec`, because the latter's `/sys` remount would
+strand that pin on an invisible bpffs — see the README's "Reading datapath stats" before changing how
+minuteman is launched.
 
 Two things that will break the rig if changed casually:
 - `mm-cpe` needs both `net.ipv4.ip_forward=1` and `net.ipv6.conf.all.forwarding=1`, or `bpf_fib_lookup()`
@@ -254,10 +261,19 @@ orphaned the running kernel's module directory — reboot to fix that).
     per CPU, fills `ipv6_rss_cpus` (slot → cpu), and sets `ipv6_rss_config{Enabled, CpuCount}`. Off unless
     called (`-ipv6-sw-rss`). `cilium/ebpf` v0.21 has no high-level CPUMAP-with-program value helper, so the
     raw `bpf_cpumap_val` struct bpf2go generated (`bpfBpfCpumapVal`) is `Put` directly.
-  - `stats.go` — `Stats()` sums the `PERCPU_ARRAY` counters across CPUs into a plain `Stats` struct. The
+  - `stats.go` — `Stats()` sums the `PERCPU_ARRAY` counters across CPUs into a plain `Stats` struct (the
+    summing is factored as `sumStats(*ebpf.Map)` so it also runs against a bare map handle). The
     field/index order (`statID` in `stats.go`) must be kept manually in sync with `enum stat_id` in the C
     source — bpf2go can't export a Go enum here because `enum stat_id` never appears as a stored map value
     type in the BTF (only as inlined integer constants), so `-type stat_id` finds nothing.
+  - `pin.go` — `Load()` pins the `stats` map to bpffs (`/sys/fs/bpf/minuteman/stats`) so it stays
+    readable out-of-band while minuteman runs (`minuteman stats [-json]` via `ReadPinnedStats()` in
+    `stats.go`, or `bpftool map dump pinned ...`): a stale pin from a crashed previous run is removed
+    first (unpin-then-repin, `internal/slowpath`'s stale-device stance), pin failure is fail-fast with a
+    bpffs-mount hint, and `Loader.Close` unpins best-effort. Only `stats` is pinned. NB for anything
+    that runs minuteman inside a netns: `ip netns exec` creates a new mount namespace and remounts
+    `/sys`, stranding the pin on a private bpffs — enter with `nsenter --net=...` instead (the netns rig
+    does; see `test/netns/README.md`'s "Reading datapath stats").
   - IPv4/IPv6 addresses are exchanged with the BPF maps as `netip.Addr` at the API boundary; internally they're
     converted to the `in6_u.u6_addr8`/big-endian-`uint32` layouts the generated `bpfB4Config`/`bpfLanConfig`
     structs expect (see `config.go`).
@@ -478,8 +494,15 @@ orphaned the running kernel's module directory — reboot to fix that).
   `-hb46pp-vendor-id`/`-hb46pp-product`/`-hb46pp-version`
   (HB46PP client-identity query parameters — see below; default to the documentation OUI `acde48` since
   minuteman has no IEEE OUI, overridable since a VNE may key rollout/workaround decisions off them, not just
-  statistics). Flag-value
+  statistics), and `-pidfile` (written only after every fail-fast startup step, so its existence means
+  "up", removed on graceful exit — for a supervisor or the test rig; see also
+  `docs/minuteman.service.example`, the systemd way to run minuteman in production). Flag-value
   parsing (`LANSpec`/`LANSpecList`, `AddrList`, MAC parsing) lives in `internal/cliconfig`, not in `main.go` itself.
+  Besides the default flag-driven run, `main()` dispatches one subcommand before `flag.Parse`:
+  `minuteman stats [-json]` (`stats.go`'s `runStats`) prints the datapath counters of the *running*
+  instance from the bpffs-pinned stats map via `datapath.ReadPinnedStats` — text as `Name: value` lines
+  (shell-friendly), `-json` as the `Stats` struct (`jq .DecapMartian`); needs the same root/CAP_BPF the
+  daemon needs.
   `resolveAFTR()` returns `-aftr` parsed directly if given (in which case its second return, the DNS
   servers `-dns-proxy` defaults to using, is nil — that path skips the DHCPv6 exchange entirely), otherwise
   blocks on `pkg/aftrdiscovery.Discover`

@@ -20,6 +20,12 @@
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./common.sh
+# common.sh turns on errexit (set -e) for the setup/teardown scripts that
+# source it, but this script collects failures via check() and must keep
+# going past a failing probe -- the first unguarded non-zero command (e.g.
+# wait on a `timeout`-expired tcpdump returning 124) would otherwise abort
+# the whole run mid-way. Undo it; our own set -uo pipefail above stands.
+set +e
 
 if [[ $EUID -ne 0 ]]; then
     echo "must run as root" >&2
@@ -107,6 +113,20 @@ dslite_capture() {
     DSLITE_PKTS=$(tcpdump -r "$DUALSTACK_PCAP" 2>/dev/null | wc -l)
 }
 
+# read_stat prints one datapath counter by name (e.g. read_stat EncapFragSlow),
+# read out-of-band from the stats map minuteman pins to bpffs
+# (/sys/fs/bpf/minuteman/stats) via the `minuteman stats` subcommand -- no
+# -stats-interval logging or log ownership needed, and it works against a
+# reused instance too. Runs from the host: bpffs pins are mount-namespace
+# state, not netns state (and minuteman is started via nsenter --net below
+# precisely so its pin lands on the host's bpffs). Prints 0 if the counter
+# (or the pin) is missing so callers can do arithmetic unconditionally.
+read_stat() {
+    local v
+    v="$("$MINUTEMAN_BIN" stats 2>/dev/null | awk -v k="$1:" '$1 == k {print $2}')"
+    echo "${v:-0}"
+}
+
 wan_model=dhcpv6-pd
 if [[ -f "$WAN_MODEL_FILE" ]]; then
     wan_model="$(cat "$WAN_MODEL_FILE")"
@@ -159,25 +179,20 @@ if ip netns pids "$NETNS_CPE" 2>/dev/null | xargs -r -I{} readlink -f /proc/{}/e
     echo "== minuteman already running in $NETNS_CPE, reusing it =="
 else
     echo "== starting minuteman in $NETNS_CPE (no -aftr: discovers it live via DHCPv6; $wan_model_flag: acquires/learns IPv6 for the LAN live too) =="
-    # In dual-stack mode we log datapath stats (interval 2s) so the IPv6
-    # fastpath assertion below can read the IPv6-forward counter; otherwise
-    # stats stay off (0) as before. MM_IPV6_SW_RSS=1 additionally enables the
-    # native-IPv6 software-RSS cpumap stage (and its counter assertion).
-    stats_interval=0
+    # Counter assertions below read the bpffs-pinned stats map out-of-band via
+    # `minuteman stats` (see read_stat), so -stats-interval logging stays off.
+    # MM_IPV6_SW_RSS=1 enables the native-IPv6 software-RSS cpumap stage (and
+    # its counter assertion).
     ipv6_rss_flags=()
-    if [[ $dualstack_enabled -eq 1 ]]; then
-        stats_interval=2s
-    fi
-    # The softwire fragmentation checks read the EncapFragSlow/DecapReasmPass
-    # counters from the log, so they need stats on too.
-    if [[ $softwire_frag_enabled -eq 1 ]]; then
-        stats_interval=2s
-    fi
     if [[ "${MM_IPV6_SW_RSS:-0}" == 1 ]]; then
         ipv6_rss_flags=(-ipv6-sw-rss)
-        stats_interval=2s
     fi
-    ip netns exec "$NETNS_CPE" "$MINUTEMAN_BIN" \
+    # nsenter --net rather than `ip netns exec`: the latter also creates a new
+    # mount namespace and remounts /sys, so the stats map minuteman pins at
+    # /sys/fs/bpf/minuteman would land on a private bpffs no later process can
+    # see. nsenter switches only the network namespace, keeping the host's
+    # /sys/fs/bpf, so read_stat (and bpftool) can open the pin from the host.
+    nsenter --net="/var/run/netns/$NETNS_CPE" "$MINUTEMAN_BIN" \
         -wan "$VETH_CPE_ISP" \
         "${b4_flags[@]}" \
         -lan "$VETH_CPE_HOST=${LAN_CPE_ADDR%/*}" \
@@ -185,7 +200,7 @@ else
         "${dns_proxy_flags[@]}" \
         "${dhcpv4_flags[@]}" \
         "${ipv6_rss_flags[@]}" \
-        -stats-interval "$stats_interval" >"$RUNDIR/minuteman.log" 2>&1 &
+        -stats-interval 0 >"$RUNDIR/minuteman.log" 2>&1 &
     minuteman_pid=$!
     started_minuteman=1
     # DHCPv6 discovery includes an RFC 3315 initial random delay (up to 1s)
@@ -368,6 +383,13 @@ wait "$nc_pid" 2>/dev/null
 if [[ $softwire_frag_enabled -eq 1 && $started_minuteman -eq 1 ]]; then
     echo "== Softwire fragmentation (RFC 6333 §5.3): the kernel companion ip6tnl fragments/reassembles what XDP can't =="
 
+    # Snapshot the slow-path counters before generating any traffic, so the
+    # assertions below are deltas -- immune to whatever an earlier check (or a
+    # reused instance) already accumulated.
+    encap_frag0="$(read_stat EncapFragSlow)"
+    reasm_pass0="$(read_stat DecapReasmPass)"
+    martian0="$(read_stat DecapMartian)"
+
     # The companion device and its IPv4 default route must exist while minuteman
     # runs (both are torn down on shutdown).
     check "minuteman created the companion ip6tnl (mm-dslite0) in $NETNS_CPE" \
@@ -405,7 +427,7 @@ if [[ $softwire_frag_enabled -eq 1 && $started_minuteman -eq 1 ]]; then
         'icmp and src 203.0.113.2' >"$frag_pcap" 2>/dev/null &
     frag_tcpdump_pid=$!
     sleep 1
-    ip netns exec "$NETNS_ISP" python3 "$(dirname "$0")/send-softwire-fragments.py" \
+    ip netns exec "$NETNS_ISP" python3 "$PWD/send-softwire-fragments.py" \
         "$wan_mac" "$isp_mac" "$VETH_ISP_CPE" "${CORE_AFTR_ADDR%/*}" "${WAN_CPE_ADDR%/*}"
     wait "$frag_tcpdump_pid" 2>/dev/null
     check "a fragmented softwire packet is reassembled and its inner echo reaches the LAN client" \
@@ -420,23 +442,21 @@ if [[ $softwire_frag_enabled -eq 1 && $started_minuteman -eq 1 ]]; then
         >"$RUNDIR/bounce.log" 2>/dev/null &
     bounce_tcpdump_pid=$!
     sleep 1
-    ip netns exec "$NETNS_ISP" python3 "$(dirname "$0")/send-softwire-fragments.py" \
+    ip netns exec "$NETNS_ISP" python3 "$PWD/send-softwire-fragments.py" \
         "$wan_mac" "$isp_mac" "$VETH_ISP_CPE" "${CORE_AFTR_ADDR%/*}" "${WAN_CPE_ADDR%/*}" martian 8.8.8.8
     wait "$bounce_tcpdump_pid" 2>/dev/null
     check "an off-LAN decapped packet is NOT bounced back into the softwire (no reflection to the AFTR)" \
         bash -c "! grep -q '8.8.8.8' '$RUNDIR/bounce.log'"
 
-    sleep 3 # let a stats: line post after the traffic above
-    frag_stats="$(grep 'stats:' "$RUNDIR/minuteman.log" | tail -n1)"
-    encap_frag="$(sed -n 's/.*EncapFragSlow:\([0-9]*\).*/\1/p' <<<"$frag_stats")"
-    reasm_pass="$(sed -n 's/.*DecapReasmPass:\([0-9]*\).*/\1/p' <<<"$frag_stats")"
-    martian="$(sed -n 's/.*DecapMartian:\([0-9]*\).*/\1/p' <<<"$frag_stats")"
-    check "encap fragmentation slow path was exercised (datapath EncapFragSlow=${encap_frag:-0} > 0)" \
-        test "${encap_frag:-0}" -gt 0
-    check "decap reassembly slow path was exercised (datapath DecapReasmPass=${reasm_pass:-0} > 0)" \
-        test "${reasm_pass:-0}" -gt 0
-    check "the off-LAN decapped packet was dropped in XDP (datapath DecapMartian=${martian:-0} > 0)" \
-        test "${martian:-0}" -gt 0
+    encap_frag="$(read_stat EncapFragSlow)"
+    reasm_pass="$(read_stat DecapReasmPass)"
+    martian="$(read_stat DecapMartian)"
+    check "encap fragmentation slow path was exercised (datapath EncapFragSlow +$((encap_frag - encap_frag0)))" \
+        test "$encap_frag" -gt "$encap_frag0"
+    check "decap reassembly slow path was exercised (datapath DecapReasmPass +$((reasm_pass - reasm_pass0)))" \
+        test "$reasm_pass" -gt "$reasm_pass0"
+    check "the off-LAN decapped packet was dropped in XDP (datapath DecapMartian +$((martian - martian0)))" \
+        test "$martian" -gt "$martian0"
 fi
 
 if [[ $dynamic_b4_enabled -eq 1 && $started_minuteman -eq 1 ]]; then
@@ -484,6 +504,11 @@ fi
 
 if [[ $dualstack_enabled -eq 1 ]]; then
     echo "== Dual-stack (RFC 6333): IPv4 via softwire, IPv6 native -- A vs AAAA =="
+    # Snapshot the IPv6-fastpath counters up front so the assertions at the end
+    # are deltas over just this section's traffic (works against a reused
+    # instance too -- read_stat needs no log ownership).
+    ipv6_fwd0="$(read_stat IPv6Fwd)"
+    ipv6_rss0="$(read_stat IPv6RSSRedirect)"
     # The whole point: a DS-Lite B4 tunnels only IPv4; native IPv6 is forwarded
     # directly. mm-host is dual-stack, mm-inet answers on both families under
     # one name (DUALSTACK_FQDN), and we steer traffic down each path purely by
@@ -532,21 +557,15 @@ if [[ $dualstack_enabled -eq 1 ]]; then
     # Prove that native IPv6 was carried by minuteman's XDP forwarding fastpath
     # -- not the kernel slow path. The reachability/dslite0 checks above hold
     # for either, so here we read the datapath's own IPv6-forward counter from
-    # the logged stats: it advances only when handle_ipv6_forward redirected a
-    # packet in XDP. Only checkable when this script started minuteman (so it
-    # set -stats-interval and owns the log); a reused instance may have stats
-    # disabled.
-    if [[ $started_minuteman -eq 1 ]]; then
-        sleep 3 # let at least one stats: line post after the pings above
-        last_stats="$(grep 'stats:' "$RUNDIR/minuteman.log" | tail -n1)"
-        ipv6_fwd="$(sed -n 's/.*IPv6Fwd:\([0-9]*\).*/\1/p' <<<"$last_stats")"
-        check "native IPv6 was forwarded by the XDP fastpath (datapath IPv6Fwd=${ipv6_fwd:-0} > 0)" \
-            test "${ipv6_fwd:-0}" -gt 0
-        if [[ "${MM_IPV6_SW_RSS:-0}" == 1 ]]; then
-            ipv6_rss="$(sed -n 's/.*IPv6RSSRedirect:\([0-9]*\).*/\1/p' <<<"$last_stats")"
-            check "IPv6 software-RSS fanned native-IPv6 packets across CPUs (datapath IPv6RSSRedirect=${ipv6_rss:-0} > 0)" \
-                test "${ipv6_rss:-0}" -gt 0
-        fi
+    # the pinned stats map: it advances only when handle_ipv6_forward
+    # redirected a packet in XDP.
+    ipv6_fwd="$(read_stat IPv6Fwd)"
+    check "native IPv6 was forwarded by the XDP fastpath (datapath IPv6Fwd +$((ipv6_fwd - ipv6_fwd0)))" \
+        test "$ipv6_fwd" -gt "$ipv6_fwd0"
+    if [[ "${MM_IPV6_SW_RSS:-0}" == 1 ]]; then
+        ipv6_rss="$(read_stat IPv6RSSRedirect)"
+        check "IPv6 software-RSS fanned native-IPv6 packets across CPUs (datapath IPv6RSSRedirect +$((ipv6_rss - ipv6_rss0)))" \
+            test "$ipv6_rss" -gt "$ipv6_rss0"
     fi
 fi
 

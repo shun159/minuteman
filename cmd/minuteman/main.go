@@ -107,6 +107,14 @@ type hb46ppIdentity struct {
 }
 
 func main() {
+	// Subcommand dispatch, before flag.Parse so the flag-only invocation
+	// stays the default (backward-compatible) run behavior.
+	if len(os.Args) > 1 && os.Args[1] == "stats" {
+		if err := runStats(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		log.Fatal(err)
 	}
@@ -141,6 +149,7 @@ func run() error {
 		hb46ppVendorID = flag.String("hb46pp-vendor-id", defaultHB46PPVendorID, "HB46PP vendorid query parameter sent during provisioning discovery fallback (vendor OUI, optionally -suffix)")
 		hb46ppProduct  = flag.String("hb46pp-product", defaultHB46PPProduct, "HB46PP product query parameter sent during provisioning discovery fallback")
 		hb46ppVersion  = flag.String("hb46pp-version", defaultHB46PPVersion, "HB46PP version query parameter sent during provisioning discovery fallback (digits/underscores only)")
+		pidFile        = flag.String("pidfile", "", "write our PID to this file once startup completes and remove it on exit, for a supervisor or test rig to track the instance")
 		lans           cliconfig.LANSpecList
 		dnsServersFlag cliconfig.AddrList
 		dhcpv4DNSFlag  cliconfig.AddrList
@@ -329,6 +338,15 @@ func run() error {
 		runAFTRRediscovery(ctx, dp, tun, b4, dynamicB4, aftrDynamic, *wanIface, wanIfindex, identity, disc, &bgWG)
 	}
 	defer bgWG.Wait()
+
+	// Written only now, after every fail-fast startup step above, so the
+	// file's existence means "up", not "starting".
+	if *pidFile != "" {
+		if err := os.WriteFile(*pidFile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o644); err != nil {
+			return fmt.Errorf("writing -pidfile: %w", err)
+		}
+		defer os.Remove(*pidFile)
+	}
 
 	logStatsUntilDone(ctx, dp, *statsEvery)
 	return nil

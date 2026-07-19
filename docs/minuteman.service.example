@@ -1,0 +1,41 @@
+# Example systemd unit for minuteman (docs/operability-backlog.md #2).
+#
+# minuteman deliberately does not self-daemonize: the init system manages the
+# lifetime. Signal handling for a clean shutdown (SIGTERM) is already built in,
+# so Type=simple is all that's needed; sd_notify readiness is not implemented.
+#
+# Install: copy to /etc/systemd/system/minuteman.service, adjust ExecStart's
+# interfaces/flags for your site, then `systemctl enable --now minuteman`.
+#
+# Runs as root: loading the XDP datapath needs CAP_BPF/CAP_NET_ADMIN, the
+# DHCPv4/NDProxy/RA servers need CAP_NET_RAW raw and packet sockets, and
+# sysctls are written under /proc/sys/net.
+
+[Unit]
+Description=minuteman DS-Lite (RFC 6333) B4 CPE gateway
+Documentation=https://github.com/shun159/minuteman
+# The WAN interface must exist and be up for AFTR discovery to start.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Minimal example: dynamic AFTR discovery, dynamic B4, DHCPv6-PD for the LAN,
+# with the RFC 6333-recommended DNS proxy and a DHCPv4 server for the LAN's
+# private IPv4 side. Adjust interface names and pick flags per `minuteman -h`.
+ExecStart=/usr/local/bin/minuteman \
+    -wan eth0 \
+    -lan eth1=192.168.1.1/24 \
+    -dhcpv6-pd \
+    -dns-proxy \
+    -dhcpv4 \
+    -pidfile /run/minuteman.pid
+Restart=on-failure
+RestartSec=5
+
+# Datapath stats stay readable out-of-band while the service runs:
+#   minuteman stats [-json]
+# (reads the map pinned at /sys/fs/bpf/minuteman/stats).
+
+[Install]
+WantedBy=multi-user.target

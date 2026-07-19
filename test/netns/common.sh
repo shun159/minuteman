@@ -200,8 +200,9 @@ DYNAMIC_B4_FILE="$RUNDIR/dynamic-b4"
 # for kernel reassembly (asserting the inner echo reaches the LAN client + the
 # DecapReasmPass counter). It changes no minuteman flag and adds no topology
 # (every link is already 1500, and the companion ip6tnl minuteman creates
-# itself is what does the work); it only forces -stats-interval on so the
-# counters are logged. Off by default (MM_SOFTWIRE_FRAG unset or "0").
+# itself is what does the work); the counters are read out-of-band from the
+# bpffs-pinned stats map via `minuteman stats` (smoketest.sh's read_stat).
+# Off by default (MM_SOFTWIRE_FRAG unset or "0").
 SOFTWIRE_FRAG_ENABLED_FILE="$RUNDIR/softwire-frag-enabled"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

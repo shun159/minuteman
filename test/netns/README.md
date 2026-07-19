@@ -77,8 +77,9 @@ DHCPv4) and a global SLAAC IPv6 address, resolves the FQDN once per family, and 
 packet count, the positive control) while the `AAAA`/IPv6 ping reaches `mm-inet` natively with *zero*
 packets on `dslite0`. In this mode `smoketest.sh` also proves the native-IPv6 path was carried by
 minuteman's *XDP forwarding fastpath* rather than the kernel slow path (which the dslite0/reachability
-checks alone can't distinguish): it starts minuteman with `-stats-interval 2s` and asserts the logged
-datapath `IPv6Fwd` counter advanced. A further independent toggle, `MM_IPV6_SW_RSS` (`0` default or `1`),
+checks alone can't distinguish): it asserts the datapath `IPv6Fwd` counter advanced across the section,
+read out-of-band from the bpffs-pinned stats map via the `minuteman stats` subcommand (see "Reading
+datapath stats" below). A further independent toggle, `MM_IPV6_SW_RSS` (`0` default or `1`),
 adds `-ipv6-sw-rss` to that invocation and additionally asserts the `IPv6RSSRedirect` counter advanced
 (the cpumap fanout engaged). Composes with all four toggles above; pairs naturally with `MM_DHCPV4=1` for
 the "host has both a DHCPv4 and an IPv6 address" case.
@@ -96,7 +97,7 @@ data-path check — which only passes if the switch actually took. Composes with
 An eighth independent toggle, `MM_SOFTWIRE_FRAG` (`0` default or `1`), exercises the softwire
 fragmentation slow path (RFC 6333 §5.3) in both directions. It changes no minuteman flag and adds no
 topology — every link is already 1500, and the companion `ip6tnl` minuteman creates in `mm-cpe` is what
-does the work — it only forces `-stats-interval` on so the counters are logged. `smoketest.sh` then (a)
+does the work — the counters are read out-of-band via `minuteman stats`. `smoketest.sh` then (a)
 checks the companion device and its IPv4 default route exist, (b) sends an oversized *non-DF* ping so the
 encap must `XDP_PASS` it to the kernel to fragment (asserting reachability + `EncapFragSlow`) while a *DF*
 one still gets an ICMPv4 Fragmentation-Needed, and (c) hand-crafts a fragmented softwire packet toward the
@@ -106,6 +107,24 @@ inner echo reaches the LAN client and reappears in `DecapReasmPass`. Composes wi
 
 `run-cpe.sh` and `smoketest.sh` deliberately omit `-aftr` so minuteman discovers it live against the rig —
 pass `-aftr <addr>` as an extra argument to either script to override with a static address instead.
+
+## Reading datapath stats
+
+While minuteman runs, the datapath's per-path counters are readable out-of-band from the stats map it
+pins to bpffs — no `-stats-interval` logging or ownership of its stdout needed:
+
+```sh
+sudo bin/minuteman stats            # one `Name: value` line per counter
+sudo bin/minuteman stats -json      # e.g. ... | jq .DecapMartian
+sudo bpftool map dump pinned /sys/fs/bpf/minuteman/stats
+```
+
+This is why both scripts start minuteman via `nsenter --net=/var/run/netns/mm-cpe` rather than
+`ip netns exec mm-cpe`: the latter also creates a new mount namespace and remounts `/sys`, so the pin
+would land on a private bpffs no later process can see. `nsenter --net` switches only the network
+namespace, keeping the host's `/sys/fs/bpf`, so the commands above work from the host while the rig runs
+(pins are mount-namespace state, not netns state). `smoketest.sh`'s counter assertions (`read_stat`) are
+before/after deltas over this same subcommand.
 
 Two things worth knowing if you touch these scripts:
 - `mm-cpe` needs both `net.ipv4.ip_forward=1` and `net.ipv6.conf.all.forwarding=1`, or `bpf_fib_lookup()` in
