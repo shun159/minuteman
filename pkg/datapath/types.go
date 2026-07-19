@@ -73,4 +73,12 @@ type Stats struct {
 	AffinityInsert     uint64
 	AffinityInsertFail uint64
 	AffinityPinned     uint64 // packets held on the old AFTR during DRAINING
+
+	// Softwire fragmentation slow path (RFC 6333 §5.3): packets XDP hands to
+	// the kernel for the companion ip6tnl to fragment/reassemble rather than
+	// dropping. See bpf/datapath.bpf.c's STAT_ENCAP_FRAG_SLOW et al.
+	EncapFragSlow  uint64 // oversized non-DF inner IPv4: kernel frags + encaps
+	DecapFragSlow  uint64 // decapped inner too big for a non-DF LAN egress
+	DecapReasmPass uint64 // fragmented softwire IPv6: kernel reassembles + decaps
+	DecapMartian   uint64 // decapped inner resolves off-LAN (would bounce): dropped
 }

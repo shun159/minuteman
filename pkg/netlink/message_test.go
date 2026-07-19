@@ -142,6 +142,180 @@ func TestBuildRouteMessage(t *testing.T) {
 	}
 }
 
+func TestBuildRouteMessageIPv4Default(t *testing.T) {
+	// The IPv4 default route internal/slowpath points at the companion ip6tnl:
+	// family AF_INET, Dst_len 0, and NO RTA_DST (only RTA_OIF).
+	dst := netip.MustParsePrefix("0.0.0.0/0")
+	msg := buildRouteMessage(unix.RTM_NEWROUTE, unix.NLM_F_REQUEST|unix.NLM_F_ACK, 1, 12, dst)
+
+	rt := msg[unix.SizeofNlMsghdr:]
+	if rt[0] != unix.AF_INET {
+		t.Errorf("rtmsg.Family = %d, want AF_INET", rt[0])
+	}
+	if rt[1] != 0 {
+		t.Errorf("rtmsg.Dst_len = %d, want 0", rt[1])
+	}
+
+	attrs := rt[unix.SizeofRtMsg:]
+	// The single attribute must be RTA_OIF -- a default route carries no RTA_DST.
+	attrType := binary.NativeEndian.Uint16(attrs[2:4])
+	attrLen := binary.NativeEndian.Uint16(attrs[0:2])
+	if attrType != unix.RTA_OIF || attrLen != unix.SizeofRtAttr+4 {
+		t.Fatalf("first attr = {len %d, type %d}, want {%d, RTA_OIF}", attrLen, attrType, unix.SizeofRtAttr+4)
+	}
+	if got := binary.NativeEndian.Uint32(attrs[unix.SizeofRtAttr : unix.SizeofRtAttr+4]); got != 12 {
+		t.Errorf("RTA_OIF = %d, want 12", got)
+	}
+	// Exactly one attribute: rtmsg header + one RTA_OIF, nothing more.
+	if len(attrs) != nlmsgAlign(int(attrLen)) {
+		t.Errorf("route body has %d trailing attr bytes, want just RTA_OIF (%d)", len(attrs), nlmsgAlign(int(attrLen)))
+	}
+}
+
+func TestBuildAddIP6TnlMessage(t *testing.T) {
+	local := netip.MustParseAddr("fd00:1::2")
+	remote := netip.MustParseAddr("fd00:2::2")
+	flags := uint16(unix.NLM_F_REQUEST | unix.NLM_F_ACK | unix.NLM_F_CREATE | unix.NLM_F_EXCL)
+	msg := buildAddIP6TnlMessage(7, flags, "mm-dslite0", local, remote, 1460)
+
+	if got := binary.NativeEndian.Uint16(msg[4:6]); got != unix.RTM_NEWLINK {
+		t.Errorf("nlmsghdr.Type = %d, want RTM_NEWLINK", got)
+	}
+	if got := binary.NativeEndian.Uint16(msg[6:8]); got != flags {
+		t.Errorf("nlmsghdr.Flags = %#x, want %#x", got, flags)
+	}
+	if got := binary.NativeEndian.Uint32(msg[0:4]); int(got) != len(msg) {
+		t.Errorf("nlmsghdr.Len = %d, want %d", got, len(msg))
+	}
+
+	ifi := msg[unix.SizeofNlMsghdr:]
+	if ifi[0] != unix.AF_UNSPEC {
+		t.Errorf("ifinfomsg.Family = %d, want AF_UNSPEC", ifi[0])
+	}
+	if got := binary.NativeEndian.Uint32(ifi[4:8]); got != 0 {
+		t.Errorf("ifinfomsg.Index = %d, want 0 (kernel assigns on create)", got)
+	}
+
+	attrs := map[uint16][]byte{}
+	walkAttrs(t, ifi[unix.SizeofIfInfomsg:], attrs)
+
+	if name := attrs[unix.IFLA_IFNAME]; string(name) != "mm-dslite0\x00" {
+		t.Errorf("IFLA_IFNAME = %q, want %q", name, "mm-dslite0\x00")
+	}
+	if mtu := attrs[unix.IFLA_MTU]; len(mtu) != 4 || binary.NativeEndian.Uint32(mtu) != 1460 {
+		t.Errorf("IFLA_MTU = %v, want 1460", mtu)
+	}
+
+	linfo, ok := attrs[unix.IFLA_LINKINFO]
+	if !ok {
+		t.Fatal("IFLA_LINKINFO absent")
+	}
+	info := map[uint16][]byte{}
+	walkAttrs(t, linfo, info)
+	if kind := info[unix.IFLA_INFO_KIND]; string(kind) != "ip6tnl\x00" {
+		t.Errorf("IFLA_INFO_KIND = %q, want %q", kind, "ip6tnl\x00")
+	}
+
+	data, ok := info[unix.IFLA_INFO_DATA]
+	if !ok {
+		t.Fatal("IFLA_INFO_DATA absent")
+	}
+	tun := map[uint16][]byte{}
+	walkAttrs(t, data, tun)
+
+	wantLocal := local.As16()
+	if got := tun[iflaIPTunLocal]; !slices.Equal(got, wantLocal[:]) {
+		t.Errorf("IFLA_IPTUN_LOCAL = %v, want %v", got, wantLocal)
+	}
+	wantRemote := remote.As16()
+	if got := tun[iflaIPTunRemote]; !slices.Equal(got, wantRemote[:]) {
+		t.Errorf("IFLA_IPTUN_REMOTE = %v, want %v", got, wantRemote)
+	}
+	if got := tun[iflaIPTunProto]; len(got) != 1 || got[0] != unix.IPPROTO_IPIP {
+		t.Errorf("IFLA_IPTUN_PROTO = %v, want [%d]", got, unix.IPPROTO_IPIP)
+	}
+	if got := tun[iflaIPTunFlags]; len(got) != 4 || binary.NativeEndian.Uint32(got) != ip6TnlIgnEncapLimit {
+		t.Errorf("IFLA_IPTUN_FLAGS = %v, want IGN_ENCAP_LIMIT (%#x)", got, ip6TnlIgnEncapLimit)
+	}
+}
+
+func TestBuildChangeIP6TnlMessage(t *testing.T) {
+	local := netip.MustParseAddr("fd00:1::9")
+	remote := netip.MustParseAddr("fd00:2::2")
+	msg := buildChangeIP6TnlMessage(4, 21, local, remote)
+
+	if got := binary.NativeEndian.Uint16(msg[4:6]); got != unix.RTM_NEWLINK {
+		t.Errorf("nlmsghdr.Type = %d, want RTM_NEWLINK", got)
+	}
+	// A changelink must NOT carry NLM_F_CREATE/NLM_F_EXCL: it targets an
+	// existing device by index, and must fail rather than create if it's gone.
+	flags := binary.NativeEndian.Uint16(msg[6:8])
+	if flags&(unix.NLM_F_CREATE|unix.NLM_F_EXCL) != 0 {
+		t.Errorf("flags = %#x, must not include NLM_F_CREATE/NLM_F_EXCL", flags)
+	}
+
+	ifi := msg[unix.SizeofNlMsghdr:]
+	if got := binary.NativeEndian.Uint32(ifi[4:8]); got != 21 {
+		t.Errorf("ifinfomsg.Index = %d, want 21", got)
+	}
+	// No IFLA_IFNAME on a changelink (identified by index), just IFLA_LINKINFO.
+	attrs := map[uint16][]byte{}
+	walkAttrs(t, ifi[unix.SizeofIfInfomsg:], attrs)
+	if _, ok := attrs[unix.IFLA_IFNAME]; ok {
+		t.Error("changelink unexpectedly carries IFLA_IFNAME")
+	}
+	if _, ok := attrs[unix.IFLA_LINKINFO]; !ok {
+		t.Error("changelink missing IFLA_LINKINFO")
+	}
+}
+
+func TestBuildSetLinkUpMessage(t *testing.T) {
+	msg := buildSetLinkUpMessage(2, 21)
+	if got := binary.NativeEndian.Uint16(msg[4:6]); got != unix.RTM_NEWLINK {
+		t.Errorf("nlmsghdr.Type = %d, want RTM_NEWLINK", got)
+	}
+	ifi := msg[unix.SizeofNlMsghdr:]
+	if got := binary.NativeEndian.Uint32(ifi[4:8]); got != 21 {
+		t.Errorf("ifinfomsg.Index = %d, want 21", got)
+	}
+	if got := binary.NativeEndian.Uint32(ifi[8:12]); got&unix.IFF_UP == 0 {
+		t.Errorf("ifinfomsg.Flags = %#x, want IFF_UP set", got)
+	}
+	if got := binary.NativeEndian.Uint32(ifi[12:16]); got&unix.IFF_UP == 0 {
+		t.Errorf("ifinfomsg.Change = %#x, want IFF_UP set", got)
+	}
+}
+
+func TestBuildDelLinkMessage(t *testing.T) {
+	msg := buildDelLinkMessage(3, 21)
+	if got := binary.NativeEndian.Uint16(msg[4:6]); got != unix.RTM_DELLINK {
+		t.Errorf("nlmsghdr.Type = %d, want RTM_DELLINK", got)
+	}
+	ifi := msg[unix.SizeofNlMsghdr:]
+	if got := binary.NativeEndian.Uint32(ifi[4:8]); got != 21 {
+		t.Errorf("ifinfomsg.Index = %d, want 21", got)
+	}
+}
+
+// walkAttrs decodes a run of netlink attributes into out{type: value}, following
+// the same TLV+4-byte-alignment layout encodeRtAttr/encodeNestedAttr produce.
+func walkAttrs(t *testing.T, buf []byte, out map[uint16][]byte) {
+	t.Helper()
+	for len(buf) >= unix.SizeofRtAttr {
+		attrLen := binary.NativeEndian.Uint16(buf[0:2])
+		attrType := binary.NativeEndian.Uint16(buf[2:4])
+		if int(attrLen) < unix.SizeofRtAttr || int(attrLen) > len(buf) {
+			t.Fatalf("walkAttrs: bad attr length %d (%d remaining)", attrLen, len(buf))
+		}
+		out[attrType] = buf[unix.SizeofRtAttr:attrLen]
+		next := nlmsgAlign(int(attrLen))
+		if next > len(buf) {
+			break
+		}
+		buf = buf[next:]
+	}
+}
+
 func TestBuildGetRouteMessage(t *testing.T) {
 	dst := netip.MustParseAddr("2001:db8:aa::1")
 	msg := buildGetRouteMessage(9, 4, dst)

@@ -143,6 +143,11 @@ dynamic_b4_enabled=0
 if [[ -f "$DYNAMIC_B4_FILE" && "$(cat "$DYNAMIC_B4_FILE")" == 1 ]]; then
     dynamic_b4_enabled=1
 fi
+
+softwire_frag_enabled=0
+if [[ -f "$SOFTWIRE_FRAG_ENABLED_FILE" && "$(cat "$SOFTWIRE_FRAG_ENABLED_FILE")" == 1 ]]; then
+    softwire_frag_enabled=1
+fi
 # -b4 is omitted under MM_DYNAMIC_B4=1 (minuteman selects it dynamically); pinned
 # to WAN_CPE_ADDR otherwise.
 b4_flags=(-b4 "${WAN_CPE_ADDR%/*}")
@@ -161,6 +166,11 @@ else
     stats_interval=0
     ipv6_rss_flags=()
     if [[ $dualstack_enabled -eq 1 ]]; then
+        stats_interval=2s
+    fi
+    # The softwire fragmentation checks read the EncapFragSlow/DecapReasmPass
+    # counters from the log, so they need stats on too.
+    if [[ $softwire_frag_enabled -eq 1 ]]; then
         stats_interval=2s
     fi
     if [[ "${MM_IPV6_SW_RSS:-0}" == 1 ]]; then
@@ -354,6 +364,80 @@ sleep 0.3
 check "LAN client can reach a TCP service on the simulated internet host" \
     ip netns exec "$NETNS_HOST" curl -sf --max-time 3 "http://${PUBLIC_INET_ADDR%/*}:8080/"
 wait "$nc_pid" 2>/dev/null
+
+if [[ $softwire_frag_enabled -eq 1 && $started_minuteman -eq 1 ]]; then
+    echo "== Softwire fragmentation (RFC 6333 §5.3): the kernel companion ip6tnl fragments/reassembles what XDP can't =="
+
+    # The companion device and its IPv4 default route must exist while minuteman
+    # runs (both are torn down on shutdown).
+    check "minuteman created the companion ip6tnl (mm-dslite0) in $NETNS_CPE" \
+        ip netns exec "$NETNS_CPE" ip link show mm-dslite0
+    check "minuteman installed the IPv4 default route via mm-dslite0" \
+        bash -c "ip netns exec $NETNS_CPE ip route show default | grep -q 'dev mm-dslite0'"
+
+    # Encap direction: an oversized *non-DF* inner IPv4 packet (1500B, -M dont)
+    # exceeds the softwire's usable MTU (WAN 1500 - 40), so the encap must
+    # XDP_PASS it to the kernel, which fragments the IPv4 to the tunnel MTU and
+    # the ip6tnl encapsulates each piece. It must still reach the internet host.
+    check "oversized non-DF traffic reaches the internet host via the fragmentation slow path" \
+        ip netns exec "$NETNS_HOST" ping -M dont -s 1472 -c 2 -W 2 -I "$VETH_HOST_CPE" "${PUBLIC_INET_ADDR%/*}"
+
+    # A *DF* oversized packet gets an ICMPv4 Fragmentation Needed (PMTUD), so it
+    # doesn't get through. NB: this is a deliberate deviation from RFC 6333 §5.3
+    # (errata 5847), which would have the B4 tunnel-fragment the outer IPv6 and
+    # ignore the inner DF bit -- the kernel ip6tnl can't do that (backlog #4), and
+    # minuteman's advertised WAN-40 LAN MTU makes an oversized DF packet a
+    # misbehaving-client case anyway, for which PMTUD signalling is reasonable.
+    if ip netns exec "$NETNS_HOST" ping -M do -s 1472 -c 1 -W 1 -I "$VETH_HOST_CPE" "${PUBLIC_INET_ADDR%/*}" >/dev/null 2>&1; then
+        check "oversized DF traffic is NOT silently fragmented (expected it to fail)" false
+    else
+        check "oversized DF traffic gets ICMP Frag Needed (PMTUD; not tunnel-fragmented -- backlog #4)" true
+    fi
+
+    # Decap direction: hand-craft a fragmented softwire packet (a real Linux AFTR
+    # never emits outer-IPv6 fragments) toward the B4. The decap must XDP_PASS
+    # both fragments so the kernel reassembles them and the ip6tnl decapsulates
+    # the result, delivering the inner ICMP echo to the LAN client (which replies).
+    wan_mac="$(ip netns exec "$NETNS_CPE" cat "/sys/class/net/$VETH_CPE_ISP/address")"
+    isp_mac="$(ip netns exec "$NETNS_ISP" cat "/sys/class/net/$VETH_ISP_CPE/address")"
+    frag_pcap="$RUNDIR/frag-inner.log"
+    ip netns exec "$NETNS_HOST" timeout 5 tcpdump -i "$VETH_HOST_CPE" -n -c 1 \
+        'icmp and src 203.0.113.2' >"$frag_pcap" 2>/dev/null &
+    frag_tcpdump_pid=$!
+    sleep 1
+    ip netns exec "$NETNS_ISP" python3 "$(dirname "$0")/send-softwire-fragments.py" \
+        "$wan_mac" "$isp_mac" "$VETH_ISP_CPE" "${CORE_AFTR_ADDR%/*}" "${WAN_CPE_ADDR%/*}"
+    wait "$frag_tcpdump_pid" 2>/dev/null
+    check "a fragmented softwire packet is reassembled and its inner echo reaches the LAN client" \
+        grep -q "203.0.113.2 > 192.168.1" "$frag_pcap"
+
+    # The softwire slow path's IPv4 default route (via mm-dslite0) must not make
+    # the B4 a reflector: a decapped inner IPv4 whose destination is off-LAN would
+    # otherwise be routed straight back into the tunnel. Send one such packet (inner
+    # dst 8.8.8.8) and confirm the decap drops it (STAT_DECAP_MARTIAN) rather than
+    # bouncing it back toward the AFTR.
+    ip netns exec "$NETNS_AFTR" timeout 4 tcpdump -i "$VETH_AFTR_ISP" -n 'ip6 proto 4 and dst host fd00:2::2' \
+        >"$RUNDIR/bounce.log" 2>/dev/null &
+    bounce_tcpdump_pid=$!
+    sleep 1
+    ip netns exec "$NETNS_ISP" python3 "$(dirname "$0")/send-softwire-fragments.py" \
+        "$wan_mac" "$isp_mac" "$VETH_ISP_CPE" "${CORE_AFTR_ADDR%/*}" "${WAN_CPE_ADDR%/*}" martian 8.8.8.8
+    wait "$bounce_tcpdump_pid" 2>/dev/null
+    check "an off-LAN decapped packet is NOT bounced back into the softwire (no reflection to the AFTR)" \
+        bash -c "! grep -q '8.8.8.8' '$RUNDIR/bounce.log'"
+
+    sleep 3 # let a stats: line post after the traffic above
+    frag_stats="$(grep 'stats:' "$RUNDIR/minuteman.log" | tail -n1)"
+    encap_frag="$(sed -n 's/.*EncapFragSlow:\([0-9]*\).*/\1/p' <<<"$frag_stats")"
+    reasm_pass="$(sed -n 's/.*DecapReasmPass:\([0-9]*\).*/\1/p' <<<"$frag_stats")"
+    martian="$(sed -n 's/.*DecapMartian:\([0-9]*\).*/\1/p' <<<"$frag_stats")"
+    check "encap fragmentation slow path was exercised (datapath EncapFragSlow=${encap_frag:-0} > 0)" \
+        test "${encap_frag:-0}" -gt 0
+    check "decap reassembly slow path was exercised (datapath DecapReasmPass=${reasm_pass:-0} > 0)" \
+        test "${reasm_pass:-0}" -gt 0
+    check "the off-LAN decapped packet was dropped in XDP (datapath DecapMartian=${martian:-0} > 0)" \
+        test "${martian:-0}" -gt 0
+fi
 
 if [[ $dynamic_b4_enabled -eq 1 && $started_minuteman -eq 1 ]]; then
     echo "== Dynamic B4 (RFC 7785 B4-address change): a WAN-address change re-selects the softwire source =="

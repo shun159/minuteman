@@ -35,6 +35,10 @@ const (
 	statAffinityInsert
 	statAffinityInsertFail
 	statAffinityPinned
+	statEncapFragSlow
+	statDecapFragSlow
+	statDecapReasmPass
+	statDecapMartian
 	statMax
 )
 
@@ -70,6 +74,11 @@ func (l *Loader) Stats() (Stats, error) {
 		statAffinityInsert:     &s.AffinityInsert,
 		statAffinityInsertFail: &s.AffinityInsertFail,
 		statAffinityPinned:     &s.AffinityPinned,
+
+		statEncapFragSlow:  &s.EncapFragSlow,
+		statDecapFragSlow:  &s.DecapFragSlow,
+		statDecapReasmPass: &s.DecapReasmPass,
+		statDecapMartian:   &s.DecapMartian,
 	}
 
 	for id, dst := range fields {

@@ -63,7 +63,7 @@ type Config struct {
 
 	// RDNSSAddr, when valid, adds a Recursive DNS Server option (RFC 8106)
 	// to every RA pointing LAN clients at it. It must be an address a DNS
-	// proxy is *actually* listening on (RFC 7084 §L-4) -- so the caller
+	// proxy is *actually* listening on (RFC 7084 §L-11) -- so the caller
 	// passes the concrete link-local address pkg/dnsproxy bound, not a mere
 	// "advertise RDNSS" flag: advertising a DNS server nothing answers on
 	// would be worse than advertising none, and having Serve independently

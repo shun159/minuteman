@@ -88,9 +88,10 @@ func NewSourceLinkLayerAddress(mac net.HardwareAddr) []byte {
 }
 
 // NewRDNSS builds a Recursive DNS Server option (RFC 8106 §5.1) listing
-// servers, valid for lifetime (truncated to whole seconds). RFC 7084 §L-4
-// requires an IPv6-only SLAAC LAN client be given a DNS server some way; this
-// is the RA-carried way (the alternative, DHCPv6 stateless service, isn't
+// servers, valid for lifetime (truncated to whole seconds). RFC 7084 §L-11
+// requires an IPv6-only SLAAC LAN client be given a DNS server some way (via
+// RDNSS and/or DNSSL); this is the RA-carried RDNSS way (the alternative,
+// DHCPv6 stateless service, isn't
 // something this project's LAN side runs). Per RFC 8106 §5.1 the address
 // list needn't be global -- the router's own link-local address is
 // explicitly permitted, which is what this project's callers use, so RDNSS

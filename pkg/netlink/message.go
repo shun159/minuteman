@@ -30,6 +30,19 @@ func encodeRtAttr(attrType uint16, payload []byte) []byte {
 	return buf
 }
 
+// encodeNestedAttr encodes a container attribute (e.g. IFLA_LINKINFO) whose
+// payload is itself a run of already-encoded child attributes. Because
+// encodeRtAttr pads every attribute to a 4-byte boundary, the children can be
+// concatenated as-is and the result stays aligned -- so this is just
+// encodeRtAttr over the joined children.
+func encodeNestedAttr(attrType uint16, children ...[]byte) []byte {
+	var payload []byte
+	for _, c := range children {
+		payload = append(payload, c...)
+	}
+	return encodeRtAttr(attrType, payload)
+}
+
 // buildAddrMessage builds a complete RTM_NEWADDR/RTM_DELADDR netlink
 // request (see rtnetlink(7)): an nlmsghdr, an ifaddrmsg, and IFA_LOCAL/
 // IFA_ADDRESS attributes both set to addr -- matching what `ip addr add`/
@@ -62,18 +75,30 @@ func buildGetAddrMessage(seq uint32) []byte {
 // buildRouteMessage builds a complete RTM_NEWROUTE/RTM_DELROUTE netlink
 // request for a route to dst out ifindex, with no gateway (RTA_OIF only):
 // scope RT_SCOPE_LINK and no RTA_GATEWAY, matching what `ip route add
-// <dst> dev <iface>` sends for a directly-attached destination.
+// <dst> dev <iface>` sends for a directly-attached destination. The address
+// family follows dst: an IPv4 prefix (Is4) is emitted as AF_INET with a
+// 4-byte RTA_DST, everything else as AF_INET6 with a 16-byte one -- so the
+// same builder serves both the IPv6 /128 host routes internal/wanextend
+// installs and the IPv4 default route internal/slowpath points at the
+// companion ip6tnl. A default route (Bits == 0) carries no RTA_DST at all:
+// Dst_len 0 already means "all destinations", and omitting the attribute is
+// what `ip route add default dev <iface>` sends.
 func buildRouteMessage(rtmType uint16, flags uint16, seq uint32, ifindex int, dst netip.Prefix) []byte {
-	dstAddr := dst.Addr().As16()
-	rtaDst := encodeRtAttr(unix.RTA_DST, dstAddr[:])
+	family := uint8(unix.AF_INET6)
+	dstBytes := func() []byte { a := dst.Addr().As16(); return a[:] }()
+	if dst.Addr().Is4() {
+		family = unix.AF_INET
+		a := dst.Addr().As4()
+		dstBytes = a[:]
+	}
 
 	oif := make([]byte, 4)
 	binary.NativeEndian.PutUint32(oif, uint32(ifindex))
 	rtaOif := encodeRtAttr(unix.RTA_OIF, oif)
 
-	body := make([]byte, 0, unix.SizeofRtMsg+len(rtaDst)+len(rtaOif))
+	body := make([]byte, 0, unix.SizeofRtMsg+unix.SizeofRtAttr+len(dstBytes)+len(rtaOif))
 	body = append(body,
-		unix.AF_INET6,      // Family
+		family,             // Family
 		uint8(dst.Bits()),  // Dst_len
 		0,                  // Src_len
 		0,                  // Tos
@@ -83,7 +108,9 @@ func buildRouteMessage(rtmType uint16, flags uint16, seq uint32, ifindex int, ds
 		unix.RTN_UNICAST,   // Type
 	)
 	body = binary.NativeEndian.AppendUint32(body, 0) // Flags
-	body = append(body, rtaDst...)
+	if dst.Bits() > 0 {
+		body = append(body, encodeRtAttr(unix.RTA_DST, dstBytes)...)
+	}
 	body = append(body, rtaOif...)
 
 	return buildMessage(rtmType, flags, seq, body)
@@ -120,6 +147,96 @@ func buildGetRouteMessage(seq uint32, ifindex int, dst netip.Addr) []byte {
 	body = append(body, rtaOif...)
 
 	return buildMessage(unix.RTM_GETROUTE, unix.NLM_F_REQUEST, seq, body)
+}
+
+// ip6tnl (RFC 6333 companion softwire device) rtnetlink attribute codes and
+// flag, from <linux/if_tunnel.h>/<linux/ip6_tunnel.h>. golang.org/x/sys/unix
+// doesn't export the IFLA_IPTUN_* enum, so -- as pkg/routeradvert vendors
+// ICMP6_FILTER and bpf/uapi vendors the datapath's UAPI macros -- they're
+// defined here.
+const (
+	iflaIPTunLocal  = 2 // IPv6 source (the B4 address)
+	iflaIPTunRemote = 3 // IPv6 destination (the AFTR address)
+	iflaIPTunFlags  = 8 // __u32 IP6_TNL_F_* flags
+	iflaIPTunProto  = 9 // __u8 encapsulated L4 proto: IPPROTO_IPIP => "ipip6"
+
+	// ip6TnlIgnEncapLimit is IP6_TNL_F_IGN_ENCAP_LIMIT: don't prepend an
+	// RFC 2473 Tunnel-Encapsulation-Limit destination-options header. This is
+	// `encaplimit none`, and it's mandatory here for the same reason the AFTR
+	// simulator sets it (see test/netns/setup.sh): minuteman's XDP decap
+	// expects the inner IPv4 immediately after the outer IPv6 header
+	// (nexthdr == IPPROTO_IPIP), with no intervening extension header.
+	ip6TnlIgnEncapLimit = 0x1
+)
+
+// buildIfInfoBody builds a 16-byte ifinfomsg with the given index/flags/change,
+// the common header of every RTM_*LINK message this package builds.
+func buildIfInfoBody(ifindex int, flags, change uint32) []byte {
+	body := make([]byte, unix.SizeofIfInfomsg)
+	body[0] = unix.AF_UNSPEC
+	binary.NativeEndian.PutUint32(body[4:8], uint32(ifindex)) // Index
+	binary.NativeEndian.PutUint32(body[8:12], flags)          // Flags
+	binary.NativeEndian.PutUint32(body[12:16], change)        // Change
+	return body
+}
+
+// buildIP6TnlLinkInfo builds the IFLA_LINKINFO attribute for an ip6tnl in
+// ipip6 (IPv4-in-IPv6) mode with the given softwire endpoints:
+// {IFLA_INFO_KIND="ip6tnl", IFLA_INFO_DATA{LOCAL, REMOTE, PROTO=IPPROTO_IPIP,
+// FLAGS=IGN_ENCAP_LIMIT}}. Shared by create and change (changelink) requests.
+func buildIP6TnlLinkInfo(local, remote netip.Addr) []byte {
+	l := local.As16()
+	r := remote.As16()
+
+	flagsBuf := make([]byte, 4)
+	binary.NativeEndian.PutUint32(flagsBuf, ip6TnlIgnEncapLimit)
+
+	data := encodeNestedAttr(unix.IFLA_INFO_DATA,
+		encodeRtAttr(iflaIPTunLocal, l[:]),
+		encodeRtAttr(iflaIPTunRemote, r[:]),
+		encodeRtAttr(iflaIPTunProto, []byte{unix.IPPROTO_IPIP}),
+		encodeRtAttr(iflaIPTunFlags, flagsBuf),
+	)
+	kind := encodeRtAttr(unix.IFLA_INFO_KIND, []byte("ip6tnl\x00"))
+	return encodeNestedAttr(unix.IFLA_LINKINFO, kind, data)
+}
+
+// buildAddIP6TnlMessage builds an RTM_NEWLINK request creating an ip6tnl named
+// name with the given endpoints and MTU -- the rtnetlink equivalent of
+// `ip link add name <name> type ip6tnl mode ipip6 local <local> remote
+// <remote> encaplimit none mtu <mtu>`. The caller supplies NLM_F_CREATE|
+// NLM_F_EXCL in flags.
+func buildAddIP6TnlMessage(seq uint32, flags uint16, name string, local, remote netip.Addr, mtu int) []byte {
+	mtuBuf := make([]byte, 4)
+	binary.NativeEndian.PutUint32(mtuBuf, uint32(mtu))
+
+	body := buildIfInfoBody(0, 0, 0)
+	body = append(body, encodeRtAttr(unix.IFLA_IFNAME, []byte(name+"\x00"))...)
+	body = append(body, encodeRtAttr(unix.IFLA_MTU, mtuBuf)...)
+	body = append(body, buildIP6TnlLinkInfo(local, remote)...)
+	return buildMessage(unix.RTM_NEWLINK, flags, seq, body)
+}
+
+// buildChangeIP6TnlMessage builds an RTM_NEWLINK request (changelink, no
+// NLM_F_CREATE) repointing an existing ip6tnl identified by ifindex at new
+// softwire endpoints -- so a WAN renumbering or AFTR migration updates the
+// companion device in place, keeping the IPv4 default route that points at it.
+func buildChangeIP6TnlMessage(seq uint32, ifindex int, local, remote netip.Addr) []byte {
+	body := buildIfInfoBody(ifindex, 0, 0)
+	body = append(body, buildIP6TnlLinkInfo(local, remote)...)
+	return buildMessage(unix.RTM_NEWLINK, unix.NLM_F_REQUEST|unix.NLM_F_ACK, seq, body)
+}
+
+// buildSetLinkUpMessage builds an RTM_NEWLINK request setting ifindex IFF_UP.
+func buildSetLinkUpMessage(seq uint32, ifindex int) []byte {
+	body := buildIfInfoBody(ifindex, unix.IFF_UP, unix.IFF_UP)
+	return buildMessage(unix.RTM_NEWLINK, unix.NLM_F_REQUEST|unix.NLM_F_ACK, seq, body)
+}
+
+// buildDelLinkMessage builds an RTM_DELLINK request deleting ifindex.
+func buildDelLinkMessage(seq uint32, ifindex int) []byte {
+	body := buildIfInfoBody(ifindex, 0, 0)
+	return buildMessage(unix.RTM_DELLINK, unix.NLM_F_REQUEST|unix.NLM_F_ACK, seq, body)
 }
 
 // parseRoutePrefsrc parses an RTM_GETROUTE reply (rtmsg, header stripped) and

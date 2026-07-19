@@ -93,6 +93,17 @@ deprecates the first (`preferred_lft 0`), waits out minuteman's 30s `watchB4` po
 NAT-state-follows-the-address step a real AFTR does via its own B4 re-learning), and re-runs the DS-Lite
 data-path check — which only passes if the switch actually took. Composes with the other toggles.
 
+An eighth independent toggle, `MM_SOFTWIRE_FRAG` (`0` default or `1`), exercises the softwire
+fragmentation slow path (RFC 6333 §5.3) in both directions. It changes no minuteman flag and adds no
+topology — every link is already 1500, and the companion `ip6tnl` minuteman creates in `mm-cpe` is what
+does the work — it only forces `-stats-interval` on so the counters are logged. `smoketest.sh` then (a)
+checks the companion device and its IPv4 default route exist, (b) sends an oversized *non-DF* ping so the
+encap must `XDP_PASS` it to the kernel to fragment (asserting reachability + `EncapFragSlow`) while a *DF*
+one still gets an ICMPv4 Fragmentation-Needed, and (c) hand-crafts a fragmented softwire packet toward the
+B4 with `send-softwire-fragments.py` (a real Linux AFTR never emits outer-IPv6 fragments, so it can't be
+driven from the rig's own traffic) so the decap must `XDP_PASS` it for kernel reassembly — asserting the
+inner echo reaches the LAN client and reappears in `DecapReasmPass`. Composes with the other toggles.
+
 `run-cpe.sh` and `smoketest.sh` deliberately omit `-aftr` so minuteman discovers it live against the rig —
 pass `-aftr <addr>` as an extra argument to either script to override with a static address instead.
 
@@ -108,7 +119,8 @@ Two things worth knowing if you touch these scripts:
   Likewise the `dhcp-range=::,constructor:<iface>,ra-only` form is required (not bare `::`) or dnsmasq
   never actually replies to Router Solicitations despite logging that RA is enabled.
 
-The AFTR's decap step uses a kernel `ip6tnl` (mode `ipip6`) device, which needs the `ip6_tunnel` module.
+The AFTR's decap step — and, since the softwire fragmentation slow path, minuteman's own companion device
+in `mm-cpe` — uses a kernel `ip6tnl` (mode `ipip6`) device, which needs the `ip6_tunnel` module.
 `setup.sh` checks for it up front with a specific diagnostic for the common Arch situation where a kernel
 package upgrade has replaced `/lib/modules/<old-version>/` before a reboot, leaving the currently *running*
 kernel without a matching module directory (`uname -r` disagrees with what's on disk) — reboot to fix that.
@@ -127,6 +139,10 @@ verified passing from a fresh setup for:
   and confirming a LAN client caches the advertised path MTU
 - `MM_DYNAMIC_B4=1` (against `dhcpv6` AFTR discovery + `dhcpv6-pd`): startup dynamic B4 selection plus the
   WAN-renumbering hard-switch and softwire recovery, all end-to-end
+- `MM_SOFTWIRE_FRAG=1` (against `dhcpv6` AFTR discovery + `dhcpv6-pd`): both fragmentation directions
+  end-to-end — an oversized non-DF ping fragmented via the companion `ip6tnl` (with `EncapFragSlow`
+  advancing), a DF one still refused with ICMPv4 Fragmentation-Needed, and a hand-crafted fragmented
+  softwire packet reassembled and delivered to the LAN client (with `DecapReasmPass` advancing)
 - the default (all toggles off), re-run after the `xdp_dslite_encap` non-unicast-bypass change to confirm
   no regression
 
