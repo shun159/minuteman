@@ -3,25 +3,14 @@
 minuteman works as a DS-Lite B4 (verified end-to-end against the netns rig — see
 `test/netns/README.md`), but measured strictly against the base RFC 7084 (IPv6 CE Router Requirements)
 and RFC 6333, these gaps remain. Ordered by real-world impact, highest first. Last checked against the
-codebase 2026-07-17. (RFC 7084's own updates — RFC 9096 renumbering reaction and RFC 9818 LAN-side
+codebase 2026-07-18. (RFC 7084's own updates — RFC 9096 renumbering reaction and RFC 9818 LAN-side
 prefix delegation — are not targeted; see the RFC 9096 item in §6 and `docs/supported-rfcs.md`.)
 
-## 1. Softwire fragmentation — RFC 6333 §5.3 (MUST) (highest remaining impact)
+Softwire fragmentation (RFC 6333 §5.3) is now *partially* addressed by the `internal/slowpath` companion
+`ip6tnl` — the reassembly half is RFC-conformant, the fragmentation half is not; it remains a real gap,
+tracked as §4 below (see also `CLAUDE.md`).
 
-`bpf/datapath.bpf.c`'s `xdp_dslite_encap` drops (rather than fragments) an oversized non-DF inner IPv4
-packet (`STAT_MTU_DROP` → `XDP_DROP`). `xdp_dslite_decap` can't reassemble a fragmented softwire IPv6
-packet either — `parse_l2_ipv6` doesn't walk the IPv6 fragment extension header, so `nexthdr == 44`
-packets fall through to `XDP_PASS` with no reassembly behind that.
-
-**Effect:** works in practice whenever the ISP's IPv6 path MTU is ≥1500 and LAN clients respect
-DHCPv4-advertised MTU (option 26)/PMTUD, but is not RFC 6333 §5.3-compliant, which mandates fragmentation
-support at the B4/AFTR when the IPv6 path can't be guaranteed ≥1540.
-
-**Fix direction:** true in-XDP fragmentation/reassembly is a substantial undertaking; a cheaper first cut
-is an `XDP_PASS` fallback to a kernel `ip6tnl` for the decap side specifically, letting the kernel
-reassemble before minuteman ever sees the packet.
-
-## 2. DHCPv6-PD takes the server's T1/T2 literally, including 0 — RFC 3633 §9 / RFC 9915 §14.2
+## 1. DHCPv6-PD takes the server's T1/T2 literally, including 0 — RFC 3633 §9 / RFC 9915 §14.2
 
 `pkg/prefixdelegation/maintain.go`'s `Maintain` sleeps until `AcquiredAt + T1` with the
 server-supplied T1 used as-is, and nothing anywhere derives client-side timers: a delegating router
@@ -41,7 +30,7 @@ Never exercised by the netns rig (its Kea is configured with renew-timer 1800).
 **Fix:** when T1 and/or T2 is 0, derive them from the shortest preferred lifetime per RFC 9915 §14.2
 (with a sane floor, and no immediate transmit); discard IA_PDs carrying 0 < T2 < T1.
 
-## 3. Every Renew restarts the LAN RA workers through their shutdown path — RFC 4861 §6.2.5 misapplied
+## 2. Every Renew restarts the LAN RA workers through their shutdown path — RFC 4861 §6.2.5 misapplied
 
 `internal/lanprefix.RAManager.Sync` deliberately restarts every RA worker on every lease change (to
 pick up refreshed lifetimes — its comment claims restarting has no churn equivalent to `Reconcile`'s),
@@ -61,22 +50,47 @@ right.
 pointer consulted per send) so a Renew never restarts the worker; or plumb a "restarting, not shutting
 down" signal that suppresses the final RA.
 
-## 4. Tunnel-originated ICMPv4: no Time Exceeded, and the B4 well-known address is unused — RFC 1812 §5.3.1, RFC 6333 §5.7 + RFC 7335
+## 3. Tunnel-originated ICMPv4: decap-side Time Exceeded, and the B4 well-known address is unused — RFC 1812 §5.3.1, RFC 6333 §5.7 + RFC 7335
 
 Two related gaps around ICMPv4 the B4 itself must originate:
 
-- **Inner TTL expiry produces no Time Exceeded** (RFC 1812 §5.3.1 MUST). `xdp_dslite_encap` XDP_PASSes
-  an inner TTL≤1 packet to the kernel, but a DS-Lite CPE kernel typically has no IPv4 default route,
-  so the kernel answers Destination Unreachable instead — traceroute from a LAN client through the
-  softwire terminates at the first hop with `!N`. `xdp_dslite_decap` XDP_PASSes the
-  *still-encapsulated* packet (its TTL check is pre-decap), which the kernel can't parse past (no
-  ip6tnl is bound to nexthdr 4), so inbound traceroute gets no reply at all at the B4 hop.
+- **Inner TTL expiry — outbound now handled, inbound still not** (RFC 1812 §5.3.1 MUST).
+  `xdp_dslite_encap` XDP_PASSes an inner TTL≤1 packet to the kernel; since the softwire fragmentation
+  slow path added the companion `ip6tnl` and an IPv4 default route through it (`internal/slowpath`),
+  the kernel now has a route to forward toward and answers **ICMPv4 Time Exceeded** for the expiry
+  (verified against the netns rig — a LAN `ping -t 1` gets Time Exceeded from the CPE, where it used to
+  get Destination Unreachable). What remains is the **decap** side: `xdp_dslite_decap` XDP_PASSes the
+  *still-encapsulated* packet on an inner-TTL check that runs pre-decap, but the companion ip6tnl
+  decapsulates it (its outer header is `nexthdr == IPPROTO_IPIP`) and then the inner TTL≤1 packet is
+  dropped by the kernel's own forwarding without a softwire-re-encapsulated Time Exceeded going back to
+  the original IPv4 sender, so inbound traceroute still gets no reply at the B4 hop.
 - **192.0.0.2 unused** (RFC 6333 §5.7 + RFC 7335): the B4's tunnel-side ICMP (today only its ICMPv4
   Fragmentation-Needed replies) is sourced from the LAN gateway's private IPv4 instead of the
   well-known B4 address.
 
-**Effect:** traceroute and PMTUD-adjacent tooling misbehave in both directions at the B4 hop;
-reachability itself unaffected.
+**Effect:** inbound traceroute and PMTUD-adjacent tooling still misbehave at the B4 hop; reachability
+itself unaffected.
+
+## 4. Softwire fragmentation is inner-IPv4, not RFC-canonical outer-IPv6 — RFC 6333 §5.3 (errata 5847) / RFC 2473 §7.2(b)
+
+`internal/slowpath`'s companion `ip6tnl` handles the *reassembly* half correctly (fragmented softwire IPv6
+is `XDP_PASS`ed, the kernel reassembles before the ip6tnl decapsulates — exactly §5.3's "reassembly MUST
+happen before decapsulation"). The *fragmentation* half is not RFC-canonical. RFC 6333 §5.3 (with the
+original "The inner IPv4 packet MUST NOT be fragmented; fragmentation MUST happen after encapsulation",
+and errata 5847 pointing at RFC 2473 §7.2(b), ignoring the DF bit) requires the B4 to fragment the *outer
+IPv6* tunnel packet after encapsulation. Linux's `ip6tnl` cannot do that — it either PMTUD-signals (ICMPv4
+Fragmentation-Needed) or, with the tunnel MTU set to WAN−40 as here, lets the kernel's IPv4 forwarding
+fragment the **inner IPv4** before encapsulation. So minuteman's encap slow path fragments the inner IPv4
+for a **non-DF** oversized packet (which §5.3 says MUST NOT be done, though it preserves reachability) and
+sends ICMPv4 Fragmentation-Needed for a **DF** one (which §5.3 says should instead be tunnel-fragmented,
+ignoring DF).
+
+**Effect:** in practice benign — minuteman advertises a reduced LAN MTU (DHCPv4 option 26 = WAN−40), so
+well-behaved clients never emit an oversized inner packet, and the slow path is only a fallback for clients
+that ignore it (non-DF: fragmented and delivered; DF: told to reduce via PMTUD). But it is not §5.3-conformant
+on the fragmentation side, and true conformance needs a custom outer-IPv6 fragmentation/reassembly path
+(in XDP or a userspace raw socket) rather than the kernel tunnel — the "substantial undertaking" this item
+originally called out.
 
 ## 5. Tunnel ICMPv6 relay — RFC 2473 §8
 
@@ -86,6 +100,11 @@ original IPv4 sender. The encap path's own proactive `bpf_check_mtu`-based PtB o
 locally-known egress MTU, not a smaller MTU somewhere further along the IPv6 path.
 
 ## 6. Minor / acceptable for a home CPE
+
+- During an AFTR graceful migration's drain window the softwire slow-path companion device is repointed at
+  the *new* AFTR at cutover, so a *draining* flow's own fragments (a rare corner: fragmentation overlapping
+  a migration) fall to the kernel with the old remote and are dropped until the flow finishes — the fast
+  path's dual-AFTR decap is unaffected.
 
 - AFTR re-discovery flips the AFTR each refresh when the AFTR *name* has several AAAA records: the
   no-op check compares one resolved address (`aftrdiscovery` returns `addrs[0]`), not set membership.

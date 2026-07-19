@@ -23,7 +23,7 @@ Provisioning Protocol many Japanese VNEs use instead of the DHCPv6 AFTR-Name —
 
 | RFC | Title | Support | Notes |
 |-----|-------|:---:|-------|
-| **6333** | Dual-Stack Lite Broadband Deployments Following IPv4 Exhaustion | ◐ | B4 element: XDP encap/decap datapath, MTU/PMTUD handling. Gaps: §5.3 softwire fragmentation (not done), §5.7 well-known B4 address 192.0.0.2 (unused). See backlog #1, #4. |
+| **6333** | Dual-Stack Lite Broadband Deployments Following IPv4 Exhaustion | ◐ | B4 element: XDP encap/decap datapath, MTU/PMTUD handling. §5.3 fragmentation is only *partially* met via a kernel companion `ip6tnl` (`internal/slowpath`): the reassembly half is conformant (kernel reassembles a fragmented softwire before the ip6tnl decaps), but the fragmentation half is not — the kernel tunnel fragments the **inner IPv4** (which §5.3/errata 5847 says MUST NOT happen) for non-DF and PMTUD-signals for DF, rather than fragmenting the **outer IPv6**. Gaps: §5.3 outer fragmentation (backlog #4), §5.7 well-known B4 address 192.0.0.2 (backlog #3). |
 | **7785** | Recommendations for Prefix Binding in the Context of Softwire Dual-Stack Lite | ◐ | Basis for **dynamic B4**: on a WAN (B4) address change minuteman re-selects the source and hard-switches. §4 Rec 3 (AFTR migrates NAT state to the new B4) is relied on when the AFTR provides it, else flows break. §4 Rec 4 (PCP ANNOUNCE) ✗ — minuteman has no PCP. |
 | **2473** | Generic Packet Tunneling in IPv6 | ○ | DS-Lite uses `nexthdr = IPPROTO_IPIP` directly (no encapsulation-limit option). Reactive ICMPv6-error → ICMPv4 relay (§8) is ✗ (backlog #5). |
 
@@ -33,7 +33,7 @@ Provisioning Protocol many Japanese VNEs use instead of the DHCPv6 AFTR-Name —
 |-----|-------|:---:|-------|
 | **3736** | Stateless DHCP Service for IPv6 | ✅ | Information-Request used to discover the AFTR-Name / DNS servers (`pkg/dhcpv6`). |
 | **3315** | Dynamic Host Configuration Protocol for IPv6 (DHCPv6) | ◐ | A 3315-era **client subset** only (`pkg/dhcpv6`): the Information-Request and IA_PD exchanges minuteman needs, with retransmission timing (§5.5, §14), message validation, and DUID — not a full DHCPv6 implementation. *Obsoletion chain: RFC 3315 → RFC 8415 → RFC 9915 (STD 102); the current normative reference is RFC 9915, though the code is written against 3315's structure and section numbers.* |
-| **9915** | Dynamic Host Configuration Protocol for IPv6 (DHCPv6) — STD 102, obsoletes 8415 | ◐ | Current consolidated DHCPv6. Used for the refresh model: Information Refresh Time (§21.23) / Refreshing Configuration Information (§18.2.12), driving periodic AFTR re-discovery. Note: 9915 defines **no** link/address-change re-discovery trigger — that is RFC 7785's concern (see backlog #2 for the §14.2 T1/T2 gap). |
+| **9915** | Dynamic Host Configuration Protocol for IPv6 (DHCPv6) — STD 102, obsoletes 8415 | ◐ | Current consolidated DHCPv6. Used for the refresh model: Information Refresh Time (§21.23) / Refreshing Configuration Information (§18.2.12), driving periodic AFTR re-discovery. Note: 9915 defines **no** link/address-change re-discovery trigger — that is RFC 7785's concern (see backlog #1 for the §14.2 T1/T2 gap). |
 | **4242** | Information Refresh Time Option for DHCPv6 | ✅ | The refresh-interval hint that paces periodic AFTR re-discovery. |
 | **6334** | DHCPv6 Option for Dual-Stack Lite (`OPTION_AFTR_NAME`) | ✅ | Decoded and resolved to the AFTR address (`pkg/aftrdiscovery`). |
 | **1035** | Domain Names — Implementation and Specification | ○ | Wire-format decode of the AFTR-Name (compression pointers rejected, per RFC 3315 §8). |
@@ -44,7 +44,7 @@ Provisioning Protocol many Japanese VNEs use instead of the DHCPv6 AFTR-Name —
 
 | RFC | Title | Support | Notes |
 |-----|-------|:---:|-------|
-| **3633** | IPv6 Prefix Options for DHCP version 6 | ◐ | IA_PD / IAPREFIX acquire + Renew/Rebind maintenance (`pkg/prefixdelegation`). Not merely a minor gap: T1/T2 = 0 is taken literally, which becomes a renew storm against a server that sends it — see backlog #2 (needs RFC 9915 §14.2 client-timer behavior + invalid-T1/T2 handling). |
+| **3633** | IPv6 Prefix Options for DHCP version 6 | ◐ | IA_PD / IAPREFIX acquire + Renew/Rebind maintenance (`pkg/prefixdelegation`). Not merely a minor gap: T1/T2 = 0 is taken literally, which becomes a renew storm against a server that sends it — see backlog #1 (needs RFC 9915 §14.2 client-timer behavior + invalid-T1/T2 handling). |
 
 ## LAN-facing services
 
@@ -68,8 +68,8 @@ Provisioning Protocol many Japanese VNEs use instead of the DHCPv6 AFTR-Name —
 |-----|-------|:---:|-------|
 | **4443** | ICMPv6 for IPv6 | ◐ | In-datapath Packet Too Big origination with per-CPU token-bucket rate-limiting (§2.4(f)). Quote is fixed-size (invoking header + 8 bytes), not "as much as fits in the min MTU". |
 | **791** | Internet Protocol | ○ | Minimum IPv4 MTU (68 B) as the DHCPv4 Interface-MTU floor. |
-| **1812** | Requirements for IP Version 4 Routers | ✗ | §5.3.1 inner-TTL Time Exceeded from the B4 is a known gap (backlog #4). |
-| **7335** | IPv4 Service Continuity Prefix | ✗ | The 192.0.0.0/29 realm / 192.0.0.2 B4 address is not yet used (backlog #4). |
+| **1812** | Requirements for IP Version 4 Routers | ◐ | §5.3.1 inner-TTL Time Exceeded: the outbound (encap) direction is now answered by the kernel via the softwire slow path's IPv4 default route; the inbound (decap) direction is still a gap (backlog #3). |
+| **7335** | IPv4 Service Continuity Prefix | ✗ | The 192.0.0.0/29 realm / 192.0.0.2 B4 address is not yet used (backlog #3). |
 
 ## Test rig / documentation conventions only
 

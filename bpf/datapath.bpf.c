@@ -247,6 +247,17 @@ enum stat_id {
     STAT_AFFINITY_INSERT,
     STAT_AFFINITY_INSERT_FAIL,
     STAT_AFFINITY_PINNED,
+    /*
+     * Softwire fragmentation slow path (RFC 6333 §5.3). XDP itself neither
+     * fragments nor reassembles; instead it hands the packet to the kernel,
+     * where a companion ip6tnl (local=B4, remote=AFTR) plus an IPv4 default
+     * route do the work. Counted separately so the netns rig can assert the
+     * slow path is actually exercised.
+     */
+    STAT_ENCAP_FRAG_SLOW,  /* oversized non-DF inner IPv4: kernel frags + encaps */
+    STAT_DECAP_FRAG_SLOW,  /* decapped inner too big for a non-DF LAN egress */
+    STAT_DECAP_REASM_PASS, /* fragmented softwire IPv6: kernel reassembles + decaps */
+    STAT_DECAP_MARTIAN,    /* decapped inner resolves off-LAN (would bounce): dropped */
     STAT_MAX,
 };
 
@@ -1053,8 +1064,16 @@ xdp_dslite_encap(struct xdp_md *ctx)
             return send_plain_icmp_frag_needed(ctx, l2_len, inner_iph, lan->gateway_ip,
                                                (__u16)next_mtu);
 
-        increase_stats_count(STAT_MTU_DROP);
-        return XDP_DROP;
+        /*
+         * Oversized but fragmentable (non-DF): RFC 6333 §5.3 requires the B4
+         * to fragment rather than drop. XDP can't, so hand the untouched inner
+         * IPv4 packet to the kernel, whose IPv4 default route toward the
+         * companion ip6tnl fragments it to the tunnel MTU and encapsulates each
+         * piece. The packet is unmodified here (encap adjust_head is below), so
+         * XDP_PASS delivers it pristine.
+         */
+        increase_stats_count(STAT_ENCAP_FRAG_SLOW);
+        return XDP_PASS;
     }
     if (ret != 0)
         return XDP_DROP;
@@ -1145,6 +1164,7 @@ enum lan_lookup_result {
     LAN_LOOKUP_FAIL = 0,
     LAN_LOOKUP_OK = 1,
     LAN_LOOKUP_FRAG_NEEDED = 2,
+    LAN_LOOKUP_DROP = 3,
 };
 
 static __always_inline int
@@ -1161,8 +1181,18 @@ lookup_lan_nexthop(struct xdp_md *ctx, const struct b4_config *cfg,
             return LAN_LOOKUP_FAIL;
         }
         if (!get_lan_config(fib->ifindex)) {
-            increase_stats_count(STAT_NO_LAN_CONFIG);
-            return LAN_LOOKUP_FAIL;
+            /*
+             * The decapped inner IPv4 resolves to a forwarding egress that
+             * isn't a managed LAN -- since the softwire slow path added an IPv4
+             * default route via the companion ip6tnl, an unexpected inner
+             * destination (not a LAN client, not local) now resolves straight
+             * back into that tunnel. XDP_PASSing it would let the kernel
+             * re-encapsulate it toward the AFTR (a reflection); drop it instead.
+             * Local delivery to the CPE itself is BPF_FIB_LKUP_RET_NOT_FWDED, a
+             * different branch below, so this never drops a packet meant for us.
+             */
+            increase_stats_count(STAT_DECAP_MARTIAN);
+            return LAN_LOOKUP_DROP;
         }
         if (ret == BPF_FIB_LKUP_RET_SUCCESS) {
             increase_stats_count(STAT_FIB_SUCCESS);
@@ -1173,11 +1203,24 @@ lookup_lan_nexthop(struct xdp_md *ctx, const struct b4_config *cfg,
         return LAN_LOOKUP_FRAG_NEEDED;
     }
 
-    if (ret == BPF_FIB_LKUP_RET_NO_NEIGH)
-        increase_stats_count(STAT_FIB_NO_NEIGH);
-    else
-        increase_stats_count(STAT_FIB_FAIL);
+    if (ret == BPF_FIB_LKUP_RET_NO_NEIGH) {
+        /*
+         * The route resolved but has no neighbor yet. For a managed LAN that's
+         * a client not in the neighbor table -- XDP_PASS so the kernel resolves
+         * ND and delivers. But the companion ip6tnl is a NOARP point-to-point
+         * device, so the IPv4 default route through it can surface here too;
+         * that (like the SUCCESS case above) is an off-LAN martian that must be
+         * dropped, not passed into the kernel to bounce back through the tunnel.
+         */
+        if (fib->ifindex != cfg->wan_ifindex && get_lan_config(fib->ifindex)) {
+            increase_stats_count(STAT_FIB_NO_NEIGH);
+            return LAN_LOOKUP_FAIL;
+        }
+        increase_stats_count(STAT_DECAP_MARTIAN);
+        return LAN_LOOKUP_DROP;
+    }
 
+    increase_stats_count(STAT_FIB_FAIL);
     return LAN_LOOKUP_FAIL;
 }
 
@@ -1339,6 +1382,11 @@ handle_xdp_dslite_decap(struct xdp_md *ctx)
         lookup_lan_nexthop(ctx, cfg, inner_iph_pre, inner_len, &fib, &fib_mtu);
     bool fast = lan_lookup == LAN_LOOKUP_OK;
 
+    /* Off-LAN martian (would bounce back into the softwire) -- drop before
+     * decap rather than XDP_PASS it into the kernel's default route. */
+    if (lan_lookup == LAN_LOOKUP_DROP)
+        return XDP_DROP;
+
     if (lan_lookup == LAN_LOOKUP_FRAG_NEEDED) {
         struct lan_config *out_lan = get_lan_config(fib.ifindex);
         if (!out_lan) {
@@ -1356,8 +1404,14 @@ handle_xdp_dslite_decap(struct xdp_md *ctx)
             return send_dslite_icmp_frag_needed(ctx, cfg, inner_iph_pre,
                                                 out_lan->gateway_ip, (__u16)next_mtu);
 
-        increase_stats_count(STAT_MTU_DROP);
-        return XDP_DROP;
+        /*
+         * Fragmentable (non-DF) but too big for the LAN egress: hand the still-
+         * encapsulated packet to the kernel (adjust_head hasn't run yet), where
+         * the companion ip6tnl decaps it and the IPv4 layer fragments toward the
+         * LAN rather than dropping (RFC 6333 §5.3).
+         */
+        increase_stats_count(STAT_DECAP_FRAG_SLOW);
+        return XDP_PASS;
     }
 
     if (fast) {
@@ -1380,8 +1434,10 @@ handle_xdp_dslite_decap(struct xdp_md *ctx)
                 return send_dslite_icmp_frag_needed(ctx, cfg, inner_iph_pre,
                                                     out_lan->gateway_ip, (__u16)next_mtu);
 
-            increase_stats_count(STAT_MTU_DROP);
-            return XDP_DROP;
+            /* Non-DF and too big for the LAN egress: same slow path as above --
+             * the kernel ip6tnl decaps and IPv4-fragments toward the LAN. */
+            increase_stats_count(STAT_DECAP_FRAG_SLOW);
+            return XDP_PASS;
         }
         if (ret != 0)
             return XDP_DROP;
@@ -1450,6 +1506,18 @@ xdp_dslite_decap(struct xdp_md *ctx)
     }
     if (parsed == 0) {
         increase_stats_count(STAT_DECAP_PASS);
+        return XDP_PASS;
+    }
+
+    /*
+     * A fragmented softwire packet (IPv6 fragment header) addressed to us:
+     * XDP can't reassemble, so hand it to the kernel, where the companion
+     * ip6tnl reassembles and decapsulates it (RFC 6333 §5.3). Checked before
+     * the native-IPv6 branch so it's an explicit, countable slow path rather
+     * than an incidental XDP_PASS out of handle_ipv6_forward's FIB lookup.
+     */
+    if (outer_iph->nexthdr == IPPROTO_FRAGMENT && find_dslite_peer_nh(outer_iph)) {
+        increase_stats_count(STAT_DECAP_REASM_PASS);
         return XDP_PASS;
     }
 

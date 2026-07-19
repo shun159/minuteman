@@ -1,8 +1,10 @@
 // Package netlink is a minimal, hand-rolled AF_NETLINK/NETLINK_ROUTE
 // client covering exactly what this project's CPE policy layers
-// (internal/lanprefix, internal/wanextend) need: assigning/removing IPv6
-// addresses, listing an interface's current addresses, and installing/
-// removing routes. No netlink library dependency, matching this project's
+// (internal/lanprefix, internal/wanextend, internal/slowpath) need:
+// assigning/removing IPv6 addresses, listing an interface's current
+// addresses, installing/removing routes, and creating/tearing down the
+// DS-Lite companion ip6tnl device. No netlink library dependency, matching
+// this project's
 // no-sidecar, no-external-process ethos (pkg/datapath/sysctl.go avoids
 // `sysctl` exec the same way, internal/lanprefix originally avoided a
 // netlink library the same way before this package was split out of it).
@@ -17,8 +19,9 @@ import (
 )
 
 // Socket is a single AF_NETLINK/NETLINK_ROUTE socket used to send
-// RTM_NEWADDR/RTM_DELADDR/RTM_GETADDR/RTM_NEWROUTE/RTM_DELROUTE requests
-// and read back their acks or dump responses. Not safe for concurrent use.
+// RTM_NEWADDR/RTM_DELADDR/RTM_GETADDR/RTM_NEWROUTE/RTM_DELROUTE and
+// RTM_NEWLINK/RTM_DELLINK requests and read back their acks or dump responses.
+// Not safe for concurrent use.
 type Socket struct {
 	fd  int
 	seq uint32
@@ -162,9 +165,11 @@ func isNoRouteErrno(err error) bool {
 		errors.Is(err, unix.ENETDOWN)
 }
 
-// AddRoute installs a route to dst (typically a /128 host route) out
-// ifindex, directly attached (no gateway), via RTM_NEWROUTE. NLM_F_REPLACE
-// makes this idempotent, matching AddAddr.
+// AddRoute installs a route to dst out ifindex, directly attached (no
+// gateway), via RTM_NEWROUTE. NLM_F_REPLACE makes this idempotent, matching
+// AddAddr. dst may be IPv4 or IPv6 (the family follows the prefix): an IPv6
+// /128 host route for internal/wanextend, or the IPv4 default route (0.0.0.0/0)
+// internal/slowpath points at the companion ip6tnl.
 func (s *Socket) AddRoute(ifindex int, dst netip.Prefix) error {
 	flags := uint16(unix.NLM_F_REQUEST | unix.NLM_F_ACK | unix.NLM_F_CREATE | unix.NLM_F_REPLACE)
 	s.seq++
@@ -176,6 +181,40 @@ func (s *Socket) DelRoute(ifindex int, dst netip.Prefix) error {
 	flags := uint16(unix.NLM_F_REQUEST | unix.NLM_F_ACK)
 	s.seq++
 	return s.sendAndAck(buildRouteMessage(unix.RTM_DELROUTE, flags, s.seq, ifindex, dst), s.seq)
+}
+
+// AddIP6Tnl creates an ip6tnl device named name in ipip6 (IPv4-in-IPv6) mode
+// with softwire endpoints local (the B4 address) and remote (the AFTR), MTU
+// mtu, and `encaplimit none` -- the companion slow-path device the kernel uses
+// to fragment/reassemble softwire traffic XDP hands up (RFC 6333 §5.3). Fails
+// if a device by that name already exists (NLM_F_EXCL); callers delete a stale
+// one first. An EOPNOTSUPP here means the ip6_tunnel kernel module is
+// unavailable.
+func (s *Socket) AddIP6Tnl(name string, local, remote netip.Addr, mtu int) error {
+	flags := uint16(unix.NLM_F_REQUEST | unix.NLM_F_ACK | unix.NLM_F_CREATE | unix.NLM_F_EXCL)
+	s.seq++
+	return s.sendAndAck(buildAddIP6TnlMessage(s.seq, flags, name, local, remote, mtu), s.seq)
+}
+
+// SetIP6TnlEndpoints repoints an existing ip6tnl (identified by ifindex) at new
+// softwire endpoints via a changelink, in place -- so a WAN renumbering or AFTR
+// migration updates the device without tearing down the IPv4 default route that
+// points at it.
+func (s *Socket) SetIP6TnlEndpoints(ifindex int, local, remote netip.Addr) error {
+	s.seq++
+	return s.sendAndAck(buildChangeIP6TnlMessage(s.seq, ifindex, local, remote), s.seq)
+}
+
+// SetLinkUp brings ifindex administratively up (IFF_UP).
+func (s *Socket) SetLinkUp(ifindex int) error {
+	s.seq++
+	return s.sendAndAck(buildSetLinkUpMessage(s.seq, ifindex), s.seq)
+}
+
+// DelLink deletes the network device ifindex (RTM_DELLINK).
+func (s *Socket) DelLink(ifindex int) error {
+	s.seq++
+	return s.sendAndAck(buildDelLinkMessage(s.seq, ifindex), s.seq)
 }
 
 func (s *Socket) sendAndAck(req []byte, seq uint32) error {

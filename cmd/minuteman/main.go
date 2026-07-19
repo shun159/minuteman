@@ -36,6 +36,7 @@ import (
 
 	"github.com/shun159/miniteman/internal/cliconfig"
 	"github.com/shun159/miniteman/internal/lanprefix"
+	"github.com/shun159/miniteman/internal/slowpath"
 	"github.com/shun159/miniteman/internal/wanextend"
 	"github.com/shun159/miniteman/pkg/aftrdiscovery"
 	"github.com/shun159/miniteman/pkg/datapath"
@@ -255,6 +256,25 @@ func run() error {
 		return fmt.Errorf("setting B4 config: %w", err)
 	}
 
+	// The companion ip6tnl slow path: what the XDP datapath's XDP_PASS of a
+	// fragmentation case (oversized non-DF outbound, or a fragmented softwire
+	// inbound) hands off to, so the kernel fragments/reassembles rather than the
+	// datapath dropping (RFC 6333 §5.3). Created here, once the softwire
+	// endpoints are known, for every run -- static or dynamic. Fail-fast: a home
+	// CPE has no other IPv4 path. Its Close (device teardown) is deferred so it
+	// runs after bgWG.Wait but before dp.Close (defers are LIFO), i.e. after the
+	// rediscovery goroutine that may repoint it has drained.
+	tun, err := slowpath.New(wanNetIface.MTU)
+	if err != nil {
+		return fmt.Errorf("opening softwire slow path: %w", err)
+	}
+	if err := tun.Ensure(b4, aftr); err != nil {
+		tun.Close()
+		return err
+	}
+	defer tun.Close()
+	log.Printf("softwire slow path: ip6tnl %s <-> %s ready for fragmentation/reassembly", b4, aftr)
+
 	for _, spec := range lans {
 		if err := attachLAN(dp, spec); err != nil {
 			return err
@@ -306,7 +326,7 @@ func run() error {
 	// skipped.
 	aftrDynamic := *aftrAddr == ""
 	if aftrDynamic || dynamicB4 {
-		runAFTRRediscovery(ctx, dp, b4, dynamicB4, aftrDynamic, *wanIface, wanIfindex, identity, disc, &bgWG)
+		runAFTRRediscovery(ctx, dp, tun, b4, dynamicB4, aftrDynamic, *wanIface, wanIfindex, identity, disc, &bgWG)
 	}
 	defer bgWG.Wait()
 
@@ -769,7 +789,7 @@ func abortMigration(dp *datapath.Loader, cause error) error {
 // never returns leaving a migration half-applied: any failure before the
 // cutover aborts back to oldAFTR, and after the cutover it keeps retrying the
 // retirement.
-func migrateAFTR(ctx context.Context, dp *datapath.Loader, b4, oldAFTR, newAFTR netip.Addr, wanChange <-chan struct{}) error {
+func migrateAFTR(ctx context.Context, dp *datapath.Loader, tun *slowpath.Tunnel, b4, oldAFTR, newAFTR netip.Addr, wanChange <-chan struct{}) error {
 	// The affinity counters are cumulative across the process, so baseline
 	// them: what matters is whether *this* priming pass lost any flow.
 	before, err := dp.Stats()
@@ -809,6 +829,16 @@ func migrateAFTR(ctx context.Context, dp *datapath.Loader, b4, oldAFTR, newAFTR 
 
 	if err := dp.Cutover(); err != nil {
 		return abortMigration(dp, err)
+	}
+	// Repoint the fragmentation slow path at the new AFTR now that the fast path
+	// has cut over to it, rather than after the (possibly hours-long) drain: new
+	// flows are on newAFTR, so their fragments must reassemble/encapsulate
+	// through it too. The trade-off is that the draining flows' own fragments
+	// (a rare corner) fall to the kernel with the old remote until they finish
+	// -- documented in docs/rfc-compliance-backlog.md. Best-effort: a failure
+	// only lags fragmentation, not the fast path.
+	if err := tun.SetEndpoints(b4, newAFTR); err != nil {
+		log.Printf("AFTR migration: %v", err)
 	}
 	log.Printf("AFTR migration: cut over to %s; the %d flow(s) recorded on %s stay there until they fall idle",
 		newAFTR, after.AffinityInsert-before.AffinityInsert, oldAFTR)
@@ -960,7 +990,8 @@ func discoverViaHB46PP(ctx context.Context, dnsServers []netip.Addr, identity hb
 // run here, and the WAN watcher (watchB4) merely signals.
 type rediscovery struct {
 	dp          *datapath.Loader
-	nl          *netlink.Socket // re-queries the B4 source on a WAN-change signal; nil for a static B4
+	tun         *slowpath.Tunnel // repointed at the new endpoints after an AFTR migration or B4 switch
+	nl          *netlink.Socket  // re-queries the B4 source on a WAN-change signal; nil for a static B4
 	wanIface    string          // for DHCPv6/HB46PP re-discovery
 	wanIfindex  int             // for the B4 source re-query
 	identity    hb46ppIdentity  // HB46PP client identity for re-discovery
@@ -1000,7 +1031,7 @@ type rediscovery struct {
 //   - If a re-discovery's DNS servers differ from the startup ones, a running
 //     -dns-proxy keeps forwarding to the startup set (it isn't reconfigured
 //     here).
-func runAFTRRediscovery(ctx context.Context, dp *datapath.Loader, b4 netip.Addr, dynamicB4, aftrDynamic bool, wanIface string, wanIfindex uint32, identity hb46ppIdentity, initial aftrDiscovery, wg *sync.WaitGroup) {
+func runAFTRRediscovery(ctx context.Context, dp *datapath.Loader, tun *slowpath.Tunnel, b4 netip.Addr, dynamicB4, aftrDynamic bool, wanIface string, wanIfindex uint32, identity hb46ppIdentity, initial aftrDiscovery, wg *sync.WaitGroup) {
 	var wanChange chan struct{}
 	appliedB4 := &atomic.Pointer[netip.Addr]{}
 	appliedB4.Store(&b4)
@@ -1016,7 +1047,7 @@ func runAFTRRediscovery(ctx context.Context, dp *datapath.Loader, b4 netip.Addr,
 		defer wg.Done()
 
 		r := &rediscovery{
-			dp: dp, wanIface: wanIface, wanIfindex: int(wanIfindex),
+			dp: dp, tun: tun, wanIface: wanIface, wanIfindex: int(wanIfindex),
 			identity: identity, aftrDynamic: aftrDynamic, wanChange: wanChange,
 			current: initial, currentB4: b4, appliedB4: appliedB4,
 		}
@@ -1145,7 +1176,7 @@ func (r *rediscovery) rediscover(ctx context.Context) (interrupted, migrationPen
 	// day-scale refresh, and serialising here is what keeps the datapath's
 	// one-migration-at-a-time rule true. r.wanChange lets a WAN-address change
 	// interrupt even a multi-hour drain.
-	if err := migrateAFTR(ctx, r.dp, r.currentB4, r.current.aftr, next.aftr, r.wanChange); err != nil {
+	if err := migrateAFTR(ctx, r.dp, r.tun, r.currentB4, r.current.aftr, next.aftr, r.wanChange); err != nil {
 		if ctx.Err() != nil {
 			return false, false
 		}
@@ -1204,6 +1235,12 @@ func (r *rediscovery) handleWANChange(migrationPending bool) (switched bool) {
 	if err := r.dp.SwitchAFTR(newB4, r.current.aftr); err != nil {
 		log.Printf("dynamic B4: switching softwire source to %s failed: %v (keeping %s)", newB4, err, r.currentB4)
 		return false
+	}
+	// Repoint the fragmentation slow path at the new source. Best-effort: the
+	// fast path already carries whole packets on the new softwire, and only
+	// fragmentation lags if this fails, until the next successful update.
+	if err := r.tun.SetEndpoints(newB4, r.current.aftr); err != nil {
+		log.Printf("dynamic B4: %v", err)
 	}
 	log.Printf("dynamic B4: switched softwire source to %s toward AFTR %s; re-triggering AFTR discovery", newB4, r.current.aftr)
 	r.currentB4 = newB4

@@ -191,6 +191,19 @@ DUALSTACK_PCAP="$RUNDIR/dualstack-dslite.pcap"
 # default (MM_DYNAMIC_B4 unset or "0").
 DYNAMIC_B4_FILE="$RUNDIR/dynamic-b4"
 
+# Whether smoketest.sh exercises the softwire fragmentation slow path (RFC 6333
+# §5.3) -- a seventh independent toggle. When on, smoketest.sh (a) sends an
+# oversized non-DF ping so minuteman's encap must XDP_PASS it to the kernel's
+# companion ip6tnl for IPv4 fragmentation (asserting connectivity + the
+# EncapFragSlow counter), and (b) hand-crafts a fragmented softwire packet
+# toward the B4 with send-softwire-fragments.py so the decap must XDP_PASS it
+# for kernel reassembly (asserting the inner echo reaches the LAN client + the
+# DecapReasmPass counter). It changes no minuteman flag and adds no topology
+# (every link is already 1500, and the companion ip6tnl minuteman creates
+# itself is what does the work); it only forces -stats-interval on so the
+# counters are logged. Off by default (MM_SOFTWIRE_FRAG unset or "0").
+SOFTWIRE_FRAG_ENABLED_FILE="$RUNDIR/softwire-frag-enabled"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MINUTEMAN_BIN="$REPO_ROOT/bin/minuteman"
 

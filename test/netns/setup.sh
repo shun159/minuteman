@@ -47,6 +47,12 @@
 # pairs naturally with MM_DHCPV4=1 so mm-host holds both a DHCPv4 and a SLAAC
 # address at once.
 #
+# MM_SOFTWIRE_FRAG ("0"/unset (default) or "1") makes smoketest.sh exercise the
+# softwire fragmentation slow path (RFC 6333 §5.3) in both directions -- an
+# oversized non-DF ping the encap must hand to the kernel to fragment, and a
+# hand-crafted fragmented softwire packet the decap must hand up for kernel
+# reassembly. Changes no minuteman flag and no topology; see common.sh.
+#
 # After this completes, run minuteman as the B4 with test/netns/run-cpe.sh,
 # then test end-to-end connectivity with test/netns/smoketest.sh (both read
 # the modes this script recorded and act/assert accordingly).
@@ -114,6 +120,15 @@ case "$DYNAMIC_B4" in
     ;;
 esac
 
+SOFTWIRE_FRAG="${MM_SOFTWIRE_FRAG:-0}"
+case "$SOFTWIRE_FRAG" in
+0 | 1) ;;
+*)
+    echo "error: MM_SOFTWIRE_FRAG must be '0' or '1' (got '$SOFTWIRE_FRAG')" >&2
+    exit 1
+    ;;
+esac
+
 # veth TX checksum/GSO/TSO/SG offloads leave TCP segments with an unfinalized
 # (CHECKSUM_PARTIAL) checksum, on the assumption that a real NIC (or the
 # kernel stack at final delivery) will fill it in later. minuteman's XDP
@@ -131,7 +146,9 @@ disable_veth_offloads() {
     ip netns exec "$ns" ethtool -K "$dev" tx off gso off tso off sg off >/dev/null
 }
 
-# The AFTR's decap step needs the ip6_tunnel kernel module (mode ipip6, i.e.
+# Both the AFTR's decap step and (since the softwire fragmentation slow path,
+# RFC 6333 §5.3) minuteman's own companion ip6tnl in mm-cpe need the ip6_tunnel
+# kernel module (mode ipip6, i.e.
 # IPv4-in-IPv6). Check it up front with a clear message: on Arch this module
 # commonly goes missing right after a kernel package upgrade, since the old
 # kernel's /lib/modules/<old-version>/ gets replaced by the new package's
@@ -397,6 +414,7 @@ echo "$DNS_PROXY" >"$DNS_PROXY_ENABLED_FILE"
 echo "$DHCPV4" >"$DHCPV4_ENABLED_FILE"
 echo "$DUALSTACK" >"$DUALSTACK_ENABLED_FILE"
 echo "$DYNAMIC_B4" >"$DYNAMIC_B4_FILE"
+echo "$SOFTWIRE_FRAG" >"$SOFTWIRE_FRAG_ENABLED_FILE"
 
 echo "== mm-cpe: B4 element (minuteman runs here) =="
 # ip_forward/net.ipv6.conf.all.forwarding=1 (required for bpf_fib_lookup() in
