@@ -1,6 +1,10 @@
 package datapath
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/cilium/ebpf"
+)
 
 // statID mirrors bpf/datapath.bpf.c's enum stat_id. The BPF map only stores
 // raw __u64 counters (no BTF enum type survives to the compiled object, see
@@ -44,6 +48,23 @@ const (
 
 // Stats reads and sums the datapath's per-CPU counters across all CPUs.
 func (l *Loader) Stats() (Stats, error) {
+	return sumStats(l.objs.Stats)
+}
+
+// ReadPinnedStats reads the stats map a running minuteman pinned to bpffs
+// (see pinStats), for out-of-band observers like the `minuteman stats`
+// subcommand that have no Loader of their own.
+func ReadPinnedStats() (Stats, error) {
+	m, err := ebpf.LoadPinnedMap(statsPinPath, nil)
+	if err != nil {
+		return Stats{}, fmt.Errorf("opening pinned stats map %s (is minuteman running?): %w", statsPinPath, err)
+	}
+	defer m.Close()
+	return sumStats(m)
+}
+
+// sumStats sums the per-CPU counters in a stats map handle across all CPUs.
+func sumStats(m *ebpf.Map) (Stats, error) {
 	var s Stats
 	fields := [statMax]*uint64{
 		statPass:            &s.Pass,
@@ -84,7 +105,7 @@ func (l *Loader) Stats() (Stats, error) {
 	for id, dst := range fields {
 		key := uint32(id)
 		var perCPU []uint64
-		if err := l.objs.Stats.Lookup(&key, &perCPU); err != nil {
+		if err := m.Lookup(&key, &perCPU); err != nil {
 			return Stats{}, fmt.Errorf("reading stat %d: %w", id, err)
 		}
 		for _, v := range perCPU {

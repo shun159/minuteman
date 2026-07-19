@@ -32,13 +32,20 @@ func Load() (*Loader, error) {
 		return nil, fmt.Errorf("loading BPF objects: %w", err)
 	}
 
-	return &Loader{
+	l := &Loader{
 		objs:     objs,
 		lanLinks: make(map[uint32]link.Link),
-	}, nil
+	}
+	if err := l.pinStats(); err != nil {
+		objs.Close()
+		return nil, err
+	}
+	return l, nil
 }
 
-// Close detaches all XDP programs and unloads the BPF objects.
+// Close detaches all XDP programs, removes the stats pin and unloads the
+// BPF objects. The unpin is best-effort: a leftover pin is only stale state
+// for the next run's pinStats to sweep, not worth failing shutdown over.
 func (l *Loader) Close() error {
 	if l.wanLink != nil {
 		l.wanLink.Close()
@@ -46,6 +53,7 @@ func (l *Loader) Close() error {
 	for _, lk := range l.lanLinks {
 		lk.Close()
 	}
+	l.objs.Stats.Unpin()
 	return l.objs.Close()
 }
 

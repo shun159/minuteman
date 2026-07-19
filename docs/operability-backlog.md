@@ -5,57 +5,45 @@ operational and test-ergonomics improvements — how minuteman is run, observed,
 that don't change datapath behavior but make the system easier to operate and to verify. Ordered by
 leverage, highest first. Last checked against the codebase 2026-07-19.
 
-Motivation: the netns rig (`test/netns/`) currently has to run minuteman as a foreground process whose
-stdout it keeps captured, then grep `-stats-interval` log lines for datapath counters. That couples every
-assertion to the process's stdout and its lifetime, and it makes "send some traffic, then read a counter"
-awkward — you can't query a running instance out-of-band, and detaching the process is fragile. The two
-items below remove that coupling.
+## 1. Query datapath stats out-of-band via a pinned BPF map + a `stats` subcommand — **DONE**
 
-## 1. Query datapath stats out-of-band via a pinned BPF map + a `stats` subcommand (highest leverage)
+Implemented: `pkg/datapath.Load` pins the `stats` `PERCPU_ARRAY` to bpffs
+(`/sys/fs/bpf/minuteman/stats`), replacing any stale pin a previous crashed run left behind
+(unpin-then-repin, mirroring `internal/slowpath`'s stale-device cleanup) and failing fast with a
+bpffs-mount hint if pinning is impossible; `Loader.Close` unpins best-effort on graceful shutdown. The
+`minuteman stats [-json]` subcommand (dispatch on `os.Args[1]` before `flag.Parse`, so the flag-only
+invocation stays the default run behavior) reads it via `datapath.ReadPinnedStats`
+(`ebpf.LoadPinnedMap` + the same cross-CPU summing `Loader.Stats` uses, factored into `sumStats`).
+`bpftool map dump pinned /sys/fs/bpf/minuteman/stats` works too. Only `stats` is pinned;
+`migration_ctrl`/`next_hops` can follow the same pattern if a need appears.
 
-Today the `stats` `PERCPU_ARRAY` lives only inside the running process: `pkg/datapath`'s `loadBpfObjects`
-does a plain `LoadAndAssign` with no pinning, so the map vanishes when minuteman exits and nothing else can
-read it. Stats are exposed only by the `-stats-interval` stdout logger (`cmd/minuteman`'s
-`logStatsUntilDone`).
+The netns rig's counter assertions (`MM_SOFTWIRE_FRAG`'s `EncapFragSlow`/`DecapReasmPass`/
+`DecapMartian`, `MM_DUALSTACK`'s `IPv6Fwd`/`IPv6RSSRedirect`) now read the subcommand as
+before/after deltas (`smoketest.sh`'s `read_stat`) instead of grepping `-stats-interval` log lines —
+minuteman's stdout is no longer load-bearing for any assertion. Note the rig launches minuteman via
+`nsenter --net` rather than `ip netns exec` for exactly this feature: `ip netns exec` creates a new
+mount namespace and remounts `/sys`, which would strand the pin on a bpffs no later process can see
+(see `test/netns/README.md`'s "Reading datapath stats").
 
-**Proposal:** pin `stats` (and, if useful, `migration_ctrl` / `next_hops`) to bpffs
-(`/sys/fs/bpf/minuteman/…`) when the datapath loads, and add a `minuteman stats [-json]` subcommand that
-opens the pinned map with `ebpf.LoadPinnedMap` and reuses `stats.go`'s cross-CPU summing to print the same
-`Stats` struct. This fully decouples stats reading from minuteman's stdout: a test can send traffic and
-then, in a separate short command, read the exact counters (`minuteman stats -json | jq .DecapMartian`).
-`bpftool map dump pinned /sys/fs/bpf/minuteman/stats` becomes possible too.
+Verified end-to-end 2026-07-19: `MM_SOFTWIRE_FRAG=1` and `MM_DUALSTACK=1 MM_IPV6_SW_RSS=1` smoketests
+all-pass with the delta assertions; manual `stats`/`stats -json`/`bpftool map dump` against a live
+instance; counters advance with traffic; kill -9 → restart replaces the stale pin with fresh zeroed
+counters; SIGTERM removes the pin.
 
-**Notes / gotchas:**
-- Pinning changes lifecycle: a pinned map persists after the process exits unless explicitly unpinned.
-  Need cleanup on graceful shutdown (unpin in `Loader.Close`), plus a way to clear a stale pin from a
-  previous crashed run (unpin-then-repin, mirroring `internal/slowpath`'s stale-device cleanup).
-- Requires a bpffs mount (`/sys/fs/bpf`, standard on modern systems); fail with a clear message if absent.
-- CLI shape: keep the current flag set as the default `run` behavior for backward compatibility and add
-  `stats` as a subcommand — a small `main()` refactor (dispatch on `os.Args[1]` before `flag.Parse`).
-- `stats.go`'s `Stats()` is currently a `*Loader` method; factor the summing so it can also run against a
-  bare pinned-map handle (the subcommand has no full `Loader`).
+## 2. Daemon / detach mode so the process survives its launcher — **PARTIAL** (unit example + `-pidfile`)
 
-**Testing payoff:** the `MM_SOFTWIRE_FRAG` smoketest's counter assertions (`EncapFragSlow`,
-`DecapReasmPass`, `DecapMartian`) could read the pinned map directly instead of grepping stats log lines,
-and would no longer need minuteman started with `-stats-interval` and its stdout owned by the script.
+Done, per the original proposal's lean-on-the-init-system stance (self-daemonizing in Go — re-exec +
+double-fork + setsid — remains deliberately rejected):
+- `docs/minuteman.service.example` — a `Type=simple` systemd unit (root, `network-online.target`,
+  `Restart=on-failure`) with a representative `ExecStart`.
+- `-pidfile <path>` — written only after every fail-fast startup step succeeds (so its existence means
+  "up", not "starting") and removed on graceful exit. Verified alongside #1 above.
 
-## 2. Daemon / detach mode so the process survives its launcher
-
-minuteman runs in the foreground; the rig backgrounds it with `&` and keeps its stdout. That is fragile —
-a launcher that tears down its process group takes minuteman with it (this bit hard when trying to run
-minuteman concurrently with packet senders under an automated harness: the backgrounded process was killed
-and its output lost).
-
-**Proposal:** for production, lean on the init system rather than self-daemonizing — a systemd unit
-(`Type=simple`, or `Type=notify` with `sd_notify` readiness) manages the lifetime cleanly, and Go's lack of
-a clean `daemon(3)` primitive makes self-daemonizing (re-exec + double-fork + setsid + fd close) the worse
-option. Ship an example unit under `test/netns/` or `docs/`. For the test rig specifically, running
-minuteman under `systemd-run --scope` (or a properly detached session) would let it outlive the launching
-command, so senders and `minuteman stats` can run against it in separate steps.
-
-**Notes:**
-- Signal handling already exists (`signal.NotifyContext` on SIGINT/SIGTERM), so graceful shutdown under a
-  service manager needs no new plumbing beyond optional `sd_notify`.
-- A `-pidfile` option (write pid, remove on exit) helps a supervisor and the rig track the instance.
-- Lower priority than #1: #1 alone removes most of the test friction (stats no longer need the process's
-  stdout), and production deployment is a packaging concern a systemd unit covers without code changes.
+Still open, in priority order:
+- `sd_notify` readiness (`Type=notify`), so a supervisor can distinguish "AFTR discovered, datapath
+  attached" from "still discovering". Small: write `READY=1` to `$NOTIFY_SOCKET` at the same point
+  `-pidfile` is written.
+- The rig still backgrounds smoketest-launched minuteman with `&` under its own process group; running
+  it under `systemd-run --scope` (or a detached session) would let an instance outlive its launcher for
+  multi-step manual workflows. #1 removed most of the practical pain (stats no longer need the
+  process's stdout), so this is low priority.

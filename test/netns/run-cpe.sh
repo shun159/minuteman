@@ -77,11 +77,18 @@ if [[ -f "$DYNAMIC_B4_FILE" && "$(cat "$DYNAMIC_B4_FILE")" == 1 ]]; then
     b4_flags=()
 fi
 
-exec ip netns exec "$NETNS_CPE" "$MINUTEMAN_BIN" \
+# nsenter --net rather than `ip netns exec`: the latter also creates a new
+# mount namespace and remounts /sys, so the stats map minuteman pins at
+# /sys/fs/bpf/minuteman would land on a private bpffs no later process can
+# see. nsenter switches only the network namespace, keeping the host's
+# /sys/fs/bpf, so `minuteman stats` (and bpftool) can read the pin from the
+# host while this runs.
+exec nsenter --net="/var/run/netns/$NETNS_CPE" "$MINUTEMAN_BIN" \
     -wan "$VETH_CPE_ISP" \
     "${b4_flags[@]}" \
     -lan "$VETH_CPE_HOST=${LAN_CPE_ADDR%/*}" \
     "$wan_model_flag" \
+    -stats-interval 0 \
     "${dns_proxy_flags[@]}" \
     "${dhcpv4_flags[@]}" \
     "$@"
