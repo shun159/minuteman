@@ -205,6 +205,16 @@ func (s *Socket) SetIP6TnlEndpoints(ifindex int, local, remote netip.Addr) error
 	return s.sendAndAck(buildChangeIP6TnlMessage(s.seq, ifindex, local, remote), s.seq)
 }
 
+// AddVeth creates a veth pair (name, peerName) with the given MTU on both
+// ends -- the softwire fragmentation companion pair the XDP datapath bounces
+// oversized clones through (see internal/fragpath). Fails if a device by that
+// name already exists (NLM_F_EXCL); callers delete a stale one first.
+func (s *Socket) AddVeth(name, peerName string, mtu int) error {
+	flags := uint16(unix.NLM_F_REQUEST | unix.NLM_F_ACK | unix.NLM_F_CREATE | unix.NLM_F_EXCL)
+	s.seq++
+	return s.sendAndAck(buildAddVethMessage(s.seq, flags, name, peerName, mtu), s.seq)
+}
+
 // SetLinkUp brings ifindex administratively up (IFF_UP).
 func (s *Socket) SetLinkUp(ifindex int) error {
 	s.seq++

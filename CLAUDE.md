@@ -39,16 +39,21 @@ further down — this is just the index of what exists and which flag turns it o
 - **Native-IPv6 forwarding fastpath** (always on) — transit IPv6 that used to fall to the kernel slow
   path (`XDP_PASS`) is now routed directly in XDP, with in-datapath ICMPv6 Packet Too Big and an optional
   software-RSS cpumap stage (`-ipv6-sw-rss`, off by default — for NICs without capable hardware RSS).
-- **Softwire fragmentation slow path** (always on; RFC 6333 §5.3, *partial* — see the honest scope note
-  below) — the two cases XDP can't handle itself, an oversized non-DF inner IPv4 packet outbound and a
-  fragmented softwire IPv6 packet inbound, are `XDP_PASS`ed to a kernel companion `ip6tnl`
-  (`internal/slowpath`, local=B4/remote=AFTR, mode ipip6, encaplimit none) plus an IPv4 default route
-  through it: the kernel reassembles (inbound) or fragments (outbound) and the ip6tnl (de)encapsulates.
-  The *reassembly* direction is §5.3-conformant; the *fragmentation* direction is **not** — the kernel
-  tunnel fragments the **inner IPv4** (which §5.3/errata 5847 says MUST NOT happen; it fragments the outer
-  IPv6 instead) for non-DF and PMTUD-signals for DF, so this is a reachability fallback, not §5.3
-  compliance (backlog #4; minuteman's primary MTU strategy is the advertised WAN−40 LAN MTU, so the slow
-  path is a fallback for clients that ignore it). Created at startup and repointed on an AFTR migration /
+- **Softwire fragmentation** (always on; RFC 6333 §5.3, both halves) — *outbound*, an oversized inner
+  IPv4 packet, **DF or not** (errata 5847 → RFC 2473 §7.2(b) ignores the DF bit), is encapsulated whole
+  and the **outer IPv6** is fragmented *in XDP* (`encap_fragment_outer`: one `BPF_F_BROADCAST` devmap
+  clone per possible fragment, each trimmed to fragment *i* by an `xdp_softwire_frag<i>` program and
+  redirected out the WAN; the clones bounce through one large-MTU companion veth pair per fragment index,
+  `internal/fragpath`'s `mm-frag<i>`/`mm-frag<i>p` — the architecture section explains why per-fragment
+  *devices* are load-bearing). The encap-side ICMPv4 Fragmentation-Needed is gone with this: an oversized
+  DF packet is fragmented transparently instead of bouncing a PMTUD signal. *Inbound*, a fragmented
+  softwire IPv6 packet is `XDP_PASS`ed to a kernel companion `ip6tnl` (`internal/slowpath`,
+  local=B4/remote=AFTR, mode ipip6, encaplimit none) plus an IPv4 default route through it: the kernel
+  reassembles before the ip6tnl decapsulates (§5.3's "reassembly MUST happen before decapsulation"). The
+  ip6tnl also remains the *fallback* for what the XDP fragmenter can't take (`STAT_ENCAP_FRAG_SLOW`: >4
+  fragments, inner beyond `fragpath.MaxInnerLen`, degenerate MTU — there the kernel fragments the inner
+  IPv4, a reachability fallback, not §5.3 conformance; backlog §4's residual note) and for a decapped
+  inner too big for a non-DF LAN egress. Created at startup and repointed on an AFTR migration /
   B4 switch. A side benefit is that the IPv4 default route lets the kernel answer ICMPv4 Time Exceeded for
   an expiring inner TTL outbound (part of backlog #3). To keep that default route from turning the decap
   path into a reflector, a decapped inner IPv4 that the FIB resolves off-LAN (back toward the companion
@@ -57,8 +62,9 @@ further down — this is just the index of what exists and which flag turns it o
 All of the above has been verified end-to-end against the netns rig (see Testing below).
 
 `internal/` holds `cliconfig` (CLI flag parsing), `lanprefix` (DHCPv6-PD LAN policy, including RA
-serving), `wanextend` (NDProxy LAN policy, including RA serving and host-route management), and
-`slowpath` (the DS-Lite companion `ip6tnl` lifecycle for softwire fragmentation);
+serving), `wanextend` (NDProxy LAN policy, including RA serving and host-route management), `slowpath`
+(the DS-Lite companion `ip6tnl` lifecycle for softwire reassembly + fragmentation fallback), and
+`fragpath` (the companion veth pairs the in-XDP softwire fragmenter bounces its clones through);
 `pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/`pkg/prefixdelegation`/`pkg/routeradvert`/`pkg/ndproxy`/
 `pkg/netlink`/`pkg/dnsproxy`/`pkg/dhcpv4` are the reusable protocol packages.
 
@@ -68,11 +74,10 @@ Not yet implemented:
   and preserves those technologies' parameter objects raw (`json.RawMessage` on `hb46pp.Provisioning`),
   so implementing one means adding its typed parameter struct there, its datapath, and extending
   `cmd/minuteman`'s policy beyond the current dslite-only capability request.
-- A handful of RFC 7084/6333 compliance gaps. Softwire fragmentation (RFC 6333 §5.3) is now *partially*
-  addressed by a kernel companion `ip6tnl` slow path (see `internal/slowpath` and the **Softwire
-  fragmentation slow path** feature below): the reassembly half is conformant, the fragmentation half is a
-  reachability fallback that fragments the inner IPv4 rather than the RFC-canonical outer IPv6, so it stays
-  an open gap. The remaining gaps are in `docs/rfc-compliance-backlog.md`, priority-ordered with the
+- A handful of RFC 7084/6333 compliance gaps. Softwire fragmentation (RFC 6333 §5.3) is now addressed on
+  both halves (in-XDP outer-IPv6 fragmentation + kernel-ip6tnl reassembly — see the **Softwire
+  fragmentation** feature above); only its fallback cases (backlog §4's residual note) still fragment the
+  inner IPv4. The remaining gaps are in `docs/rfc-compliance-backlog.md`, priority-ordered with the
   specific code each points at. Non-protocol operability/test-ergonomics improvements are tracked
   separately in `docs/operability-backlog.md` — its #1 (out-of-band stats via a bpffs-pinned map + the
   `minuteman stats` subcommand) is done, #2 (daemon/detach) partially (systemd unit example +
@@ -120,8 +125,9 @@ sudo ./test/netns/teardown.sh    # tears everything down (always safe to re-run)
 Eight independent env-var toggles select what `setup.sh` builds and what `smoketest.sh` asserts —
 `MM_AFTR_DISCOVERY` (`dhcpv6`/`hb46pp`), `MM_WAN_MODEL` (`dhcpv6-pd`/`ndproxy`), `MM_DNS_PROXY`,
 `MM_DHCPV4`, `MM_DUALSTACK`, `MM_IPV6_SW_RSS`, `MM_DYNAMIC_B4` (omit `-b4` and drive a WAN-renumbering
-scenario), `MM_SOFTWIRE_FRAG` (exercise the fragmentation slow path both ways — an oversized non-DF ping
-and a hand-crafted fragmented softwire packet via `send-softwire-fragments.py`) — plus the full list of
+scenario), `MM_SOFTWIRE_FRAG` (exercise softwire fragmentation both ways — oversized non-DF *and* DF
+pings outbound, both expected to round-trip via the in-XDP outer-IPv6 fragmenter, and a hand-crafted
+fragmented softwire packet inbound via `send-softwire-fragments.py`) — plus the full list of
 verified-passing combinations. See
 **`test/netns/README.md`** for all of that detail; it's a rig-operation runbook, not something most tasks
 need loaded up front.
@@ -165,14 +171,39 @@ orphaned the running kernel's module directory — reboot to fix that).
     point-to-point softwire must never carry — this is also what lets a LAN client's limited-broadcast DHCP
     DISCOVER/REQUEST reach minuteman's own `-dhcpv4` server, which listens via an AF_PACKET socket
     downstream of XDP), checks WAN path MTU
-    accounting for the 40-byte IPv6 encap overhead (`TUNNEL_L3_OVERHEAD`): a too-big *DF* inner packet
-    gets a plain ICMPv4 Fragmentation-Needed via `XDP_TX` (`send_plain_icmp_frag_needed` — untunneled,
-    since the LAN sender is directly reachable on the ingress interface), while a too-big *non-DF* one is
-    `XDP_PASS`ed to the kernel's companion `ip6tnl` for fragmentation (`STAT_ENCAP_FRAG_SLOW`; RFC 6333
-    §5.3, see `internal/slowpath`) rather than dropped. An in-MTU packet is instead wrapped in an outer
+    accounting for the 40-byte IPv6 encap overhead (`TUNNEL_L3_OVERHEAD`): a too-big inner packet — **DF
+    or not** (RFC 6333 §5.3 / errata 5847 → RFC 2473 §7.2(b) ignores the DF bit) — goes to
+    `encap_fragment_outer` (see below) to be encapsulated whole and outer-IPv6-fragmented in XDP, falling
+    back to an `XDP_PASS` toward the kernel's companion `ip6tnl` (`STAT_ENCAP_FRAG_SLOW`, which then
+    fragments the *inner* IPv4 — reachability only; see `internal/slowpath`) for the cases the fragmenter
+    can't take. An in-MTU packet is instead wrapped in an outer
     Ethernet+IPv6(nexthdr=`IPPROTO_IPIP`) header and redirects it out the WAN ifindex via the `tx_ports`
     `DEVMAP_HASH`. Native IPv6 arriving here (a LAN client's IPv6 transit traffic) is *not* IPv4, so instead
     of being encapsulated it takes the native-IPv6 forwarding fastpath (`handle_ipv6_forward`, see below).
+  - `encap_fragment_outer` + `emit_softwire_fragment`/`xdp_softwire_frag0..3` (`SEC("xdp")`) — in-XDP
+    softwire fragmentation (RFC 6333 §5.3). XDP emits exactly one frame per input frame, so the fragments
+    are made by cloning: `encap_fragment_outer` encapsulates the oversized inner IPv4 once behind outer
+    Ethernet + IPv6 (`nexthdr = IPPROTO_FRAGMENT`) + a Fragment header (offset 0, M=1, one
+    `bpf_get_prandom_u32()` ID every clone then inherits — no metadata passing needed), decrements the
+    inner TTL, and `bpf_redirect_map`s it to the `frag_ports` `DEVMAP` with `BPF_F_BROADCAST` (one clone
+    per possible fragment, `MAX_SOFTWIRE_FRAGS` = 4). Entry *i* targets the A end (`mm-frag<i>`) of a
+    dedicated large-MTU companion veth pair (`internal/fragpath`), whose B end (`mm-frag<i>p`) runs
+    `xdp_softwire_frag<i>` as its rx XDP program: it trims the clone to fragment *i* (adjust head/tail,
+    rewrite `payload_len`/`frag_off`/M from stack-copied headers) and redirects it out the WAN, or drops
+    it when the packet needed fewer fragments. One *device* per fragment index is load-bearing twice over
+    (documented on `frag_ports`): the kernel's devmap enqueue validates the untrimmed clone's length
+    against the target device's MTU before any program could trim it (`is_valid_dst` → `xdp_ok_fwd_dev`),
+    so the target can never be the WAN itself; and enqueued frames are batched per target device with only
+    the batch's *first* devmap egress program run over all of them, so per-entry `bpf_devmap_val` programs
+    on one shared device cannot express per-fragment behavior (both discovered empirically — the second
+    produced four identical fragment-0s). Counted per packet (`STAT_ENCAP_FRAG_XDP`) and per fragment
+    (`STAT_ENCAP_FRAG_SEG`). The FIB lookup for the fragments' L2 asks for a *fragment-sized* `tot_len` —
+    `bpf_fib_lookup` returns `FRAG_NEEDED` *before* filling `ifindex`/macs when `tot_len` exceeds the
+    route MTU, so asking with the full oversized length would echo the ingress ifindex back and trip the
+    wrong-interface check. Guards fall back to the ip6tnl (`STAT_ENCAP_FRAG_SLOW`): `frag_unit` unset,
+    inner > 4×`frag_unit` or > `frag_max_inner` (the veth pairs' clone-admission ceiling), device MTU
+    shrunk below the configured unit, `frag_ports` unpopulated, expiring TTL (kernel answers Time
+    Exceeded), or an unresolvable WAN next hop.
   - `xdp_dslite_decap` (`SEC("xdp")`, attach to the WAN interface) / `xdp_dslite_decap_cpu` (`SEC("xdp/cpumap")`
     second-stage variant): validates the outer IPv6 header matches the configured AFTR/B4 pair
     (`is_expected_dslite_peer`), optionally fans decap work out across CPUs first
@@ -200,7 +231,7 @@ orphaned the running kernel's module directory — reboot to fix that).
     cut, PMTUD is served *here*, not deferred to the kernel: on `BPF_FIB_LKUP_RET_FRAG_NEEDED` it originates
     ICMPv6 Packet Too Big itself (`send_icmpv6_pkt_too_big` → `write_icmpv6_pkt_too_big`, a plain untunneled
     `XDP_TX` reply back out the ingress interface — IPv6 is never softwire-tunneled, so the sender is always
-    directly reachable, the IPv6 analogue of the encap path's `send_plain_icmp_frag_needed`), sourced from
+    directly reachable, unlike the decap path's softwire-encapsulated ICMPv4 replies), sourced from
     the CPE's own `b4_addr` (falling back to `XDP_PASS` if that's unset). Native IPv6 forwarding is always
     on (no flag), the same posture as DS-Lite's inner-IPv4 forwarding. Known simplifications: VLAN-tagged
     IPv6 and packets whose transport is behind IPv6 extension headers stay on the kernel path; the PtB source
@@ -216,13 +247,15 @@ orphaned the running kernel's module directory — reboot to fix that).
     spread flows across CPUs; on hardware-RSS-capable NICs (e.g. mlx4) it's redundant and left off. Enabled
     via `-ipv6-sw-rss` → `Loader.EnableIPv6SoftwareRSS`.
   - Config is held in BPF maps, not hardcoded: `b4_config_map` (single-entry `ARRAY`: B4/AFTR IPv6 addresses,
-    fallback WAN MACs, WAN ifindex) and `lan_configs` (`HASH` keyed by LAN ifindex: gateway IPv4, inner MTU).
+    fallback WAN MACs, WAN ifindex, and the softwire fragmenter's `frag_unit`/`frag_max_inner`) and
+    `lan_configs` (`HASH` keyed by LAN ifindex: gateway IPv4, inner MTU); the fragmenter adds the
+    `frag_ports` `DEVMAP` of companion-veth ifindexes.
     The optional IPv6 software-RSS stage adds `ipv6_rss_config_map`/`ipv6_rss_cpus`/`cpu_map_v6` (separate
     from the dormant DS-Lite `fanout_*`/`cpu_map`). Per-path counters live in the `stats` `PERCPU_ARRAY`
     (see `enum stat_id`; the field/index order in `pkg/datapath/stats.go`'s `statID` and the `Stats` struct
     must be kept in sync with it by hand — new counters are appended before `STAT_MAX`).
-  - Every ICMP error the datapath originates (`send_plain_icmp_frag_needed`,
-    `send_dslite_icmp_frag_needed`, `send_icmpv6_pkt_too_big`) is gated by `icmp_error_allowed()`, a
+  - Every ICMP error the datapath originates (`send_dslite_icmp_frag_needed`,
+    `send_icmpv6_pkt_too_big`) is gated by `icmp_error_allowed()`, a
     per-CPU token bucket (`icmp_error_rate` `PERCPU_ARRAY`, 100/s sustained + 20 burst per CPU) — RFC 4443
     §2.4(f) makes rate-limiting originated ICMPv6 errors a MUST, and these `XDP_TX` replies bypass the
     kernel's own `icmp_ratelimit` sysctls entirely. When the bucket is empty the offending packet is
@@ -231,9 +264,10 @@ orphaned the running kernel's module directory — reboot to fix that).
     incremental checksum update, IPv6 hop-limit decrement (`decrease_ipv6_hoplimit` — no checksum, so
     trivial), L2(+VLAN)/IPv4/IPv6 header parsing with bounds checks, IPv6 address comparison and
     unspecified/forwardable classification (`ipv6_addr_equal`/`ipv6_addr_is_unspecified`/`ipv6_is_forwardable`),
-    IPv6 flow hashing (`inner_ip6_hash`), and ICMP error construction: ICMPv4 Fragmentation-Needed in both
-    plain and DS-Lite-tunneled form, plus ICMPv6 Packet Too Big (`write_icmpv6_pkt_too_big`, whose
-    `icmpv6_checksum` covers the IPv6 pseudo-header, unlike ICMPv4's).
+    IPv6 flow hashing (`inner_ip6_hash`), the outer-IPv6 header writer (`write_outer_ipv6`, whose `nexthdr`
+    parameter serves both the plain `IPPROTO_IPIP` encap and the fragmenter's `IPPROTO_FRAGMENT`), and ICMP
+    error construction: DS-Lite-tunneled ICMPv4 Fragmentation-Needed, plus ICMPv6 Packet Too Big
+    (`write_icmpv6_pkt_too_big`, whose `icmpv6_checksum` covers the IPv6 pseudo-header, unlike ICMPv4's).
   - **`bpf/uapi/linux/*.h`** — vendored kernel UAPI headers providing `#define` constants (`ETH_P_*`, `IP_DF`,
     `ICMP_*`) that the BTF-derived `bpf/vmlinux.h` (struct/union/enum definitions only, no macros) doesn't
     carry. `vmlinux.h` and these uapi headers are complementary: struct/type layouts come from BTF, numeric
@@ -256,6 +290,14 @@ orphaned the running kernel's module directory — reboot to fix that).
     packet until dnsmasq's next periodic RA, minutes later).
   - `config.go` — `SetB4Config(B4Config)`, `SetLANConfig(ifindex uint32, LANConfig)`; also registers each
     attached ifindex as a valid `bpf_redirect_map()` target in `tx_ports` (self-mapped ifindex → ifindex).
+    `SetB4Config` derives the softwire fragmenter's `frag_unit` from `B4Config.WANMTU` (`softwireFragUnit`
+    in `frag.go`: largest multiple of 8 ≤ WAN MTU − 48) and passes `FragMaxInner` through.
+  - `frag.go` — `EnableSoftwireFrag(redirectIfindexes, fwdIfaces)` wires the in-XDP softwire fragmenter to
+    the companion veth pairs `internal/fragpath` created: attaches `xdp_softwire_frag<i>` to pair *i*'s B
+    end (which also activates the pair's NAPI), then points `frag_ports[i]` at the pair's A end —
+    attach-then-populate, so the datapath (whose `encap_fragment_outer` guard checks `frag_ports`
+    resolves) never broadcasts into a pair with no consumer. `MaxSoftwireFrags` (4) mirrors the C
+    `MAX_SOFTWIRE_FRAGS` and is what `fragpath.NumPairs` is defined from.
   - `ipv6_rss.go` — `EnableIPv6SoftwareRSS([]uint32)` turns on the native-IPv6 software-RSS cpumap stage
     across the given CPU ids: it populates `cpu_map_v6` with `bpfBpfCpumapVal{Qsize, prog: XdpIpv6FwdCpu.FD()}`
     per CPU, fills `ipv6_rss_cpus` (slot → cpu), and sets `ipv6_rss_config{Enabled, CpuCount}`. Off unless
@@ -407,7 +449,8 @@ orphaned the running kernel's module directory — reboot to fix that).
 - **`pkg/netlink/`** — minimal, hand-rolled `AF_NETLINK`/`NETLINK_ROUTE` client (`golang.org/x/sys/unix`,
   no netlink library, matching `pkg/datapath/sysctl.go`'s `sysctl`-exec-avoidance the same way): the only
   package that builds/parses netlink wire messages, used by `internal/lanprefix` (address assignment),
-  `internal/wanextend` (WAN-prefix discovery, host routes) and `internal/slowpath` (the companion ip6tnl)
+  `internal/wanextend` (WAN-prefix discovery, host routes), `internal/slowpath` (the companion ip6tnl) and
+  `internal/fragpath` (the fragmenter's companion veth pairs)
   — split out from `internal/lanprefix`'s
   original private implementation once `internal/wanextend` needed the same mechanism. `message.go` builds
   `RTM_NEWADDR`/`RTM_DELADDR`/`RTM_GETADDR`/`RTM_NEWROUTE`/`RTM_DELROUTE` and `RTM_NEWLINK`/`RTM_DELLINK`
@@ -420,14 +463,16 @@ orphaned the running kernel's module directory — reboot to fix that).
   `IFLA_INFO_DATA` nesting needs; `buildAddIP6TnlMessage`/`buildChangeIP6TnlMessage`/`buildSetLinkUpMessage`/
   `buildDelLinkMessage` build the ip6tnl create/changelink/up/delete requests (with locally-`#define`d
   `IFLA_IPTUN_*` codes and the `IP6_TNL_F_IGN_ENCAP_LIMIT` flag, since `x/sys/unix` doesn't export them —
-  same vendoring rationale as `pkg/routeradvert`'s `ICMP6_FILTER`). `socket.go`'s `Socket` is the actual
+  same vendoring rationale as `pkg/routeradvert`'s `ICMP6_FILTER`), and `buildAddVethMessage` the veth-pair
+  create request (the peer described by its own `ifinfomsg` nested in `VETH_INFO_PEER`, vendored the same
+  way). `socket.go`'s `Socket` is the actual
   send/receive I/O: `AddAddr`/`DelAddr` (`NLM_F_
   REPLACE` makes `AddAddr` idempotent), `Addrs` (an `RTM_GETADDR` dump, looping `Recvfrom` until
   `NLMSG_DONE`), `AddRoute`/`DelRoute` (a directly-attached route — `RTA_OIF` only, no `RTA_GATEWAY`, scope
   `RT_SCOPE_LINK` — matching `ip route add <dst> dev <iface>`; family follows the prefix, so the same call
   serves `internal/wanextend`'s IPv6 `/128` host routes and `internal/slowpath`'s IPv4 default route, and a
   `/0` prefix omits `RTA_DST`; `AddRoute` is `NLM_F_REPLACE`-idempotent too), and
-  `AddIP6Tnl`/`SetIP6TnlEndpoints`/`SetLinkUp`/`DelLink` for the companion device lifecycle.
+  `AddIP6Tnl`/`SetIP6TnlEndpoints`/`AddVeth`/`SetLinkUp`/`DelLink` for the companion device lifecycles.
 - **`pkg/dnsproxy/`** — the DNS proxy RFC 6333 recommends a DS-Lite B4 run (the B4 SHOULD act as a DNS
   proxy for LAN clients): opaque byte-relay only, no DNS message parsing, caching, or rewriting of any
   kind, so it's simple enough to have no unit tests of its own (like `pkg/ndproxy`/`pkg/routeradvert`'s raw
@@ -612,9 +657,10 @@ orphaned the running kernel's module directory — reboot to fix that).
   `pkg/ndproxy.Serve`, the initial `raManager.sync`, and a `WatchChanges` goroutine whose `onChange`
   re-runs `raManager.sync` with the new prefix — every goroutine registered on the caller's `wg`.
 - **`internal/slowpath`** — owns the kernel companion `ip6tnl` that gives the datapath softwire
-  fragmentation/reassembly (RFC 6333 §5.3) without doing either in XDP: the two cases the XDP fast path
-  `XDP_PASS`es rather than dropping — an oversized non-DF inner IPv4 packet outbound (`STAT_ENCAP_FRAG_SLOW`)
-  and a fragmented softwire IPv6 packet inbound (`STAT_DECAP_REASM_PASS`), plus a decapped inner too big
+  *reassembly* (RFC 6333 §5.3's inbound half) plus the *fallback* for what the in-XDP fragmenter can't
+  take: the cases the XDP fast path `XDP_PASS`es rather than dropping — a fragmented softwire IPv6 packet
+  inbound (`STAT_DECAP_REASM_PASS`), an oversized outbound inner the fragmenter's guards rejected
+  (`STAT_ENCAP_FRAG_SLOW`), and a decapped inner too big
   for a non-DF LAN egress (`STAT_DECAP_FRAG_SLOW`) — land on a `mm-dslite0` device (`local=B4`, `remote=AFTR`,
   mode ipip6, `encaplimit none`) and an IPv4 default route through it, so the kernel fragments the inner
   IPv4 to the tunnel MTU (WAN−40) and the ip6tnl encapsulates each piece, or reassembles the IPv6 fragments
@@ -629,6 +675,19 @@ orphaned the running kernel's module directory — reboot to fix that).
   (static or dynamic) and hands it to `runAFTRRediscovery` so the single endpoint owner can repoint it;
   its `defer Close()` runs after `bgWG.Wait()` (so the rediscovery goroutine has drained) but before
   `dp.Close()`.
+- **`internal/fragpath`** — owns the companion veth pairs the in-XDP softwire fragmenter bounces its
+  broadcast clones through (see the `bpf/datapath.bpf.c` fragmenter bullet for the two kernel constraints
+  — devmap-enqueue MTU pre-check, per-device egress-program batching — that make one large-MTU pair *per
+  fragment index* necessary): `mm-frag<i>` (the A end `frag_ports[i]` targets) / `mm-frag<i>p` (the B end
+  `pkg/datapath` attaches `xdp_softwire_frag<i>` to), `NumPairs` = `datapath.MaxSoftwireFrags`, MTU 3456
+  (as large as veth XDP attach allows on 4K pages — the attach ERANGEs beyond ~3.5KB), no IP (IPv6
+  disabled via sysctl; stray kernel chatter is dropped by the trimming programs anyway). `MaxInnerLen`
+  (`vethMTU − 48`) is the clone-admission ceiling handed to the datapath as `b4_config.frag_max_inner`.
+  Endpoint-independent — the fragments carry whatever softwire addresses the encap wrote — so unlike
+  `slowpath.Tunnel` it needs no repointing on an AFTR/B4 change. Same lifecycle shape as `slowpath`:
+  long-lived netlink socket (via `pkg/netlink.AddVeth`), stale-device replacement, fail-fast `Ensure` at
+  startup (`cmd/minuteman` wires it *before* `SetB4Config` sets `frag_unit`, so the datapath never
+  engages the fragmenter without the plumbing behind it), best-effort `Close`.
 
 When implementing new functionality, follow this split: per-packet fast-path logic goes in
 `bpf/datapath.bpf.c`; anything that needs `cilium/ebpf` or knows about BPF map layouts goes in

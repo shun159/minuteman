@@ -34,6 +34,21 @@ struct b4_config {
     __u8 dst_mac[ETH_ALEN];
     __u32 wan_ifindex;
     __u32 flags;
+    /*
+     * Per-fragment payload size for softwire (outer IPv6) fragmentation: the
+     * largest multiple of 8 that fits the WAN MTU after the outer IPv6 +
+     * Fragment headers (WAN MTU - 48, rounded down; 1500 -> 1448). Computed
+     * by userspace; 0 means unset, which sends every oversized packet down
+     * the kernel ip6tnl fallback instead (see encap_fragment_outer).
+     */
+    __u32 frag_unit;
+    /*
+     * Largest inner IPv4 packet the fragmenter may take: the companion veth
+     * pair (internal/fragpath) admits a broadcast clone only while the whole
+     * encapsulated frame fits its MTU, and a bigger packet must fall back to
+     * the ip6tnl rather than blackhole into a rejected enqueue.
+     */
+    __u32 frag_max_inner;
 };
 
 /*
@@ -219,6 +234,49 @@ struct {
     __type(value, struct bpf_cpumap_val);
 } cpu_map_v6 SEC(".maps");
 
+/*
+ * Maximum number of outer-IPv6 fragments the datapath can carve one oversized
+ * softwire packet into -- the number of frag_ports entries, and of
+ * xdp_softwire_frag* programs. 4 x frag_unit (1448 at WAN MTU 1500) covers any
+ * inner packet a single-buffer XDP frame can carry; anything larger falls back
+ * to the kernel ip6tnl slow path. Mirrored as maxSoftwireFrags in Go.
+ */
+#define MAX_SOFTWIRE_FRAGS 4
+
+/*
+ * Softwire fragmentation clone targets (RFC 6333 §5.3): entry i is the A end
+ * of companion large-MTU veth pair i (internal/fragpath), whose B end runs
+ * xdp_softwire_frag<i> as its rx XDP program. XDP can only emit one frame per
+ * input frame, so encap_fragment_outer() builds the whole encapsulated packet
+ * once (with a Fragment header) and bpf_redirect_map()s it here with
+ * BPF_F_BROADCAST: the kernel clones the frame per entry, and pair i's
+ * program trims its clone down to fragment i (or drops it when the packet
+ * needs fewer than MAX_SOFTWIRE_FRAGS fragments) and redirects it out the
+ * WAN.
+ *
+ * One device per fragment index is load-bearing, not decoration, twice over:
+ *
+ *   - The devmap enqueue validates the *untrimmed* clone's length against the
+ *     target device's MTU before any trimming could happen (is_valid_dst ->
+ *     xdp_ok_fwd_dev), and a frame that needs fragmenting by definition
+ *     exceeds the WAN MTU -- so the targets must be large-MTU devices, never
+ *     the WAN itself.
+ *   - Per-entry devmap *egress programs* (bpf_devmap_val.bpf_prog) cannot
+ *     express per-fragment behavior here: the kernel batches enqueued frames
+ *     in one bulk queue per target device and runs only the first enqueue's
+ *     program over the whole batch, so entries sharing one device would run
+ *     one program over every clone. Distinct devices are what actually keeps
+ *     the four programs distinct -- which is why the programs live on the
+ *     pairs' B ends as plain rx XDP programs and the map holds plain
+ *     ifindexes.
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_DEVMAP);
+    __uint(max_entries, MAX_SOFTWIRE_FRAGS);
+    __type(key, __u32);
+    __type(value, __u32); /* ifindex of pair i's A end */
+} frag_ports SEC(".maps");
+
 enum stat_id {
     STAT_PASS = 0,
     STAT_DROP,
@@ -248,16 +306,26 @@ enum stat_id {
     STAT_AFFINITY_INSERT_FAIL,
     STAT_AFFINITY_PINNED,
     /*
-     * Softwire fragmentation slow path (RFC 6333 §5.3). XDP itself neither
-     * fragments nor reassembles; instead it hands the packet to the kernel,
-     * where a companion ip6tnl (local=B4, remote=AFTR) plus an IPv4 default
-     * route do the work. Counted separately so the netns rig can assert the
-     * slow path is actually exercised.
+     * Softwire fragmentation slow path (RFC 6333 §5.3). XDP doesn't
+     * reassemble; inbound fragmentation cases are handed to the kernel, where
+     * a companion ip6tnl (local=B4, remote=AFTR) plus an IPv4 default route
+     * do the work. Outbound, STAT_ENCAP_FRAG_SLOW is only the *fallback* for
+     * what encap_fragment_outer()'s in-XDP outer-IPv6 fragmentation (the two
+     * STAT_ENCAP_FRAG_XDP/SEG counters below) can't cover. Counted separately
+     * so the netns rig can assert which path is actually exercised.
      */
-    STAT_ENCAP_FRAG_SLOW,  /* oversized non-DF inner IPv4: kernel frags + encaps */
+    STAT_ENCAP_FRAG_SLOW,  /* oversized inner IPv4 the XDP fragmenter can't take:
+                            * kernel ip6tnl fallback (inner-IPv4 fragmentation) */
     STAT_DECAP_FRAG_SLOW,  /* decapped inner too big for a non-DF LAN egress */
     STAT_DECAP_REASM_PASS, /* fragmented softwire IPv6: kernel reassembles + decaps */
     STAT_DECAP_MARTIAN,    /* decapped inner resolves off-LAN (would bounce): dropped */
+    /*
+     * In-XDP softwire fragmentation (RFC 6333 §5.3, errata 5847 -> RFC 2473
+     * §7.2(b)): the oversized inner IPv4 is encapsulated whole and the outer
+     * IPv6 is fragmented, DF bit ignored.
+     */
+    STAT_ENCAP_FRAG_XDP, /* oversized inner IPv4 outer-fragmented in XDP (per packet) */
+    STAT_ENCAP_FRAG_SEG, /* outer-IPv6 fragments emitted by xdp_softwire_frag* */
     STAT_MAX,
 };
 
@@ -703,57 +771,177 @@ maybe_redirect_to_cpu(struct xdp_md *ctx, const struct iphdr *inner_iph, void *d
 }
 
 /*
- * Sends a plain (untunneled) ICMPv4 Fragmentation Needed reply straight back
- * out the LAN interface a packet arrived on. Used from the encap path: the
- * offending packet hasn't been tunneled yet, so its sender is directly
- * reachable on the ingress interface.
+ * Softwire (outer IPv6) fragmentation for an oversized inner IPv4 packet, in
+ * XDP (RFC 6333 §5.3). §5.3 -- clarified by errata 5847, which points at
+ * RFC 2473 §7.2(b) and ignores the DF bit -- forbids fragmenting the inner
+ * IPv4 packet: the B4 must encapsulate it whole and fragment the resulting
+ * *outer IPv6* packet, whether or not the inner packet set DF. (This replaced
+ * the earlier DF -> ICMPv4 Fragmentation Needed behavior here; an oversized
+ * DF packet is now fragmented transparently instead of bouncing a PMTUD
+ * signal. minuteman's primary MTU strategy is still the advertised WAN-40 LAN
+ * MTU, so this path only carries traffic from clients that ignore it.)
+ *
+ * XDP emits exactly one frame per input frame, so the fragments are made by
+ * cloning: the frame is encapsulated once -- outer Ethernet + IPv6
+ * (nexthdr = Fragment) + Fragment header (offset 0, M=1, fresh random ID) --
+ * and broadcast to frag_ports (the companion veth pairs' A ends; see that
+ * map's comment for why it is one pair per fragment), where pair i's
+ * xdp_softwire_frag<i> program (emit_softwire_fragment) trims its clone down
+ * to fragment i and redirects it out the WAN. The Fragment header written
+ * here before the broadcast is what every clone inherits, so all fragments
+ * share one identification without any metadata passing.
+ *
+ * What the broadcast can't cover falls back to the kernel companion ip6tnl
+ * exactly as before (XDP_PASS + STAT_ENCAP_FRAG_SLOW): no frag_unit
+ * configured, more than MAX_SOFTWIRE_FRAGS fragments needed, or a device MTU
+ * shrunk at runtime below the configured unit. That kernel path fragments the
+ * inner IPv4 (non-DF) or answers Fragmentation Needed (DF) -- a reachability
+ * fallback, not §5.3 conformance.
  */
 static __always_inline int
-send_plain_icmp_frag_needed(struct xdp_md *ctx, __u64 l2_len,
-                            const struct iphdr *orig_iph, __u32 icmp_src_ip,
-                            __u16 next_mtu)
+encap_fragment_outer(struct xdp_md *ctx, __u64 l2_len, struct iphdr *inner_iph,
+                     __u16 inner_len, const struct b4_config *cfg, __u32 wan_mtu)
+{
+    /* Expiring TTL: XDP_PASS so the kernel (which has the slow-path IPv4
+     * default route) answers ICMPv4 Time Exceeded, as on the normal path. */
+    if (inner_iph->ttl <= 1) {
+        increase_stats_count(STAT_PASS);
+        return XDP_PASS;
+    }
+
+    /* frag_ports must actually have somewhere to send the clones (userspace
+     * populates it only once the companion veth pair is up); an unconfigured
+     * map would make the broadcast a silent blackhole. */
+    __u32 slot0 = 0;
+    __u32 unit = cfg->frag_unit & ~7U;
+    if (unit == 0 || inner_len > MAX_SOFTWIRE_FRAGS * unit ||
+        inner_len > cfg->frag_max_inner ||
+        unit + OUTER_IPV6_LEN + sizeof(struct frag_hdr) > wan_mtu ||
+        !bpf_map_lookup_elem(&frag_ports, &slot0)) {
+        increase_stats_count(STAT_ENCAP_FRAG_SLOW);
+        return XDP_PASS;
+    }
+
+    /*
+     * Resolve the WAN next hop for a *fragment-sized* packet (the largest
+     * fragment: outer IPv6 + Fragment header + unit), never the whole
+     * oversized one: bpf_fib_lookup returns FRAG_NEEDED early -- before
+     * filling in ifindex/dmac/smac -- when tot_len exceeds the route MTU, so
+     * looking up the full length here would leave the ingress ifindex echoed
+     * back and trip the wrong-interface check. The fragments really are this
+     * size, so this is also the honest question to ask the FIB.
+     */
+    struct bpf_fib_lookup fib = {};
+    if (!lookup_aftr_nexthop(ctx, cfg, (__u16)(unit + sizeof(struct frag_hdr)), &fib))
+        return XDP_PASS;
+
+    int delta = (int)l2_len - (int)(OUTER_HDR_LEN + sizeof(struct frag_hdr));
+    if (bpf_xdp_adjust_head(ctx, delta) < 0) {
+        increase_stats_count(STAT_ABORT);
+        return XDP_ABORTED;
+    }
+
+    __u8 *data = (__u8 *)(long)ctx->data;
+    __u8 *data_end = (__u8 *)(long)ctx->data_end;
+
+    struct ethhdr *outer_eth = (struct ethhdr *)data;
+    struct ipv6hdr *outer_iph = (struct ipv6hdr *)(data + OUTER_ETH_LEN);
+    struct frag_hdr *fh = (struct frag_hdr *)(data + OUTER_HDR_LEN);
+    inner_iph = (struct iphdr *)(data + OUTER_HDR_LEN + sizeof(struct frag_hdr));
+
+    if ((void *)(inner_iph + 1) > data_end || (void *)inner_iph + inner_len > data_end) {
+        increase_stats_count(STAT_ABORT);
+        return XDP_ABORTED;
+    }
+
+    write_outer_eth6(outer_eth, cfg, &fib, true);
+    write_outer_ipv6(outer_iph, &cfg->b4_addr, &cfg->aftr_addr, IPPROTO_FRAGMENT,
+                     (__u16)(inner_len + sizeof(struct frag_hdr)));
+    fh->nexthdr = IPPROTO_IPIP;
+    fh->reserved = 0;
+    fh->frag_off = bpf_htons(1); /* offset 0, M=1 */
+    fh->identification = bpf_get_prandom_u32();
+    decrease_ipv4_ttl(inner_iph);
+
+    increase_stats_count(STAT_ENCAP_FRAG_XDP);
+    return bpf_redirect_map(&frag_ports, 0, BPF_F_BROADCAST);
+}
+
+/*
+ * Trims one broadcast clone of encap_fragment_outer()'s encapsulated frame
+ * down to outer-IPv6 fragment idx -- payload bytes [idx*unit, idx*unit +
+ * unit) of the inner IPv4 packet, behind a copy of the original Ethernet +
+ * IPv6 + Fragment headers with payload_len/frag_off/M rewritten -- and
+ * redirects the result out the WAN. A clone beyond the last fragment (the
+ * packet needed fewer than MAX_SOFTWIRE_FRAGS) is dropped, as is any stray
+ * non-clone traffic the kernel puts on the pair. Runs as the rx XDP program
+ * of companion veth pair idx's B end (which is also what activates the
+ * pair's NAPI so it consumes XDP frames at all).
+ */
+static __always_inline int
+emit_softwire_fragment(struct xdp_md *ctx, __u32 idx)
 {
     __u8 *data = (__u8 *)(long)ctx->data;
     __u8 *data_end = (__u8 *)(long)ctx->data_end;
 
-    if (!icmp_src_ip) {
-        increase_stats_count(STAT_MTU_DROP);
+    __u64 l2_len = 0;
+    struct ipv6hdr *ip6h = 0;
+    if (parse_l2_ipv6(data, data_end, &l2_len, &ip6h) != 1 ||
+        ip6h->nexthdr != IPPROTO_FRAGMENT) {
+        /* Not a clone of ours: stray kernel chatter on the pair. */
+        increase_stats_count(STAT_DROP);
         return XDP_DROP;
     }
 
-    if (!icmp_error_allowed()) {
-        increase_stats_count(STAT_MTU_DROP);
-        increase_stats_count(STAT_ICMP_RATE_LIMITED);
+    struct frag_hdr *fh = (struct frag_hdr *)(ip6h + 1);
+    if ((void *)(fh + 1) > (void *)data_end) {
+        increase_stats_count(STAT_DROP);
         return XDP_DROP;
     }
 
-    if (l2_len < sizeof(struct ethhdr) || l2_len > 64) {
+    __u16 plen = bpf_ntohs(ip6h->payload_len);
+    if (plen < sizeof(*fh) + sizeof(struct iphdr)) {
+        increase_stats_count(STAT_ABORT);
+        return XDP_ABORTED;
+    }
+    __u32 total = plen - sizeof(*fh); /* inner IPv4 bytes to slice up */
+
+    struct b4_config *g = get_b4_config();
+    if (!g || !g->wan_ifindex) {
+        increase_stats_count(STAT_NO_CONFIG);
+        return XDP_DROP;
+    }
+    __u32 unit = g->frag_unit & ~7U;
+    if (unit < 8 || unit > 0xffff) {
         increase_stats_count(STAT_ABORT);
         return XDP_ABORTED;
     }
 
-    if (orig_iph->ihl != 5) {
-        increase_stats_count(STAT_MTU_DROP);
-        return XDP_DROP;
+    __u32 start = idx * unit;
+    if (start >= total)
+        return XDP_DROP; /* packet needs fewer fragments than clones */
+
+    __u32 len = total - start;
+    bool last = true;
+    if (len > unit) {
+        len = unit;
+        last = false;
     }
 
-    if (bpf_ntohs(orig_iph->tot_len) < ICMP_FRAG_QUOTE_LEN ||
-        (void *)orig_iph + ICMP_FRAG_QUOTE_LEN > data_end) {
+    /* The headers survive the front trim below only as these stack copies. */
+    struct ethhdr eth_copy = *(struct ethhdr *)data;
+    struct ipv6hdr ip6_copy = *ip6h;
+    struct frag_hdr fh_copy = *fh;
+
+    /* Drop the payload of the preceding fragments off the front (the headers
+     * go with it and are rewritten from the copies), then everything past
+     * this fragment's slice off the tail. */
+    if (start > 0 && bpf_xdp_adjust_head(ctx, (int)start) < 0) {
         increase_stats_count(STAT_ABORT);
         return XDP_ABORTED;
     }
-
-    struct ipv4_quote quote = {};
-    copy_ipv4_quote(&quote, orig_iph);
-
-    __u32 new_len = (__u32)l2_len + (__u32)ICMP_FRAG_REPLY_L3_LEN;
-    __u32 old_len = data_end - data;
-    if (new_len > old_len) {
-        increase_stats_count(STAT_ABORT);
-        return XDP_ABORTED;
-    }
-
-    if (bpf_xdp_adjust_tail(ctx, (int)new_len - (int)old_len) < 0) {
+    __u32 tail_trim = total - start - len;
+    if (tail_trim > 0 && bpf_xdp_adjust_tail(ctx, -(int)tail_trim) < 0) {
         increase_stats_count(STAT_ABORT);
         return XDP_ABORTED;
     }
@@ -762,21 +950,22 @@ send_plain_icmp_frag_needed(struct xdp_md *ctx, __u64 l2_len,
     data_end = (__u8 *)(long)ctx->data_end;
 
     struct ethhdr *eth = (struct ethhdr *)data;
-    struct iphdr *iph = (struct iphdr *)(data + l2_len);
-    struct icmp_frag_needed *icmp =
-        (struct icmp_frag_needed *)(data + l2_len + sizeof(struct iphdr));
-
-    if ((void *)(eth + 1) > data_end || (void *)(iph + 1) > data_end ||
-        (void *)(icmp + 1) > data_end) {
+    struct ipv6hdr *out6 = (struct ipv6hdr *)(data + OUTER_ETH_LEN);
+    struct frag_hdr *outfh = (struct frag_hdr *)(data + OUTER_HDR_LEN);
+    if ((void *)(outfh + 1) > (void *)data_end) {
         increase_stats_count(STAT_ABORT);
         return XDP_ABORTED;
     }
 
-    write_plain_icmp_frag_needed(eth, iph, icmp, &quote, icmp_src_ip, next_mtu);
+    *eth = eth_copy;
+    ip6_copy.payload_len = bpf_htons((__u16)(len + sizeof(struct frag_hdr)));
+    *out6 = ip6_copy;
+    /* start is a multiple of 8, so (start/8) << 3 == start; bit 0 is M. */
+    fh_copy.frag_off = bpf_htons((__u16)(start | (last ? 0 : 1)));
+    *outfh = fh_copy;
 
-    increase_stats_count(STAT_MTU_DROP);
-    increase_stats_count(STAT_ICMP_FRAG_NEEDED);
-    return XDP_TX;
+    increase_stats_count(STAT_ENCAP_FRAG_SEG);
+    return redirect_to_ifindex(g->wan_ifindex, STAT_REDIRECT_WAN);
 }
 
 /*
@@ -784,8 +973,8 @@ send_plain_icmp_frag_needed(struct xdp_md *ctx, __u64 l2_len,
  * interface the offending packet arrived on. Used from the native-IPv6
  * forwarding fastpath when the resolved egress link's MTU is too small: since
  * IPv6 is never softwire-tunneled, the original sender is directly reachable via
- * the ingress interface, so this is a plain (untunneled) reply -- the IPv6
- * analogue of send_plain_icmp_frag_needed, not send_dslite_icmp_frag_needed.
+ * the ingress interface, so this is a plain (untunneled) reply, unlike
+ * send_dslite_icmp_frag_needed's softwire-encapsulated IPv4 one.
  * src6 is the router's own routable source address for the reply; if it's
  * unset, the packet is handed to the kernel to originate the PtB instead.
  */
@@ -1052,29 +1241,14 @@ xdp_dslite_encap(struct xdp_md *ctx)
     __u32 wan_mtu = 0;
     int ret =
         check_dev_mtu(ctx, cfg->wan_ifindex, TUNNEL_L3_OVERHEAD + inner_len, &wan_mtu);
-    if (ret == BPF_MTU_CHK_RET_FRAG_NEEDED) {
-        __u32 next_mtu =
-            wan_mtu > TUNNEL_L3_OVERHEAD ? wan_mtu - TUNNEL_L3_OVERHEAD : ICMPV4_MIN_MTU;
-        if (next_mtu < ICMPV4_MIN_MTU)
-            next_mtu = ICMPV4_MIN_MTU;
-        if (next_mtu > 0xffff)
-            next_mtu = 0xffff;
-
-        if (ipv4_has_df(inner_iph))
-            return send_plain_icmp_frag_needed(ctx, l2_len, inner_iph, lan->gateway_ip,
-                                               (__u16)next_mtu);
-
+    if (ret == BPF_MTU_CHK_RET_FRAG_NEEDED)
         /*
-         * Oversized but fragmentable (non-DF): RFC 6333 §5.3 requires the B4
-         * to fragment rather than drop. XDP can't, so hand the untouched inner
-         * IPv4 packet to the kernel, whose IPv4 default route toward the
-         * companion ip6tnl fragments it to the tunnel MTU and encapsulates each
-         * piece. The packet is unmodified here (encap adjust_head is below), so
-         * XDP_PASS delivers it pristine.
+         * Too big for the WAN once encapsulated: encapsulate whole and
+         * fragment the *outer IPv6*, DF ignored (RFC 6333 §5.3 / errata 5847
+         * -> RFC 2473 §7.2(b)); see encap_fragment_outer for the mechanism
+         * and its ip6tnl fallback.
          */
-        increase_stats_count(STAT_ENCAP_FRAG_SLOW);
-        return XDP_PASS;
-    }
+        return encap_fragment_outer(ctx, l2_len, inner_iph, inner_len, cfg, wan_mtu);
     if (ret != 0)
         return XDP_DROP;
 
@@ -1111,7 +1285,7 @@ xdp_dslite_encap(struct xdp_md *ctx)
     }
 
     write_outer_eth6(outer_eth, cfg, &fib, fib_ok);
-    write_outer_ipv6(outer_iph, &cfg->b4_addr, &cfg->aftr_addr, inner_len);
+    write_outer_ipv6(outer_iph, &cfg->b4_addr, &cfg->aftr_addr, IPPROTO_IPIP, inner_len);
     decrease_ipv4_ttl(inner_iph);
 
     increase_stats_count(STAT_ENCAP);
@@ -1580,3 +1754,25 @@ xdp_ipv6_fwd_cpu(struct xdp_md *ctx)
 
     return handle_ipv6_forward(ctx, l2_len, ip6h, &cfg);
 }
+
+/*
+ * The rx XDP programs of the softwire-fragmentation companion veth pairs'
+ * B ends: pair i's program turns the broadcast clone arriving there into
+ * outer-IPv6 fragment i and sends it out the WAN (see encap_fragment_outer /
+ * emit_softwire_fragment). One program per possible fragment, its index a
+ * compile-time constant: nothing about the clones themselves differs, so
+ * which fragment a clone becomes is decided entirely by which pair it was
+ * cloned into (see frag_ports for why that must be one *device* per
+ * fragment, not one devmap egress program per entry).
+ */
+#define SOFTWIRE_FRAG_PROG(i)                                                            \
+    SEC("xdp")                                                                           \
+    int xdp_softwire_frag##i(struct xdp_md *ctx)                                         \
+    {                                                                                    \
+        return emit_softwire_fragment(ctx, i);                                           \
+    }
+
+SOFTWIRE_FRAG_PROG(0)
+SOFTWIRE_FRAG_PROG(1)
+SOFTWIRE_FRAG_PROG(2)
+SOFTWIRE_FRAG_PROG(3)

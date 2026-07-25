@@ -248,13 +248,13 @@ parse_l2_ipv6(void *data, void *data_end, __u64 *l2_len_out, struct ipv6hdr **ip
 
 static __always_inline void
 write_outer_ipv6(struct ipv6hdr *iph, const struct in6_addr *saddr,
-                 const struct in6_addr *daddr, __u16 payload_len)
+                 const struct in6_addr *daddr, __u8 nexthdr, __u16 payload_len)
 {
     iph->version = 6;
     iph->priority = 0;
     __builtin_memset(iph->flow_lbl, 0, sizeof(iph->flow_lbl));
     iph->payload_len = bpf_htons(payload_len);
-    iph->nexthdr = IPPROTO_IPIP;
+    iph->nexthdr = nexthdr;
     iph->hop_limit = 64;
     iph->saddr = *saddr;
     iph->daddr = *daddr;
@@ -291,39 +291,6 @@ build_icmp_frag_needed(struct icmp_frag_needed *msg, const struct ipv4_quote *qu
 }
 
 /*
- * Writes an ICMPv4 "Fragmentation Needed" reply in place of the packet
- * currently at [eth, iph, icmp), addressed back to the quoted packet's
- * source, over a plain (untunneled) Ethernet+IPv4 frame. Used on the LAN
- * side, where no DS-Lite encapsulation is needed to reach the sender.
- */
-static __always_inline void
-write_plain_icmp_frag_needed(struct ethhdr *eth, struct iphdr *iph,
-                             struct icmp_frag_needed *icmp,
-                             const struct ipv4_quote *quote, __u32 icmp_src_ip_host_order,
-                             __u16 next_mtu)
-{
-    struct icmp_frag_needed msg = {};
-
-    swap_eth_addrs(eth);
-    eth->h_proto = bpf_htons(ETH_P_IP);
-
-    iph->version = 4;
-    iph->ihl = 5;
-    iph->tos = 0;
-    iph->tot_len = bpf_htons((__u16)ICMP_FRAG_REPLY_L3_LEN);
-    iph->id = 0;
-    iph->frag_off = 0;
-    iph->ttl = 64;
-    iph->protocol = IPPROTO_ICMP;
-    iph->saddr = bpf_htonl(icmp_src_ip_host_order);
-    iph->daddr = quote->iph.saddr;
-    ipv4_checksum(iph);
-
-    build_icmp_frag_needed(&msg, quote, next_mtu);
-    __builtin_memcpy(icmp, &msg, sizeof(msg));
-}
-
-/*
  * Writes an ICMPv4 "Fragmentation Needed" reply that is itself
  * re-encapsulated in a DS-Lite (IPv4-in-IPv6) tunnel frame, addressed back
  * through the AFTR to the original IPv4 sender. Used when the WAN-side path
@@ -343,7 +310,8 @@ write_dslite_icmp_frag_needed(struct ethhdr *eth, struct ipv6hdr *outer_iph,
     swap_eth_addrs(eth);
     eth->h_proto = bpf_htons(ETH_P_IPV6);
 
-    write_outer_ipv6(outer_iph, b4_addr, aftr_addr, (__u16)ICMP_FRAG_REPLY_L3_LEN);
+    write_outer_ipv6(outer_iph, b4_addr, aftr_addr, IPPROTO_IPIP,
+                     (__u16)ICMP_FRAG_REPLY_L3_LEN);
 
     icmp_iph->version = 4;
     icmp_iph->ihl = 5;

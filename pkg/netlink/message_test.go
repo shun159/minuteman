@@ -239,6 +239,66 @@ func TestBuildAddIP6TnlMessage(t *testing.T) {
 	}
 }
 
+func TestBuildAddVethMessage(t *testing.T) {
+	flags := uint16(unix.NLM_F_REQUEST | unix.NLM_F_ACK | unix.NLM_F_CREATE | unix.NLM_F_EXCL)
+	msg := buildAddVethMessage(9, flags, "mm-frag0", "mm-frag0p", 3456)
+
+	if got := binary.NativeEndian.Uint16(msg[4:6]); got != unix.RTM_NEWLINK {
+		t.Errorf("nlmsghdr.Type = %d, want RTM_NEWLINK", got)
+	}
+	if got := binary.NativeEndian.Uint32(msg[0:4]); int(got) != len(msg) {
+		t.Errorf("nlmsghdr.Len = %d, want %d", got, len(msg))
+	}
+
+	ifi := msg[unix.SizeofNlMsghdr:]
+	attrs := map[uint16][]byte{}
+	walkAttrs(t, ifi[unix.SizeofIfInfomsg:], attrs)
+
+	if name := attrs[unix.IFLA_IFNAME]; string(name) != "mm-frag0\x00" {
+		t.Errorf("IFLA_IFNAME = %q, want %q", name, "mm-frag0\x00")
+	}
+	if mtu := attrs[unix.IFLA_MTU]; len(mtu) != 4 || binary.NativeEndian.Uint32(mtu) != 3456 {
+		t.Errorf("IFLA_MTU = %v, want 3456", mtu)
+	}
+
+	linfo, ok := attrs[unix.IFLA_LINKINFO]
+	if !ok {
+		t.Fatal("IFLA_LINKINFO absent")
+	}
+	info := map[uint16][]byte{}
+	walkAttrs(t, linfo, info)
+	if kind := info[unix.IFLA_INFO_KIND]; string(kind) != "veth\x00" {
+		t.Errorf("IFLA_INFO_KIND = %q, want %q", kind, "veth\x00")
+	}
+
+	data, ok := info[unix.IFLA_INFO_DATA]
+	if !ok {
+		t.Fatal("IFLA_INFO_DATA absent")
+	}
+	veth := map[uint16][]byte{}
+	walkAttrs(t, data, veth)
+
+	// VETH_INFO_PEER carries the peer's own ifinfomsg followed by its attrs.
+	peer, ok := veth[vethInfoPeer]
+	if !ok {
+		t.Fatal("VETH_INFO_PEER absent")
+	}
+	if len(peer) < unix.SizeofIfInfomsg {
+		t.Fatalf("VETH_INFO_PEER too short for an ifinfomsg: %d bytes", len(peer))
+	}
+	if peer[0] != unix.AF_UNSPEC {
+		t.Errorf("peer ifinfomsg.Family = %d, want AF_UNSPEC", peer[0])
+	}
+	peerAttrs := map[uint16][]byte{}
+	walkAttrs(t, peer[unix.SizeofIfInfomsg:], peerAttrs)
+	if name := peerAttrs[unix.IFLA_IFNAME]; string(name) != "mm-frag0p\x00" {
+		t.Errorf("peer IFLA_IFNAME = %q, want %q", name, "mm-frag0p\x00")
+	}
+	if mtu := peerAttrs[unix.IFLA_MTU]; len(mtu) != 4 || binary.NativeEndian.Uint32(mtu) != 3456 {
+		t.Errorf("peer IFLA_MTU = %v, want 3456", mtu)
+	}
+}
+
 func TestBuildChangeIP6TnlMessage(t *testing.T) {
 	local := netip.MustParseAddr("fd00:1::9")
 	remote := netip.MustParseAddr("fd00:2::2")

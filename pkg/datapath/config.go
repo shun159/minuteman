@@ -48,6 +48,10 @@ func (l *Loader) SetB4Config(cfg B4Config) error {
 	copy(val.SrcMac[:], cfg.SrcMAC)
 	copy(val.DstMac[:], cfg.DstMAC)
 	val.WanIfindex = cfg.WANIfindex
+	val.FragUnit = softwireFragUnit(cfg.WANMTU)
+	if cfg.FragMaxInner > 0 {
+		val.FragMaxInner = uint32(cfg.FragMaxInner)
+	}
 	// val.B4Addr/AftrAddr are intentionally left zero: the datapath reads
 	// the softwire addresses from the active next_hop slot, not from here
 	// (see resolve_softwire in bpf/datapath.bpf.c).

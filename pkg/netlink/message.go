@@ -227,6 +227,38 @@ func buildChangeIP6TnlMessage(seq uint32, ifindex int, local, remote netip.Addr)
 	return buildMessage(unix.RTM_NEWLINK, unix.NLM_F_REQUEST|unix.NLM_F_ACK, seq, body)
 }
 
+// vethInfoPeer is VETH_INFO_PEER from <linux/veth.h>: the IFLA_INFO_DATA
+// attribute carrying the peer end's own ifinfomsg + attributes. x/sys/unix
+// doesn't export it -- same vendoring rationale as the IFLA_IPTUN_* codes.
+const vethInfoPeer = 1
+
+// buildAddVethMessage builds an RTM_NEWLINK request creating a veth pair
+// (name, peerName) with the given MTU on both ends -- the rtnetlink
+// equivalent of `ip link add <name> mtu <mtu> type veth peer name <peerName>`
+// (plus the peer's MTU, which iproute2 would take after `peer`). The caller
+// supplies NLM_F_CREATE|NLM_F_EXCL in flags.
+func buildAddVethMessage(seq uint32, flags uint16, name, peerName string, mtu int) []byte {
+	mtuBuf := make([]byte, 4)
+	binary.NativeEndian.PutUint32(mtuBuf, uint32(mtu))
+
+	// The peer is described by a full ifinfomsg of its own inside
+	// VETH_INFO_PEER, followed by its attributes.
+	peer := buildIfInfoBody(0, 0, 0)
+	peer = append(peer, encodeRtAttr(unix.IFLA_IFNAME, []byte(peerName+"\x00"))...)
+	peer = append(peer, encodeRtAttr(unix.IFLA_MTU, mtuBuf)...)
+
+	data := encodeNestedAttr(unix.IFLA_INFO_DATA,
+		encodeRtAttr(vethInfoPeer, peer),
+	)
+	kind := encodeRtAttr(unix.IFLA_INFO_KIND, []byte("veth\x00"))
+
+	body := buildIfInfoBody(0, 0, 0)
+	body = append(body, encodeRtAttr(unix.IFLA_IFNAME, []byte(name+"\x00"))...)
+	body = append(body, encodeRtAttr(unix.IFLA_MTU, mtuBuf)...)
+	body = append(body, encodeNestedAttr(unix.IFLA_LINKINFO, kind, data)...)
+	return buildMessage(unix.RTM_NEWLINK, flags, seq, body)
+}
+
 // buildSetLinkUpMessage builds an RTM_NEWLINK request setting ifindex IFF_UP.
 func buildSetLinkUpMessage(seq uint32, ifindex int) []byte {
 	body := buildIfInfoBody(ifindex, unix.IFF_UP, unix.IFF_UP)

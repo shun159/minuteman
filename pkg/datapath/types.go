@@ -20,6 +20,19 @@ type B4Config struct {
 	// WANIfindex is the expected egress interface toward the AFTR; FIB
 	// lookups that resolve to a different interface are rejected.
 	WANIfindex uint32
+
+	// WANMTU is the WAN interface's MTU, from which the datapath's softwire
+	// fragmentation unit is derived (see softwireFragUnit): an oversized
+	// inner IPv4 packet is encapsulated whole and the outer IPv6 fragmented
+	// to this budget (RFC 6333 §5.3). Zero (or a degenerate value) disables
+	// in-XDP fragmentation, leaving the kernel ip6tnl fallback.
+	WANMTU int
+
+	// FragMaxInner caps the inner IPv4 packet size the in-XDP fragmenter
+	// takes (internal/fragpath's MaxInnerLen -- what its companion veth pair
+	// can carry a clone of); larger packets fall back to the kernel ip6tnl.
+	// Zero disables in-XDP fragmentation like a zero WANMTU does.
+	FragMaxInner int
 }
 
 // LANConfig is the per-LAN-interface configuration keyed by interface index.
@@ -77,8 +90,13 @@ type Stats struct {
 	// Softwire fragmentation slow path (RFC 6333 §5.3): packets XDP hands to
 	// the kernel for the companion ip6tnl to fragment/reassemble rather than
 	// dropping. See bpf/datapath.bpf.c's STAT_ENCAP_FRAG_SLOW et al.
-	EncapFragSlow  uint64 // oversized non-DF inner IPv4: kernel frags + encaps
+	EncapFragSlow  uint64 // oversized inner the XDP fragmenter can't take: ip6tnl fallback
 	DecapFragSlow  uint64 // decapped inner too big for a non-DF LAN egress
 	DecapReasmPass uint64 // fragmented softwire IPv6: kernel reassembles + decaps
 	DecapMartian   uint64 // decapped inner resolves off-LAN (would bounce): dropped
+
+	// In-XDP softwire fragmentation (RFC 6333 §5.3, errata 5847): oversized
+	// inner IPv4 encapsulated whole, outer IPv6 fragmented, DF ignored.
+	EncapFragXDP uint64 // packets outer-fragmented in XDP (one per inner packet)
+	EncapFragSeg uint64 // outer-IPv6 fragments emitted by xdp_softwire_frag*
 }

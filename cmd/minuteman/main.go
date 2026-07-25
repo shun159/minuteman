@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/shun159/miniteman/internal/cliconfig"
+	"github.com/shun159/miniteman/internal/fragpath"
 	"github.com/shun159/miniteman/internal/lanprefix"
 	"github.com/shun159/miniteman/internal/slowpath"
 	"github.com/shun159/miniteman/internal/wanextend"
@@ -239,6 +240,34 @@ func run() error {
 		return fmt.Errorf("looking up WAN interface: %w", err)
 	}
 
+	// The in-XDP softwire fragmenter's companion veth pairs (RFC 6333 §5.3
+	// outer-IPv6 fragmentation; see internal/fragpath for why the clones must
+	// bounce through one large-MTU pair per fragment). Wired up before
+	// SetB4Config sets frag_unit, so the datapath never engages the
+	// fragmenter without the plumbing behind it. Fail-fast, matching the
+	// slowpath tunnel's stance.
+	fragVeths, err := fragpath.New()
+	if err != nil {
+		return fmt.Errorf("opening softwire fragmentation veth pairs: %w", err)
+	}
+	if err := fragVeths.Ensure(); err != nil {
+		fragVeths.Close()
+		return err
+	}
+	// Deferred (device teardown) so it runs after bgWG.Wait but before
+	// dp.Close (defers are LIFO), the same ordering as tun.Close below. Note
+	// this deletes the mm-frag* devices while dp.Close still holds the
+	// xdp_softwire_frag* links (l.fragLinks) attached to them; that's benign
+	// (Linux auto-detaches an XDP bpf_link on NETDEV_UNREGISTER, and a packet
+	// arriving in that shutdown window just falls back and is dropped by the
+	// kernel), but it is the reverse of detach-then-delete, so it's called out
+	// here rather than left implicit.
+	defer fragVeths.Close()
+	if err := dp.EnableSoftwireFrag(fragVeths.RedirectIfindexes(), fragpath.FwdNames()); err != nil {
+		return fmt.Errorf("enabling softwire fragmentation: %w", err)
+	}
+	log.Printf("softwire fragmentation: XDP outer-IPv6 fragmenter ready via %d mm-frag* veth pairs", fragpath.NumPairs)
+
 	// Resolve the B4 softwire source. With -b4 it is the given static address;
 	// without it, ask the kernel which source it would use toward the AFTR
 	// (RFC 6724), retrying until the WAN's RA-learned route to the AFTR is back
@@ -256,11 +285,13 @@ func run() error {
 	}
 
 	if err := dp.SetB4Config(datapath.B4Config{
-		B4Addr:     b4,
-		AFTRAddr:   aftr,
-		SrcMAC:     wanNetIface.HardwareAddr,
-		DstMAC:     dstMAC,
-		WANIfindex: wanIfindex,
+		B4Addr:       b4,
+		AFTRAddr:     aftr,
+		SrcMAC:       wanNetIface.HardwareAddr,
+		DstMAC:       dstMAC,
+		WANIfindex:   wanIfindex,
+		WANMTU:       wanNetIface.MTU,
+		FragMaxInner: fragpath.MaxInnerLen,
 	}); err != nil {
 		return fmt.Errorf("setting B4 config: %w", err)
 	}
@@ -1010,11 +1041,11 @@ type rediscovery struct {
 	dp          *datapath.Loader
 	tun         *slowpath.Tunnel // repointed at the new endpoints after an AFTR migration or B4 switch
 	nl          *netlink.Socket  // re-queries the B4 source on a WAN-change signal; nil for a static B4
-	wanIface    string          // for DHCPv6/HB46PP re-discovery
-	wanIfindex  int             // for the B4 source re-query
-	identity    hb46ppIdentity  // HB46PP client identity for re-discovery
-	aftrDynamic bool            // AFTR was discovered (has refresh semantics), vs. a static -aftr
-	wanChange   <-chan struct{} // WAN-address change signal from watchB4; nil for a static B4
+	wanIface    string           // for DHCPv6/HB46PP re-discovery
+	wanIfindex  int              // for the B4 source re-query
+	identity    hb46ppIdentity   // HB46PP client identity for re-discovery
+	aftrDynamic bool             // AFTR was discovered (has refresh semantics), vs. a static -aftr
+	wanChange   <-chan struct{}  // WAN-address change signal from watchB4; nil for a static B4
 
 	current   aftrDiscovery // the AFTR in use plus its refresh pacing/token
 	currentB4 netip.Addr    // the B4 source in use (this goroutine's working copy)
@@ -1281,6 +1312,16 @@ func attachLAN(dp *datapath.Loader, spec cliconfig.LANSpec) error {
 			return fmt.Errorf("looking up LAN interface %s: %w", spec.Iface, err)
 		}
 		mtu = iface.MTU
+	}
+
+	// A LAN whose MTU exceeds the in-XDP fragmenter's clone-admission ceiling
+	// lets clients emit an inner packet too big for outer-IPv6 fragmentation,
+	// which then silently falls to the kernel ip6tnl (inner-IPv4 fragmentation,
+	// not RFC 6333 §5.3-conformant — see docs/rfc-compliance-backlog.md §4).
+	// Surface it once at startup so it's actionable, not discovered via counters.
+	if mtu > fragpath.MaxInnerLen {
+		log.Printf("warning: LAN %s MTU %d exceeds the softwire fragmenter's ceiling (%d); oversized traffic from this LAN uses the non-§5.3 ip6tnl fallback (EncapFragSlow)",
+			spec.Iface, mtu, fragpath.MaxInnerLen)
 	}
 
 	if err := dp.SetLANConfig(ifindex, datapath.LANConfig{

@@ -18,6 +18,7 @@ type Loader struct {
 	wanLink    link.Link
 	wanIfindex uint32
 	lanLinks   map[uint32]link.Link
+	fragLinks  []link.Link
 }
 
 // Load compiles-in objects (embedded at build time by bpf2go) and loads them
@@ -49,6 +50,9 @@ func Load() (*Loader, error) {
 func (l *Loader) Close() error {
 	if l.wanLink != nil {
 		l.wanLink.Close()
+	}
+	for _, lk := range l.fragLinks {
+		lk.Close()
 	}
 	for _, lk := range l.lanLinks {
 		lk.Close()
