@@ -326,6 +326,15 @@ enum stat_id {
      */
     STAT_ENCAP_FRAG_XDP, /* oversized inner IPv4 outer-fragmented in XDP (per packet) */
     STAT_ENCAP_FRAG_SEG, /* outer-IPv6 fragments emitted by xdp_softwire_frag* */
+    /*
+     * Decap-side inner-TTL expiry answered in XDP with a softwire-encapsulated
+     * ICMPv4 Time Exceeded (RFC 1812 §5.3.1). Appended here rather than next to
+     * STAT_ICMP_FRAG_NEEDED on purpose: these ids are the keys of the bpffs-
+     * pinned stats map, so inserting one mid-enum renumbers every counter after
+     * it and breaks any observer (`minuteman stats`, bpftool) built against a
+     * different revision. New counters go before STAT_MAX, never in the middle.
+     */
+    STAT_ICMP_TIME_EXCEEDED,
     STAT_MAX,
 };
 
@@ -1415,16 +1424,10 @@ finish_decap_slow_path(struct ethhdr *eth, const struct ethhdr *old_eth)
  */
 static __always_inline int
 send_dslite_icmp_frag_needed(struct xdp_md *ctx, const struct b4_config *cfg,
-                             const struct iphdr *inner_iph, __u32 icmp_src_ip,
-                             __u16 next_mtu)
+                             const struct iphdr *inner_iph, __u16 next_mtu)
 {
     __u8 *data = (__u8 *)(long)ctx->data;
     __u8 *data_end = (__u8 *)(long)ctx->data_end;
-
-    if (!icmp_src_ip) {
-        increase_stats_count(STAT_MTU_DROP);
-        return XDP_DROP;
-    }
 
     if (inner_iph->ihl != 5) {
         increase_stats_count(STAT_MTU_DROP);
@@ -1445,6 +1448,18 @@ send_dslite_icmp_frag_needed(struct xdp_md *ctx, const struct b4_config *cfg,
 
     struct ipv4_quote quote = {};
     copy_ipv4_quote(&quote, inner_iph);
+
+    /* RFC 1812 §4.3.2.7: no ICMP error for a non-initial fragment, another
+     * ICMP error, or a source that isn't a single host. The offending packet
+     * is too big for the egress either way, so it is simply dropped. */
+    if (!icmp_error_eligible(&quote)) {
+        increase_stats_count(STAT_MTU_DROP);
+        return XDP_DROP;
+    }
+
+    struct bpf_fib_lookup fib = {};
+    if (!lookup_aftr_nexthop(ctx, cfg, ICMP_FRAG_REPLY_L3_LEN, &fib))
+        return XDP_DROP;
 
     __u32 new_len = OUTER_ETH_LEN + (__u32)OUTER_IPV6_LEN + (__u32)ICMP_FRAG_REPLY_L3_LEN;
     __u32 old_len = data_end - data;
@@ -1474,11 +1489,104 @@ send_dslite_icmp_frag_needed(struct xdp_md *ctx, const struct b4_config *cfg,
     }
 
     write_dslite_icmp_frag_needed(eth, outer_iph, icmp_iph, icmp, &quote, &cfg->b4_addr,
-                                  &cfg->aftr_addr, icmp_src_ip, next_mtu);
+                                  &cfg->aftr_addr, next_mtu);
+    write_outer_eth6(eth, cfg, &fib, true);
 
     increase_stats_count(STAT_MTU_DROP);
     increase_stats_count(STAT_ICMP_FRAG_NEEDED);
-    return XDP_TX;
+    return redirect_to_ifindex(cfg->wan_ifindex, STAT_REDIRECT_WAN);
+}
+
+/*
+ * Sends an ICMPv4 Time Exceeded (RFC 1812 §5.3.1) for a decapped inner packet
+ * whose TTL expired at the B4, re-encapsulated back through the softwire: like
+ * the Fragmentation Needed above, the original IPv4 sender is only reachable
+ * via the AFTR. Sourced from the well-known B4 address 192.0.0.2 (RFC 6333
+ * §5.7 / RFC 7335), not from a LAN gateway address.
+ *
+ * Every case this can't handle in XDP is XDP_PASSed rather than dropped: the
+ * companion ip6tnl decapsulates the packet and the kernel's own IPv4
+ * forwarding then originates the Time Exceeded, exactly as it already does for
+ * the encap (outbound) direction. Only an unusable next hop or the ICMP rate
+ * limiter drops.
+ */
+static __always_inline int
+send_dslite_icmp_time_exceeded(struct xdp_md *ctx, const struct b4_config *cfg,
+                               const struct iphdr *inner_iph)
+{
+    __u8 *data = (__u8 *)(long)ctx->data;
+    __u8 *data_end = (__u8 *)(long)ctx->data_end;
+
+    if (inner_iph->ihl != 5) {
+        increase_stats_count(STAT_DECAP_PASS);
+        return XDP_PASS;
+    }
+
+    if (bpf_ntohs(inner_iph->tot_len) < ICMP_FRAG_QUOTE_LEN ||
+        (void *)inner_iph + ICMP_FRAG_QUOTE_LEN > data_end) {
+        increase_stats_count(STAT_DECAP_PASS);
+        return XDP_PASS;
+    }
+
+    struct ipv4_quote quote = {};
+    copy_ipv4_quote(&quote, inner_iph);
+
+    /* RFC 1812 §4.3.2.7: no ICMP error for a non-initial fragment, another
+     * ICMP error, or a source that isn't a single host. */
+    if (!icmp_error_eligible(&quote)) {
+        increase_stats_count(STAT_DECAP_PASS);
+        return XDP_PASS;
+    }
+
+    /*
+     * The reply is a fixed 110 bytes, built by shrinking this frame in place;
+     * a smaller offending packet (a bare TCP SYN from a TCP traceroute, say)
+     * can't be rewritten into one, so it goes to the kernel instead of being
+     * treated as a datapath bug.
+     */
+    __u32 new_len =
+        OUTER_ETH_LEN + (__u32)OUTER_IPV6_LEN + (__u32)ICMP_TIME_EXCEEDED_REPLY_L3_LEN;
+    __u32 old_len = data_end - data;
+    if (new_len > old_len) {
+        increase_stats_count(STAT_DECAP_PASS);
+        return XDP_PASS;
+    }
+
+    if (!icmp_error_allowed()) {
+        increase_stats_count(STAT_ICMP_RATE_LIMITED);
+        return XDP_DROP;
+    }
+
+    struct bpf_fib_lookup fib = {};
+    if (!lookup_aftr_nexthop(ctx, cfg, ICMP_TIME_EXCEEDED_REPLY_L3_LEN, &fib))
+        return XDP_DROP;
+
+    if (bpf_xdp_adjust_tail(ctx, (int)new_len - (int)old_len) < 0) {
+        increase_stats_count(STAT_ABORT);
+        return XDP_ABORTED;
+    }
+
+    data = (__u8 *)(long)ctx->data;
+    data_end = (__u8 *)(long)ctx->data_end;
+
+    struct ethhdr *eth = (struct ethhdr *)data;
+    struct ipv6hdr *outer_iph = (struct ipv6hdr *)(data + OUTER_ETH_LEN);
+    struct iphdr *icmp_iph = (struct iphdr *)(data + OUTER_HDR_LEN);
+    struct icmp_time_exceeded *icmp =
+        (struct icmp_time_exceeded *)(data + OUTER_HDR_LEN + sizeof(struct iphdr));
+
+    if ((void *)(eth + 1) > data_end || (void *)(outer_iph + 1) > data_end ||
+        (void *)(icmp_iph + 1) > data_end || (void *)(icmp + 1) > data_end) {
+        increase_stats_count(STAT_ABORT);
+        return XDP_ABORTED;
+    }
+
+    write_dslite_icmp_time_exceeded(eth, outer_iph, icmp_iph, icmp, &quote, &cfg->b4_addr,
+                                    &cfg->aftr_addr);
+    write_outer_eth6(eth, cfg, &fib, true);
+
+    increase_stats_count(STAT_ICMP_TIME_EXCEEDED);
+    return redirect_to_ifindex(cfg->wan_ifindex, STAT_REDIRECT_WAN);
 }
 
 static __always_inline int
@@ -1543,11 +1651,6 @@ handle_xdp_dslite_decap(struct xdp_md *ctx)
     if (mig_state(ctrl_decap) != MIG_STEADY)
         touch_flow_affinity(ctrl_decap, inner_iph_pre, data_end, true);
 
-    if (inner_iph_pre->ttl <= 1) {
-        increase_stats_count(STAT_DECAP_PASS);
-        return XDP_PASS;
-    }
-
     struct ethhdr old_eth = *(struct ethhdr *)data;
 
     struct bpf_fib_lookup fib = {};
@@ -1561,13 +1664,19 @@ handle_xdp_dslite_decap(struct xdp_md *ctx)
     if (lan_lookup == LAN_LOOKUP_DROP)
         return XDP_DROP;
 
-    if (lan_lookup == LAN_LOOKUP_FRAG_NEEDED) {
-        struct lan_config *out_lan = get_lan_config(fib.ifindex);
-        if (!out_lan) {
-            increase_stats_count(STAT_NO_LAN_CONFIG);
-            return XDP_PASS;
-        }
+    /*
+     * TTL expiry (RFC 1812 §5.3.1) applies only to a packet this B4 is
+     * actually *forwarding*, which is why it is decided after the FIB lookup
+     * and not on arrival: LAN_LOOKUP_FAIL covers BPF_FIB_LKUP_RET_NOT_FWDED,
+     * i.e. a packet addressed to one of the CPE's own IPv4 addresses, which is
+     * perfectly legal at TTL 1 and must be delivered locally (the slow path
+     * below XDP_PASSes it) rather than answered with Time Exceeded. It also
+     * covers NO_NEIGH, where the kernel is the one that finishes the job.
+     */
+    if ((fast || lan_lookup == LAN_LOOKUP_FRAG_NEEDED) && inner_iph_pre->ttl <= 1)
+        return send_dslite_icmp_time_exceeded(ctx, cfg, inner_iph_pre);
 
+    if (lan_lookup == LAN_LOOKUP_FRAG_NEEDED) {
         __u32 next_mtu = fib_mtu;
         if (next_mtu < ICMPV4_MIN_MTU)
             next_mtu = ICMPV4_MIN_MTU;
@@ -1575,8 +1684,7 @@ handle_xdp_dslite_decap(struct xdp_md *ctx)
             next_mtu = 0xffff;
 
         if (ipv4_has_df(inner_iph_pre))
-            return send_dslite_icmp_frag_needed(ctx, cfg, inner_iph_pre,
-                                                out_lan->gateway_ip, (__u16)next_mtu);
+            return send_dslite_icmp_frag_needed(ctx, cfg, inner_iph_pre, (__u16)next_mtu);
 
         /*
          * Fragmentable (non-DF) but too big for the LAN egress: hand the still-
@@ -1592,12 +1700,6 @@ handle_xdp_dslite_decap(struct xdp_md *ctx)
         __u32 lan_mtu = 0;
         ret = check_dev_mtu(ctx, fib.ifindex, inner_len, &lan_mtu);
         if (ret == BPF_MTU_CHK_RET_FRAG_NEEDED) {
-            struct lan_config *out_lan = get_lan_config(fib.ifindex);
-            if (!out_lan) {
-                increase_stats_count(STAT_NO_LAN_CONFIG);
-                return XDP_PASS;
-            }
-
             __u32 next_mtu = lan_mtu;
             if (next_mtu < ICMPV4_MIN_MTU)
                 next_mtu = ICMPV4_MIN_MTU;
@@ -1606,7 +1708,7 @@ handle_xdp_dslite_decap(struct xdp_md *ctx)
 
             if (ipv4_has_df(inner_iph_pre))
                 return send_dslite_icmp_frag_needed(ctx, cfg, inner_iph_pre,
-                                                    out_lan->gateway_ip, (__u16)next_mtu);
+                                                    (__u16)next_mtu);
 
             /* Non-DF and too big for the LAN egress: same slow path as above --
              * the kernel ip6tnl decaps and IPv4-fragments toward the LAN. */

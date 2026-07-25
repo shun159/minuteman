@@ -380,6 +380,41 @@ check "LAN client can reach a TCP service on the simulated internet host" \
     ip netns exec "$NETNS_HOST" curl -sf --max-time 3 "http://${PUBLIC_INET_ADDR%/*}:8080/"
 wait "$nc_pid" 2>/dev/null
 
+if [[ $started_minuteman -eq 1 ]]; then
+    echo "== Tunnel-originated ICMPv4 (RFC 1812 §5.3.1, RFC 6333 §5.7): B4 replies through the softwire =="
+
+    # Runs after the checks above on purpose: the decap only answers Time
+    # Exceeded for a packet it would really forward (a resolved LAN next hop),
+    # so the LAN client must already be in mm-cpe's neighbour table -- which the
+    # ping/curl above guarantee.
+    time_exceeded0="$(read_stat ICMPTimeExceeded)"
+    wan_mac="$(ip netns exec "$NETNS_CPE" cat "/sys/class/net/$VETH_CPE_ISP/address")"
+    isp_mac="$(ip netns exec "$NETNS_ISP" cat "/sys/class/net/$VETH_ISP_CPE/address")"
+    time_exceeded_pcap="$RUNDIR/decap-time-exceeded.log"
+    # The filter reaches past the outer IPv6 header into the softwire payload
+    # (ip6[49] is the inner IPv4 protocol, ip6[60] the inner ICMP type once
+    # ihl == 5) so only a Time Exceeded matches: "any softwire packet B4 ->
+    # AFTR" would also match a stray retransmit from the checks above and, with
+    # -c 1, consume the capture on it.
+    ip netns exec "$NETNS_ISP" timeout 5 tcpdump -i "$VETH_ISP_CPE" -n -vv -c 1 \
+        "ip6 proto 4 and src host ${WAN_CPE_ADDR%/*} and dst host ${CORE_AFTR_ADDR%/*} \
+         and ip6[49] == 1 and ip6[60] == 11" \
+        >"$time_exceeded_pcap" 2>/dev/null &
+    time_exceeded_tcpdump_pid=$!
+    sleep 1
+    ip netns exec "$NETNS_ISP" python3 "$PWD/send-softwire-fragments.py" \
+        "$wan_mac" "$isp_mac" "$VETH_ISP_CPE" "${CORE_AFTR_ADDR%/*}" "${WAN_CPE_ADDR%/*}" ttl1
+    wait "$time_exceeded_tcpdump_pid" 2>/dev/null
+
+    time_exceeded="$(read_stat ICMPTimeExceeded)"
+    check "an inbound inner TTL expiry draws ICMPv4 Time Exceeded back through the softwire" \
+        bash -c "grep -q 'time exceeded' '$time_exceeded_pcap'"
+    check "the B4's tunnel-originated ICMPv4 uses the well-known 192.0.0.2 source" \
+        bash -c "grep -q '192.0.0.2 > 203.0.113.2' '$time_exceeded_pcap'"
+    check "the datapath counted the decap-side Time Exceeded reply (ICMPTimeExceeded +$((time_exceeded - time_exceeded0)))" \
+        test "$time_exceeded" -gt "$time_exceeded0"
+fi
+
 if [[ $softwire_frag_enabled -eq 1 && $started_minuteman -eq 1 ]]; then
     echo "== Softwire fragmentation (RFC 6333 §5.3): XDP fragments the outer IPv6 outbound, the kernel ip6tnl reassembles inbound =="
 

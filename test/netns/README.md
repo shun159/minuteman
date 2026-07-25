@@ -116,6 +116,11 @@ XDP-attached LAN veth caps the pair's MTU, so a client can't emit a >1500 inner 
 which is also why that residual is genuinely unreachable on a standard 1500 deployment.) Composes with the
 other toggles.
 
+Independently of `MM_SOFTWIRE_FRAG`, `smoketest.sh` also hand-crafts a whole softwire packet whose inner
+IPv4 TTL is 1, and asserts that the B4 returns a softwire-encapsulated ICMPv4 Time Exceeded toward the
+AFTR, sourced from the DS-Lite well-known B4 address `192.0.0.2`, with the `ICMPTimeExceeded` counter
+advancing.
+
 `run-cpe.sh` and `smoketest.sh` deliberately omit `-aftr` so minuteman discovers it live against the rig —
 pass `-aftr <addr>` as an extra argument to either script to override with a static address instead.
 

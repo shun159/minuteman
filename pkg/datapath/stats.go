@@ -45,6 +45,7 @@ const (
 	statDecapMartian
 	statEncapFragXDP
 	statEncapFragSeg
+	statICMPTimeExceeded
 	statMax
 )
 
@@ -105,6 +106,8 @@ func sumStats(m *ebpf.Map) (Stats, error) {
 
 		statEncapFragXDP: &s.EncapFragXDP,
 		statEncapFragSeg: &s.EncapFragSeg,
+
+		statICMPTimeExceeded: &s.ICMPTimeExceeded,
 	}
 
 	for id, dst := range fields {

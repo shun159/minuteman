@@ -60,6 +60,7 @@ func runStats(args []string) error {
 		{"RedirectWAN", stats.RedirectWAN},
 		{"RedirectLAN", stats.RedirectLAN},
 		{"ICMPFragNeeded", stats.ICMPFragNeeded},
+		{"ICMPTimeExceeded", stats.ICMPTimeExceeded},
 		{"IPv6Fwd", stats.IPv6Fwd},
 		{"IPv6Pass", stats.IPv6Pass},
 		{"IPv6RSSRedirect", stats.IPv6RSSRedirect},

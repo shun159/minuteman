@@ -55,9 +55,15 @@ further down — this is just the index of what exists and which flag turns it o
   IPv4, a reachability fallback, not §5.3 conformance; backlog §4's residual note) and for a decapped
   inner too big for a non-DF LAN egress. Created at startup and repointed on an AFTR migration /
   B4 switch. A side benefit is that the IPv4 default route lets the kernel answer ICMPv4 Time Exceeded for
-  an expiring inner TTL outbound (part of backlog #3). To keep that default route from turning the decap
+  an expiring inner TTL outbound. To keep that default route from turning the decap
   path into a reflector, a decapped inner IPv4 that the FIB resolves off-LAN (back toward the companion
   tunnel) is dropped in XDP (`STAT_DECAP_MARTIAN`) rather than passed to the kernel.
+- **Tunnel-originated ICMPv4** (always on; RFC 1812 §5.3.1 + §4.3.2.7, RFC 6333 §5.7 / RFC 7335) — the
+  ICMPv4 errors the B4 itself originates back through the softwire (Fragmentation Needed on the decap
+  path, and now Time Exceeded for an inner TTL that expires *inbound*, `STAT_ICMP_TIME_EXCEEDED`) are
+  sourced from the well-known B4 address `192.0.0.2` rather than a LAN gateway address, and are gated on
+  the packet genuinely being forwarded and on §4.3.2.7's suppression rules — see the `xdp_dslite_decap`
+  bullet in Architecture for where each check sits.
 
 All of the above has been verified end-to-end against the netns rig (see Testing below).
 
@@ -212,7 +218,18 @@ orphaned the running kernel's module directory — reboot to fix that).
     small — replies with an ICMPv4 Fragmentation-Needed re-encapsulated back through the softwire for a DF
     inner packet (`send_dslite_icmp_frag_needed`, since the original IPv4 sender is only reachable via the
     AFTR), or `XDP_PASS`es the still-encapsulated non-DF packet to the companion ip6tnl to decap and
-    IPv4-fragment toward the LAN (`STAT_DECAP_FRAG_SLOW`). A *fragmented* softwire packet (outer
+    IPv4-fragment toward the LAN (`STAT_DECAP_FRAG_SLOW`). An inner packet whose TTL expires here is
+    answered the same way, with a softwire-encapsulated ICMPv4 Time Exceeded
+    (`send_dslite_icmp_time_exceeded`, `STAT_ICMP_TIME_EXCEEDED`, RFC 1812 §5.3.1). Both of these ICMPv4
+    errors are sourced from the well-known B4 address `192.0.0.2` (RFC 6333 §5.7 / RFC 7335), are
+    `redirect`ed out `b4_config.wan_ifindex` rather than `XDP_TX`ed (so they also work from the cpumap
+    variant, where `XDP_TX` isn't available), and go through `icmp_error_eligible` — RFC 1812 §4.3.2.7's
+    "never answer a non-initial fragment, another ICMP error, or a non-unicast source". The Time Exceeded
+    decision deliberately sits *after* the LAN FIB lookup, not on arrival: `BPF_FIB_LKUP_RET_NOT_FWDED`
+    means the packet is addressed to the CPE itself, where TTL 1 is legal and must be delivered locally,
+    and every case the in-place rewrite can't express (an offending packet shorter than the 110-byte
+    reply, IPv4 options) is `XDP_PASS`ed so the ip6tnl and the kernel's own forwarding originate the error
+    instead of the datapath dropping it. A *fragmented* softwire packet (outer
     `nexthdr == IPPROTO_FRAGMENT`, matched to a peer) is `XDP_PASS`ed up front for kernel reassembly +
     ip6tnl decap (`STAT_DECAP_REASM_PASS`), since XDP can't reassemble. Native
     (non-softwire) IPv6 arriving on the WAN — the `outer_iph->nexthdr != IPPROTO_IPIP` case, previously
@@ -266,8 +283,13 @@ orphaned the running kernel's module directory — reboot to fix that).
     unspecified/forwardable classification (`ipv6_addr_equal`/`ipv6_addr_is_unspecified`/`ipv6_is_forwardable`),
     IPv6 flow hashing (`inner_ip6_hash`), the outer-IPv6 header writer (`write_outer_ipv6`, whose `nexthdr`
     parameter serves both the plain `IPPROTO_IPIP` encap and the fragmenter's `IPPROTO_FRAGMENT`), and ICMP
-    error construction: DS-Lite-tunneled ICMPv4 Fragmentation-Needed, plus ICMPv6 Packet Too Big
+    error construction: DS-Lite-tunneled ICMPv4 Fragmentation-Needed and Time Exceeded (sharing
+    `write_dslite_inner_icmp_iph`, which sources them from the RFC 6333 §5.7 well-known B4 address
+    `192.0.0.2`), plus ICMPv6 Packet Too Big
     (`write_icmpv6_pkt_too_big`, whose `icmpv6_checksum` covers the IPv6 pseudo-header, unlike ICMPv4's).
+    `icmp_error_eligible` is the shared RFC 1812 §4.3.2.7 gate every originated ICMPv4 error runs through
+    (non-initial fragment / ICMP error / non-unicast source → don't answer), distinct from
+    `icmp_error_allowed()`'s rate limiting in `datapath.bpf.c`.
   - **`bpf/uapi/linux/*.h`** — vendored kernel UAPI headers providing `#define` constants (`ETH_P_*`, `IP_DF`,
     `ICMP_*`) that the BTF-derived `bpf/vmlinux.h` (struct/union/enum definitions only, no macros) doesn't
     carry. `vmlinux.h` and these uapi headers are complementary: struct/type layouts come from BTF, numeric
