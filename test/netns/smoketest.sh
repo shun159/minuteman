@@ -381,40 +381,35 @@ check "LAN client can reach a TCP service on the simulated internet host" \
 wait "$nc_pid" 2>/dev/null
 
 if [[ $softwire_frag_enabled -eq 1 && $started_minuteman -eq 1 ]]; then
-    echo "== Softwire fragmentation (RFC 6333 §5.3): the kernel companion ip6tnl fragments/reassembles what XDP can't =="
+    echo "== Softwire fragmentation (RFC 6333 §5.3): XDP fragments the outer IPv6 outbound, the kernel ip6tnl reassembles inbound =="
 
-    # Snapshot the slow-path counters before generating any traffic, so the
+    # Snapshot the fragmentation counters before generating any traffic, so the
     # assertions below are deltas -- immune to whatever an earlier check (or a
     # reused instance) already accumulated.
+    frag_xdp0="$(read_stat EncapFragXDP)"
+    frag_seg0="$(read_stat EncapFragSeg)"
     encap_frag0="$(read_stat EncapFragSlow)"
     reasm_pass0="$(read_stat DecapReasmPass)"
     martian0="$(read_stat DecapMartian)"
 
     # The companion device and its IPv4 default route must exist while minuteman
-    # runs (both are torn down on shutdown).
+    # runs (both are torn down on shutdown): they carry the inbound reassembly
+    # half and the encap fragmenter's fallback cases.
     check "minuteman created the companion ip6tnl (mm-dslite0) in $NETNS_CPE" \
         ip netns exec "$NETNS_CPE" ip link show mm-dslite0
     check "minuteman installed the IPv4 default route via mm-dslite0" \
         bash -c "ip netns exec $NETNS_CPE ip route show default | grep -q 'dev mm-dslite0'"
 
-    # Encap direction: an oversized *non-DF* inner IPv4 packet (1500B, -M dont)
-    # exceeds the softwire's usable MTU (WAN 1500 - 40), so the encap must
-    # XDP_PASS it to the kernel, which fragments the IPv4 to the tunnel MTU and
-    # the ip6tnl encapsulates each piece. It must still reach the internet host.
-    check "oversized non-DF traffic reaches the internet host via the fragmentation slow path" \
+    # Encap direction: an oversized inner IPv4 packet (1500B) exceeds the
+    # softwire's usable MTU (WAN 1500 - 40), so the encap must encapsulate it
+    # whole and fragment the *outer IPv6* in XDP (RFC 6333 §5.3, errata 5847 ->
+    # RFC 2473 §7.2(b)) -- never the inner IPv4, and ignoring the DF bit, so
+    # both a non-DF and a DF oversized packet must reach the internet host
+    # transparently (each as two outer fragments the AFTR reassembles).
+    check "oversized non-DF traffic reaches the internet host via XDP outer-IPv6 fragmentation" \
         ip netns exec "$NETNS_HOST" ping -M dont -s 1472 -c 2 -W 2 -I "$VETH_HOST_CPE" "${PUBLIC_INET_ADDR%/*}"
-
-    # A *DF* oversized packet gets an ICMPv4 Fragmentation Needed (PMTUD), so it
-    # doesn't get through. NB: this is a deliberate deviation from RFC 6333 §5.3
-    # (errata 5847), which would have the B4 tunnel-fragment the outer IPv6 and
-    # ignore the inner DF bit -- the kernel ip6tnl can't do that (backlog #4), and
-    # minuteman's advertised WAN-40 LAN MTU makes an oversized DF packet a
-    # misbehaving-client case anyway, for which PMTUD signalling is reasonable.
-    if ip netns exec "$NETNS_HOST" ping -M do -s 1472 -c 1 -W 1 -I "$VETH_HOST_CPE" "${PUBLIC_INET_ADDR%/*}" >/dev/null 2>&1; then
-        check "oversized DF traffic is NOT silently fragmented (expected it to fail)" false
-    else
-        check "oversized DF traffic gets ICMP Frag Needed (PMTUD; not tunnel-fragmented -- backlog #4)" true
-    fi
+    check "oversized DF traffic also reaches the internet host (DF ignored per errata 5847)" \
+        ip netns exec "$NETNS_HOST" ping -M do -s 1472 -c 2 -W 2 -I "$VETH_HOST_CPE" "${PUBLIC_INET_ADDR%/*}"
 
     # Decap direction: hand-craft a fragmented softwire packet (a real Linux AFTR
     # never emits outer-IPv6 fragments) toward the B4. The decap must XDP_PASS
@@ -448,15 +443,73 @@ if [[ $softwire_frag_enabled -eq 1 && $started_minuteman -eq 1 ]]; then
     check "an off-LAN decapped packet is NOT bounced back into the softwire (no reflection to the AFTR)" \
         bash -c "! grep -q '8.8.8.8' '$RUNDIR/bounce.log'"
 
+    frag_xdp="$(read_stat EncapFragXDP)"
+    frag_seg="$(read_stat EncapFragSeg)"
     encap_frag="$(read_stat EncapFragSlow)"
     reasm_pass="$(read_stat DecapReasmPass)"
     martian="$(read_stat DecapMartian)"
-    check "encap fragmentation slow path was exercised (datapath EncapFragSlow +$((encap_frag - encap_frag0)))" \
-        test "$encap_frag" -gt "$encap_frag0"
+    check "oversized packets were outer-fragmented in XDP (datapath EncapFragXDP +$((frag_xdp - frag_xdp0)))" \
+        test "$frag_xdp" -gt "$frag_xdp0"
+    # Every oversized packet in this rig (1500B inner, 1448B fragment payload)
+    # yields exactly two outer fragments.
+    check "each fragmented packet produced 2 outer-IPv6 fragments (datapath EncapFragSeg +$((frag_seg - frag_seg0)))" \
+        test "$((frag_seg - frag_seg0))" -eq "$((2 * (frag_xdp - frag_xdp0)))"
+    check "the kernel ip6tnl encap fallback was NOT needed (datapath EncapFragSlow +$((encap_frag - encap_frag0)))" \
+        test "$encap_frag" -eq "$encap_frag0"
     check "decap reassembly slow path was exercised (datapath DecapReasmPass +$((reasm_pass - reasm_pass0)))" \
         test "$reasm_pass" -gt "$reasm_pass0"
     check "the off-LAN decapped packet was dropped in XDP (datapath DecapMartian +$((martian - martian0)))" \
         test "$martian" -gt "$martian0"
+
+    # --- Encap fallback (backlog §4 residual): a packet the in-XDP fragmenter
+    # can't take must fall to the kernel ip6tnl (EncapFragSlow) -- and crucially
+    # a *DF* one must still draw an ICMPv4 Fragmentation-Needed (PMTUD) rather
+    # than silently blackhole. That's the specific regression risk this PR
+    # introduces: DF oversized packets now route to the fallback instead of the
+    # old in-XDP plain ICMPv4 reply, so the DF-on-the-fallback behavior is worth
+    # asserting directly.
+    #
+    # The over-MaxInnerLen *inner-size* trigger isn't reachable from the LAN in
+    # this rig -- the CPE's XDP-attached LAN veth caps the pair's MTU, so the
+    # client can never emit a >1500 inner packet (it IP-fragments first, and each
+    # fragment takes the fast path). The reachable trigger is a runtime WAN-MTU
+    # shrink below the fragment size frag_unit was computed from at startup
+    # (1448 at WAN 1500): every oversized packet then exceeds frag_unit and takes
+    # the fallback. ---
+    echo "-- encap fallback: a runtime WAN-MTU shrink forces the kernel ip6tnl path (DF -> PMTUD) --"
+    wan_mtu_orig="$(ip netns exec "$NETNS_CPE" cat "/sys/class/net/$VETH_CPE_ISP/mtu")"
+    ip netns exec "$NETNS_CPE" ip link set "$VETH_CPE_ISP" mtu 1400
+
+    fb_encap0="$(read_stat EncapFragSlow)"
+    fb_xdp0="$(read_stat EncapFragXDP)"
+
+    # A DF packet too big for the shrunk WAN once encapsulated: the encap can no
+    # longer outer-fragment within frag_unit, so it XDP_PASSes to the kernel
+    # ip6tnl, which -- unable to fragment a DF inner packet -- answers ICMPv4
+    # Fragmentation-Needed back to the client (PMTUD). Capture that signal on the
+    # LAN; the ping itself is expected to fail (that IS the PMTUD drop), and the
+    # client caches the lower PMTU, so only the first packet reaches the encap.
+    pmtud_pcap="$RUNDIR/pmtud-df.log"
+    ip netns exec "$NETNS_HOST" timeout 5 tcpdump -i "$VETH_HOST_CPE" -n -c 1 \
+        'icmp[0] == 3 and icmp[1] == 4' >"$pmtud_pcap" 2>/dev/null &
+    pmtud_tcpdump_pid=$!
+    sleep 1
+    ip netns exec "$NETNS_HOST" ping -M do -s 1400 -c 2 -W 2 -I "$VETH_HOST_CPE" "${PUBLIC_INET_ADDR%/*}" >/dev/null 2>&1 || true
+    wait "$pmtud_tcpdump_pid" 2>/dev/null
+
+    fb_encap="$(read_stat EncapFragSlow)"
+    fb_xdp="$(read_stat EncapFragXDP)"
+    check "the kernel ip6tnl encap fallback was exercised (datapath EncapFragSlow +$((fb_encap - fb_encap0)))" \
+        test "$fb_encap" -gt "$fb_encap0"
+    check "a DF packet on the fallback draws ICMPv4 Fragmentation-Needed (PMTUD), not a blackhole" \
+        bash -c "grep -q 'need to frag' '$pmtud_pcap'"
+    check "the fallback did NOT engage the in-XDP fragmenter (datapath EncapFragXDP +$((fb_xdp - fb_xdp0)))" \
+        test "$fb_xdp" -eq "$fb_xdp0"
+
+    # Restore the WAN MTU and flush the client's PMTU cache so later checks (and
+    # reruns) see the rig's 1500 baseline.
+    ip netns exec "$NETNS_CPE" ip link set "$VETH_CPE_ISP" mtu "$wan_mtu_orig"
+    ip netns exec "$NETNS_HOST" ip route flush cache 2>/dev/null || true
 fi
 
 if [[ $dynamic_b4_enabled -eq 1 && $started_minuteman -eq 1 ]]; then

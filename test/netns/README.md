@@ -94,16 +94,27 @@ deprecates the first (`preferred_lft 0`), waits out minuteman's 30s `watchB4` po
 NAT-state-follows-the-address step a real AFTR does via its own B4 re-learning), and re-runs the DS-Lite
 data-path check — which only passes if the switch actually took. Composes with the other toggles.
 
-An eighth independent toggle, `MM_SOFTWIRE_FRAG` (`0` default or `1`), exercises the softwire
-fragmentation slow path (RFC 6333 §5.3) in both directions. It changes no minuteman flag and adds no
-topology — every link is already 1500, and the companion `ip6tnl` minuteman creates in `mm-cpe` is what
-does the work — the counters are read out-of-band via `minuteman stats`. `smoketest.sh` then (a)
-checks the companion device and its IPv4 default route exist, (b) sends an oversized *non-DF* ping so the
-encap must `XDP_PASS` it to the kernel to fragment (asserting reachability + `EncapFragSlow`) while a *DF*
-one still gets an ICMPv4 Fragmentation-Needed, and (c) hand-crafts a fragmented softwire packet toward the
+An eighth independent toggle, `MM_SOFTWIRE_FRAG` (`0` default or `1`), exercises softwire fragmentation
+(RFC 6333 §5.3) in both directions. It changes no minuteman flag and adds no topology — every link is
+already 1500; outbound the in-XDP outer-IPv6 fragmenter (and its `mm-frag*` companion veth pairs) does the
+work, inbound the companion `ip6tnl` minuteman creates in `mm-cpe` — the counters are read out-of-band via
+`minuteman stats`. `smoketest.sh` then (a) checks the companion ip6tnl and its IPv4 default route exist,
+(b) sends an oversized *non-DF* ping **and** an oversized *DF* one — both must round-trip, since the B4
+encapsulates the packet whole and fragments the *outer IPv6* in XDP, ignoring DF per errata 5847
+(asserting `EncapFragXDP` advances, `EncapFragSeg` is exactly 2× it, and the `EncapFragSlow` ip6tnl
+fallback stays untouched), and (c) hand-crafts a fragmented softwire packet toward the
 B4 with `send-softwire-fragments.py` (a real Linux AFTR never emits outer-IPv6 fragments, so it can't be
 driven from the rig's own traffic) so the decap must `XDP_PASS` it for kernel reassembly — asserting the
-inner echo reaches the LAN client and reappears in `DecapReasmPass`. Composes with the other toggles.
+inner echo reaches the LAN client and reappears in `DecapReasmPass`. It then also (d) exercises the encap
+*fallback* the fast path can't take (backlog §4's residual note): it temporarily shrinks the WAN link's MTU
+below the fragment size `frag_unit` was computed from at startup, so an oversized *DF* ping falls to the
+kernel `ip6tnl` instead of the in-XDP fragmenter, and asserts `EncapFragSlow` advances, `EncapFragXDP` does
+*not*, and — the specific regression risk from this PR routing DF packets to the fallback — the client
+receives an ICMPv4 Fragmentation-Needed (PMTUD, captured on the LAN) rather than a silent blackhole, then
+restores the MTU. (The over-`MaxInnerLen` inner-size trigger isn't reachable from the LAN here: the CPE's
+XDP-attached LAN veth caps the pair's MTU, so a client can't emit a >1500 inner packet in the first place —
+which is also why that residual is genuinely unreachable on a standard 1500 deployment.) Composes with the
+other toggles.
 
 `run-cpe.sh` and `smoketest.sh` deliberately omit `-aftr` so minuteman discovers it live against the rig —
 pass `-aftr <addr>` as an extra argument to either script to override with a static address instead.
@@ -159,9 +170,13 @@ verified passing from a fresh setup for:
 - `MM_DYNAMIC_B4=1` (against `dhcpv6` AFTR discovery + `dhcpv6-pd`): startup dynamic B4 selection plus the
   WAN-renumbering hard-switch and softwire recovery, all end-to-end
 - `MM_SOFTWIRE_FRAG=1` (against `dhcpv6` AFTR discovery + `dhcpv6-pd`): both fragmentation directions
-  end-to-end — an oversized non-DF ping fragmented via the companion `ip6tnl` (with `EncapFragSlow`
-  advancing), a DF one still refused with ICMPv4 Fragmentation-Needed, and a hand-crafted fragmented
-  softwire packet reassembled and delivered to the LAN client (with `DecapReasmPass` advancing)
+  end-to-end — oversized non-DF *and* DF pings both round-tripping as two outer-IPv6 fragments via the
+  in-XDP fragmenter (with `EncapFragXDP`/`EncapFragSeg` advancing and the `EncapFragSlow` ip6tnl fallback
+  untouched; the on-wire fragments were also confirmed by tcpdump on the ISP link — correct offsets,
+  M flags, and a shared ID per packet), a hand-crafted fragmented
+  softwire packet reassembled and delivered to the LAN client (with `DecapReasmPass` advancing), and the
+  encap ip6tnl *fallback* forced by a runtime WAN-MTU shrink: a DF oversized packet takes the fallback
+  (`EncapFragSlow` advancing, `EncapFragXDP` untouched) and draws an ICMPv4 Fragmentation-Needed on the LAN
 - the default (all toggles off), re-run after the `xdp_dslite_encap` non-unicast-bypass change to confirm
   no regression
 

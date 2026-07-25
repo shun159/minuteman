@@ -3,12 +3,13 @@
 minuteman works as a DS-Lite B4 (verified end-to-end against the netns rig — see
 `test/netns/README.md`), but measured strictly against the base RFC 7084 (IPv6 CE Router Requirements)
 and RFC 6333, these gaps remain. Ordered by real-world impact, highest first. Last checked against the
-codebase 2026-07-18. (RFC 7084's own updates — RFC 9096 renumbering reaction and RFC 9818 LAN-side
+codebase 2026-07-20. (RFC 7084's own updates — RFC 9096 renumbering reaction and RFC 9818 LAN-side
 prefix delegation — are not targeted; see the RFC 9096 item in §6 and `docs/supported-rfcs.md`.)
 
-Softwire fragmentation (RFC 6333 §5.3) is now *partially* addressed by the `internal/slowpath` companion
-`ip6tnl` — the reassembly half is RFC-conformant, the fragmentation half is not; it remains a real gap,
-tracked as §4 below (see also `CLAUDE.md`).
+Softwire fragmentation (RFC 6333 §5.3) is now addressed on both halves: reassembly by the
+`internal/slowpath` companion `ip6tnl` (kernel reassembles before decapsulation), fragmentation by the
+in-XDP outer-IPv6 fragmenter (`encap_fragment_outer` + the `internal/fragpath` companion veth pairs) —
+see the resolved §4 below for the residual fallback cases that still take the old inner-IPv4 path.
 
 ## 1. DHCPv6-PD takes the server's T1/T2 literally, including 0 — RFC 3633 §9 / RFC 9915 §14.2
 
@@ -71,26 +72,37 @@ Two related gaps around ICMPv4 the B4 itself must originate:
 **Effect:** inbound traceroute and PMTUD-adjacent tooling still misbehave at the B4 hop; reachability
 itself unaffected.
 
-## 4. Softwire fragmentation is inner-IPv4, not RFC-canonical outer-IPv6 — RFC 6333 §5.3 (errata 5847) / RFC 2473 §7.2(b)
+## 4. ~~Softwire fragmentation is inner-IPv4, not RFC-canonical outer-IPv6~~ — RESOLVED (in-XDP outer-IPv6 fragmentation); residual fallback cases remain
 
-`internal/slowpath`'s companion `ip6tnl` handles the *reassembly* half correctly (fragmented softwire IPv6
-is `XDP_PASS`ed, the kernel reassembles before the ip6tnl decapsulates — exactly §5.3's "reassembly MUST
-happen before decapsulation"). The *fragmentation* half is not RFC-canonical. RFC 6333 §5.3 (with the
-original "The inner IPv4 packet MUST NOT be fragmented; fragmentation MUST happen after encapsulation",
-and errata 5847 pointing at RFC 2473 §7.2(b), ignoring the DF bit) requires the B4 to fragment the *outer
-IPv6* tunnel packet after encapsulation. Linux's `ip6tnl` cannot do that — it either PMTUD-signals (ICMPv4
-Fragmentation-Needed) or, with the tunnel MTU set to WAN−40 as here, lets the kernel's IPv4 forwarding
-fragment the **inner IPv4** before encapsulation. So minuteman's encap slow path fragments the inner IPv4
-for a **non-DF** oversized packet (which §5.3 says MUST NOT be done, though it preserves reachability) and
-sends ICMPv4 Fragmentation-Needed for a **DF** one (which §5.3 says should instead be tunnel-fragmented,
-ignoring DF).
+RFC 6333 §5.3 (with the original "The inner IPv4 packet MUST NOT be fragmented; fragmentation MUST happen
+after encapsulation", and errata 5847 pointing at RFC 2473 §7.2(b), ignoring the DF bit) requires the B4 to
+fragment the *outer IPv6* tunnel packet after encapsulation. The datapath now does exactly that, in XDP
+(`encap_fragment_outer` + `emit_softwire_fragment` in `bpf/datapath.bpf.c`, plumbing in
+`internal/fragpath`): an oversized inner IPv4 packet — **DF or not** — is encapsulated whole behind an
+outer IPv6 header with a Fragment extension header, broadcast-cloned via a DEVMAP
+(`bpf_redirect_map(BPF_F_BROADCAST)`, one clone per possible fragment), and each clone is trimmed to
+fragment *i* and redirected out the WAN. The clones bounce through one large-MTU companion veth pair per
+fragment index (`mm-frag<i>`/`mm-frag<i>p`) because of two kernel constraints: the devmap enqueue rejects a
+frame larger than the target device's MTU *before* any egress program could trim it, and frames batched to
+one target device all run the *first* enqueue's egress program, so per-fragment programs need per-fragment
+devices. The encap-side ICMPv4 Fragmentation-Needed for oversized DF packets is gone with this — an
+oversized DF packet is fragmented transparently, per the errata's DF-ignoring reading. Verified end-to-end
+in the netns rig (`MM_SOFTWIRE_FRAG=1`): both DF and non-DF 1500-byte pings round-trip as two outer
+fragments (`EncapFragXDP`/`EncapFragSeg` counters), and the reassembly half is unchanged
+(`internal/slowpath`'s ip6tnl — kernel reassembles before decapsulation, §5.3-conformant since it landed).
 
-**Effect:** in practice benign — minuteman advertises a reduced LAN MTU (DHCPv4 option 26 = WAN−40), so
-well-behaved clients never emit an oversized inner packet, and the slow path is only a fallback for clients
-that ignore it (non-DF: fragmented and delivered; DF: told to reduce via PMTUD). But it is not §5.3-conformant
-on the fragmentation side, and true conformance needs a custom outer-IPv6 fragmentation/reassembly path
-(in XDP or a userspace raw socket) rather than the kernel tunnel — the "substantial undertaking" this item
-originally called out.
+**Residual (kernel ip6tnl fallback, counted as `EncapFragSlow`):** packets the XDP fragmenter can't take
+still fall to the companion ip6tnl exactly as before — i.e. the kernel fragments the *inner* IPv4 (non-DF)
+or PMTUD-signals (DF), which is a reachability fallback, not §5.3 conformance. That happens only when: the
+inner packet needs more than `MAX_SOFTWIRE_FRAGS` (4) fragments or exceeds `fragpath.MaxInnerLen` (~3.4KB,
+the veth single-buffer XDP ceiling) — only reachable with a jumbo-MTU LAN; the WAN device MTU shrank at
+runtime below the startup-computed fragment size; or the fragmenter is unconfigured (degenerate WAN MTU).
+On a standard WAN-1500 home deployment none of these occur. The netns rig covers the fallback directly
+(`MM_SOFTWIRE_FRAG=1` temporarily shrinks the WAN MTU below the startup-computed fragment size, the one
+trigger reachable from the LAN — the over-`MaxInnerLen` inner-size trigger is not, since the CPE's
+XDP-attached LAN veth caps the pair's MTU so a client can't emit a >1500 inner packet): a DF oversized
+packet then takes the ip6tnl fallback (`EncapFragSlow` advances, `EncapFragXDP` does not) and draws an
+ICMPv4 Fragmentation-Needed (PMTUD) rather than blackholing.
 
 ## 5. Tunnel ICMPv6 relay — RFC 2473 §8
 
@@ -101,10 +113,12 @@ locally-known egress MTU, not a smaller MTU somewhere further along the IPv6 pat
 
 ## 6. Minor / acceptable for a home CPE
 
-- During an AFTR graceful migration's drain window the softwire slow-path companion device is repointed at
-  the *new* AFTR at cutover, so a *draining* flow's own fragments (a rare corner: fragmentation overlapping
-  a migration) fall to the kernel with the old remote and are dropped until the flow finishes — the fast
-  path's dual-AFTR decap is unaffected.
+- During an AFTR graceful migration's drain window the softwire slow-path companion ip6tnl is repointed at
+  the *new* AFTR at cutover. A *draining* flow's XDP-fragmented packets are unaffected (the in-XDP
+  fragmenter reads the same per-packet next-hop slot as normal encap, so its fragments follow flow
+  affinity), but the rare packet that falls to the ip6tnl *fallback* (see §4's residual) during a drain is
+  encapsulated toward the new AFTR and dropped until the flow finishes — the fast path's dual-AFTR decap is
+  unaffected.
 
 - AFTR re-discovery flips the AFTR each refresh when the AFTR *name* has several AAAA records: the
   no-op check compares one resolved address (`aftrdiscovery` returns `addrs[0]`), not set membership.

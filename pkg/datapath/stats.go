@@ -43,6 +43,8 @@ const (
 	statDecapFragSlow
 	statDecapReasmPass
 	statDecapMartian
+	statEncapFragXDP
+	statEncapFragSeg
 	statMax
 )
 
@@ -100,6 +102,9 @@ func sumStats(m *ebpf.Map) (Stats, error) {
 		statDecapFragSlow:  &s.DecapFragSlow,
 		statDecapReasmPass: &s.DecapReasmPass,
 		statDecapMartian:   &s.DecapMartian,
+
+		statEncapFragXDP: &s.EncapFragXDP,
+		statEncapFragSeg: &s.EncapFragSeg,
 	}
 
 	for id, dst := range fields {

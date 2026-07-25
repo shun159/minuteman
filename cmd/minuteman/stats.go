@@ -71,6 +71,8 @@ func runStats(args []string) error {
 		{"DecapFragSlow", stats.DecapFragSlow},
 		{"DecapReasmPass", stats.DecapReasmPass},
 		{"DecapMartian", stats.DecapMartian},
+		{"EncapFragXDP", stats.EncapFragXDP},
+		{"EncapFragSeg", stats.EncapFragSeg},
 	} {
 		fmt.Printf("%s: %d\n", c.name, c.value)
 	}
