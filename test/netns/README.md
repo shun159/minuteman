@@ -106,7 +106,7 @@ fallback stays untouched), and (c) hand-crafts a fragmented softwire packet towa
 B4 with `send-softwire-fragments.py` (a real Linux AFTR never emits outer-IPv6 fragments, so it can't be
 driven from the rig's own traffic) so the decap must `XDP_PASS` it for kernel reassembly — asserting the
 inner echo reaches the LAN client and reappears in `DecapReasmPass`. It then also (d) exercises the encap
-*fallback* the fast path can't take (backlog §4's residual note): it temporarily shrinks the WAN link's MTU
+*fallback* the fast path can't take (backlog §3's residual note): it temporarily shrinks the WAN link's MTU
 below the fragment size `frag_unit` was computed from at startup, so an oversized *DF* ping falls to the
 kernel `ip6tnl` instead of the in-XDP fragmenter, and asserts `EncapFragSlow` advances, `EncapFragXDP` does
 *not*, and — the specific regression risk from this PR routing DF packets to the fallback — the client

@@ -1317,7 +1317,7 @@ func attachLAN(dp *datapath.Loader, spec cliconfig.LANSpec) error {
 	// A LAN whose MTU exceeds the in-XDP fragmenter's clone-admission ceiling
 	// lets clients emit an inner packet too big for outer-IPv6 fragmentation,
 	// which then silently falls to the kernel ip6tnl (inner-IPv4 fragmentation,
-	// not RFC 6333 §5.3-conformant — see docs/rfc-compliance-backlog.md §4).
+	// not RFC 6333 §5.3-conformant — see docs/rfc-compliance-backlog.md §3).
 	// Surface it once at startup so it's actionable, not discovered via counters.
 	if mtu > fragpath.MaxInnerLen {
 		log.Printf("warning: LAN %s MTU %d exceeds the softwire fragmenter's ceiling (%d); oversized traffic from this LAN uses the non-§5.3 ip6tnl fallback (EncapFragSlow)",

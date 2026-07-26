@@ -3,13 +3,15 @@
 minuteman works as a DS-Lite B4 (verified end-to-end against the netns rig — see
 `test/netns/README.md`), but measured strictly against the base RFC 7084 (IPv6 CE Router Requirements)
 and RFC 6333, these gaps remain. Ordered by real-world impact, highest first. Last checked against the
-codebase 2026-07-20. (RFC 7084's own updates — RFC 9096 renumbering reaction and RFC 9818 LAN-side
-prefix delegation — are not targeted; see the RFC 9096 item in §6 and `docs/supported-rfcs.md`.)
+codebase 2026-07-26. (RFC 7084's own updates — RFC 9096 renumbering reaction and RFC 9818 LAN-side
+prefix delegation — are not targeted; see the RFC 9096 item in §5 and `docs/supported-rfcs.md`.)
 
 Softwire fragmentation (RFC 6333 §5.3) is now addressed on both halves: reassembly by the
 `internal/slowpath` companion `ip6tnl` (kernel reassembles before decapsulation), fragmentation by the
 in-XDP outer-IPv6 fragmenter (`encap_fragment_outer` + the `internal/fragpath` companion veth pairs) —
-see the resolved §4 below for the residual fallback cases that still take the old inner-IPv4 path.
+see the resolved §3 below for the residual fallback cases that still take the old inner-IPv4 path.
+Tunnel-originated ICMPv4 (decap-side Time Exceeded plus the RFC 6333 §5.7 well-known B4 address) is also
+resolved and no longer tracked here.
 
 ## 1. DHCPv6-PD takes the server's T1/T2 literally, including 0 — RFC 3633 §9 / RFC 9915 §14.2
 
@@ -51,25 +53,7 @@ right.
 pointer consulted per send) so a Renew never restarts the worker; or plumb a "restarting, not shutting
 down" signal that suppresses the final RA.
 
-## 3. ~~Tunnel-originated ICMPv4: decap-side Time Exceeded, and the B4 well-known address is unused~~ — RESOLVED
-
-The B4 now originates tunnel-side ICMPv4 from the well-known B4 address `192.0.0.2`
-(RFC 6333 §5.7 / RFC 7335). Decap-side inner TTL expiry is handled in XDP:
-`xdp_dslite_decap` rewrites the still-encapsulated frame into a softwire-encapsulated
-ICMPv4 Time Exceeded reply back toward the AFTR, counted as `ICMPTimeExceeded`.
-The outbound encap-side TTL expiry remains handled by the kernel through the companion
-`ip6tnl` and its IPv4 default route.
-
-The decap-side reply is deliberately narrow, so that "TTL expired" never swallows a
-packet the B4 was not forwarding in the first place: it is decided *after* the LAN FIB
-lookup (a packet addressed to one of the CPE's own IPv4 addresses is `NOT_FWDED` and is
-delivered locally at TTL 1, as RFC 1812 §5.3.1 requires), it is suppressed for the cases
-§4.3.2.7 forbids (non-initial fragment, ICMP error, non-unicast source), and anything the
-XDP rewrite can't express — an offending packet smaller than the 110-byte reply, IPv4
-options — is `XDP_PASS`ed so the companion `ip6tnl` plus the kernel's own forwarding
-originate the error instead.
-
-## 4. ~~Softwire fragmentation is inner-IPv4, not RFC-canonical outer-IPv6~~ — RESOLVED (in-XDP outer-IPv6 fragmentation); residual fallback cases remain
+## 3. ~~Softwire fragmentation is inner-IPv4, not RFC-canonical outer-IPv6~~ — RESOLVED (in-XDP outer-IPv6 fragmentation); residual fallback cases remain
 
 RFC 6333 §5.3 (with the original "The inner IPv4 packet MUST NOT be fragmented; fragmentation MUST happen
 after encapsulation", and errata 5847 pointing at RFC 2473 §7.2(b), ignoring the DF bit) requires the B4 to
@@ -101,19 +85,19 @@ XDP-attached LAN veth caps the pair's MTU so a client can't emit a >1500 inner p
 packet then takes the ip6tnl fallback (`EncapFragSlow` advances, `EncapFragXDP` does not) and draws an
 ICMPv4 Fragmentation-Needed (PMTUD) rather than blackholing.
 
-## 5. Tunnel ICMPv6 relay — RFC 2473 §8
+## 4. Tunnel ICMPv6 relay — RFC 2473 §8
 
 No reactive translation exists of an ICMPv6 error about the softwire packet itself (e.g. a Packet Too Big
 or Time Exceeded from an intermediate IPv6 router on the B4↔AFTR path) into an ICMPv4 error toward the
 original IPv4 sender. The encap path's own proactive `bpf_check_mtu`-based PtB only covers the
 locally-known egress MTU, not a smaller MTU somewhere further along the IPv6 path.
 
-## 6. Minor / acceptable for a home CPE
+## 5. Minor / acceptable for a home CPE
 
 - During an AFTR graceful migration's drain window the softwire slow-path companion ip6tnl is repointed at
   the *new* AFTR at cutover. A *draining* flow's XDP-fragmented packets are unaffected (the in-XDP
   fragmenter reads the same per-packet next-hop slot as normal encap, so its fragments follow flow
-  affinity), but the rare packet that falls to the ip6tnl *fallback* (see §4's residual) during a drain is
+  affinity), but the rare packet that falls to the ip6tnl *fallback* (see §3's residual) during a drain is
   encapsulated toward the new AFTR and dropped until the flow finishes — the fast path's dual-AFTR decap is
   unaffected.
 

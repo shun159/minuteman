@@ -52,7 +52,7 @@ further down — this is just the index of what exists and which flag turns it o
   reassembles before the ip6tnl decapsulates (§5.3's "reassembly MUST happen before decapsulation"). The
   ip6tnl also remains the *fallback* for what the XDP fragmenter can't take (`STAT_ENCAP_FRAG_SLOW`: >4
   fragments, inner beyond `fragpath.MaxInnerLen`, degenerate MTU — there the kernel fragments the inner
-  IPv4, a reachability fallback, not §5.3 conformance; backlog §4's residual note) and for a decapped
+  IPv4, a reachability fallback, not §5.3 conformance; backlog §3's residual note) and for a decapped
   inner too big for a non-DF LAN egress. Created at startup and repointed on an AFTR migration /
   B4 switch. A side benefit is that the IPv4 default route lets the kernel answer ICMPv4 Time Exceeded for
   an expiring inner TTL outbound. To keep that default route from turning the decap
@@ -82,7 +82,7 @@ Not yet implemented:
   `cmd/minuteman`'s policy beyond the current dslite-only capability request.
 - A handful of RFC 7084/6333 compliance gaps. Softwire fragmentation (RFC 6333 §5.3) is now addressed on
   both halves (in-XDP outer-IPv6 fragmentation + kernel-ip6tnl reassembly — see the **Softwire
-  fragmentation** feature above); only its fallback cases (backlog §4's residual note) still fragment the
+  fragmentation** feature above); only its fallback cases (backlog §3's residual note) still fragment the
   inner IPv4. The remaining gaps are in `docs/rfc-compliance-backlog.md`, priority-ordered with the
   specific code each points at. Non-protocol operability/test-ergonomics improvements are tracked
   separately in `docs/operability-backlog.md` — its #1 (out-of-band stats via a bpffs-pinned map + the
