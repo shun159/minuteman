@@ -3,8 +3,17 @@
 minuteman works as a DS-Lite B4 (verified end-to-end against the netns rig — see
 `test/netns/README.md`), but measured strictly against the base RFC 7084 (IPv6 CE Router Requirements)
 and RFC 6333, these gaps remain. Ordered by real-world impact, highest first. Last checked against the
-codebase 2026-07-26. (RFC 7084's own updates — RFC 9096 renumbering reaction and RFC 9818 LAN-side
+codebase 2026-07-27. (RFC 7084's own updates — RFC 9096 renumbering reaction and RFC 9818 LAN-side
 prefix delegation — are not targeted; see the RFC 9096 item in §3 and `docs/supported-rfcs.md`.)
+
+Two §3 items come from a carrier spec rather than an RFC: NTT East's *IP通信網サービスのインタフェース
+－フレッツシリーズ－* 第三分冊 (<https://flets.com/pdf/ip-int-3.pdf>), §2.4.2.1 "IPv6(IPoE)通信における
+IPv6仕様" (printed p. 62, PDF p. 76) — the IPoE access spec minuteman's own target deployment runs on. It
+states what the network's WAN-side RA may carry, which is what makes those two gaps concrete rather than
+hypothetical. Its other requirements in that section are already met: DHCPv6 yields no 128-bit address
+(minuteman requests IA_PD only), the client DUID must be DUID-LL from a MAC and as stable as possible
+(`pkg/dhcpv6/duid.go`, a pure function of the WAN MAC), and a delegation is a /48 or /56
+(`lanprefix.SubnetFor` carves a /64 out of any delegation up to /64).
 
 Softwire fragmentation (RFC 6333 §5.3) is now addressed on both halves: reassembly by the
 `internal/slowpath` companion `ip6tnl` (kernel reassembles before decapsulation), fragmentation by the
@@ -102,6 +111,26 @@ locally-known egress MTU, not a smaller MTU somewhere further along the IPv6 pat
   stale config) and WPD-9/WPD-10 (don't auto-RELEASE on restart; stable WAN IAID — `pkg/prefixdelegation`
   already uses a fixed client IAID, so WPD-10 is likely met, but it does send a shutdown Release). RFC 7084's
   other update, RFC 9818 (LAN-side prefix delegation, LPD-1..LPD-10), is out of scope for a single-tier CPE.
+- `internal/wanextend` re-advertises the shared WAN prefix to the LAN with RFC 4861 §6.2.1's *default*
+  lifetimes (30 days valid / 7 days preferred, `ra.go`'s `validLifetime`/`preferredLifetime`) because
+  `DiscoverPrefix`/`WatchChanges` read the prefix back from the kernel's address list, and
+  `pkg/netlink`'s `parseIfAddrMsg` doesn't decode `IFA_CACHEINFO` — so the WAN RA's actual remaining
+  lifetimes are unknown to it. The NTT East IPoE spec (§2.4.2.1.2) says the network's RA *may* carry
+  Preferred Lifetime = 0, so this is reachable in the target deployment, not just in theory: minuteman
+  would advertise a 7-day preferred lifetime for a prefix the network has already deprecated, telling LAN
+  clients to keep sourcing from an address the network no longer prefers (RFC 4862 §5.5.4 makes
+  deprecation the sender's signal to stop). The fix is to decode `IFA_CACHEINFO` in `parseIfAddrMsg`,
+  carry the remaining lifetimes on the discovered prefix, and pass them into the RA config — the same
+  values the RFC 9096 L-15/L-16 item above needs for the DHCPv6-PD side, so the two share the plumbing.
+- The WAN-side RA's M/O flags (RFC 4861 §4.2) are never consulted: `pkg/routeradvert`'s codec is
+  Marshal-only (it only detects that a Router Solicitation *arrived*, `isRouterSolicitation`), inbound
+  RAs are left entirely to the kernel, and which LAN provisioning model runs is the operator's
+  `-dhcpv6-pd`-vs-`-ndproxy` choice. No protocol requirement is broken — the O flag's
+  Information-Request is sent unconditionally by `pkg/aftrdiscovery` anyway, and the NTT East IPoE spec
+  (§2.4.2.1.2) only 推奨s (recommends) DHCPv6-PD on M=1, which `-dhcpv6-pd` does — but the network
+  signals the model minuteman currently has to be told, so this is the one piece of per-deployment
+  configuration that AFTR discovery's own design goal (no per-VNE config) would say should be derived.
+  Deriving it means decoding inbound RAs on the WAN, which nothing does today.
 - RA MTU option (RFC 4861 §4.6.4) isn't advertised.
 - MLD (RFC 3810) is left entirely to the kernel — minuteman forwards no IPv6 multicast of its own. Fine
   for a home gateway; would need revisiting for a router expected to do multicast routing.
