@@ -99,4 +99,10 @@ type Stats struct {
 	// inner IPv4 encapsulated whole, outer IPv6 fragmented, DF ignored.
 	EncapFragXDP uint64 // packets outer-fragmented in XDP (one per inner packet)
 	EncapFragSeg uint64 // outer-IPv6 fragments emitted by xdp_softwire_frag*
+
+	// ICMPTimeExceeded counts decap-side inner-TTL expiries answered in XDP
+	// with a softwire-encapsulated ICMPv4 Time Exceeded (RFC 1812 §5.3.1). It
+	// sits at the end rather than next to ICMPFragNeeded because the enum it
+	// mirrors is append-only: the ids are the pinned map's keys.
+	ICMPTimeExceeded uint64
 }

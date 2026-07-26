@@ -57,6 +57,7 @@
 #define OUTER_HDR_LEN (OUTER_ETH_LEN + OUTER_IPV6_LEN)
 #define TUNNEL_L3_OVERHEAD OUTER_IPV6_LEN
 #define ICMPV4_MIN_MTU 68
+#define B4_WELL_KNOWN_IPV4 0xc0000002 /* 192.0.0.2, RFC 6333 §5.7 / RFC 7335 */
 
 struct vlan_hdr_min {
     __be16 h_vlan_TCI;
@@ -80,6 +81,17 @@ struct icmp_frag_needed {
 };
 
 #define ICMP_FRAG_REPLY_L3_LEN (sizeof(struct iphdr) + sizeof(struct icmp_frag_needed))
+
+struct icmp_time_exceeded {
+    __u8 type;
+    __u8 code;
+    __u16 checksum;
+    __u32 unused;
+    struct ipv4_quote quote;
+};
+
+#define ICMP_TIME_EXCEEDED_REPLY_L3_LEN                                                  \
+    (sizeof(struct iphdr) + sizeof(struct icmp_time_exceeded))
 
 /*
  * The invoking-packet quote carried in an ICMPv6 Packet Too Big: the offending
@@ -114,7 +126,20 @@ checksum_fold32(__u32 csum)
 }
 
 static __always_inline __u16
-icmp_checksum(const struct icmp_frag_needed *icmp)
+icmp_frag_needed_checksum(const struct icmp_frag_needed *icmp)
+{
+    __u32 csum = 0;
+    const __u16 *p = (const __u16 *)icmp;
+
+#pragma unroll
+    for (int i = 0; i < sizeof(*icmp) / 2; i++)
+        csum += (__u32)p[i];
+
+    return checksum_fold32(csum);
+}
+
+static __always_inline __u16
+icmp_time_exceeded_checksum(const struct icmp_time_exceeded *icmp)
 {
     __u32 csum = 0;
     const __u16 *p = (const __u16 *)icmp;
@@ -276,6 +301,52 @@ copy_ipv4_quote(struct ipv4_quote *quote, const struct iphdr *iph)
     __builtin_memcpy(quote, iph, sizeof(*quote));
 }
 
+static __always_inline bool
+icmpv4_type_is_error(__u8 type)
+{
+    switch (type) {
+    case ICMP_DEST_UNREACH:
+    case ICMP_SOURCE_QUENCH:
+    case ICMP_REDIRECT:
+    case ICMP_TIME_EXCEEDED:
+    case ICMP_PARAMETERPROB:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/*
+ * RFC 1812 §4.3.2.7 (and RFC 1122 §3.2.2): an ICMP error message MUST NOT be
+ * originated in response to a non-initial fragment, to another ICMP error
+ * message, or to a datagram whose source address does not identify a single
+ * host (unspecified, loopback, multicast or limited broadcast) -- doing any of
+ * those is how a single crafted packet turns into an error storm, and the
+ * quote would be unusable to the receiver anyway (a non-initial fragment
+ * carries no transport header for it to match against).
+ *
+ * `quote` must already hold the offending packet's IPv4 header plus the 8
+ * bytes past it, so quote->data[0] is the ICMP type when the protocol is ICMP
+ * (guaranteed: this is only called for ihl == 5).
+ */
+static __always_inline bool
+icmp_error_eligible(const struct ipv4_quote *quote)
+{
+    if (quote->iph.frag_off & bpf_htons(IP_OFFSET))
+        return false;
+
+    __u32 saddr = bpf_ntohl(quote->iph.saddr);
+    if (saddr == 0 || saddr == 0xffffffff)
+        return false;
+    if ((saddr >> 24) == 127 || (saddr >> 28) == 0xe)
+        return false;
+
+    if (quote->iph.protocol == IPPROTO_ICMP && icmpv4_type_is_error(quote->data[0]))
+        return false;
+
+    return true;
+}
+
 static __always_inline void
 build_icmp_frag_needed(struct icmp_frag_needed *msg, const struct ipv4_quote *quote,
                        __u16 next_mtu)
@@ -287,7 +358,33 @@ build_icmp_frag_needed(struct icmp_frag_needed *msg, const struct ipv4_quote *qu
     msg->next_mtu = bpf_htons(next_mtu);
     msg->quote = *quote;
     msg->checksum = 0;
-    msg->checksum = icmp_checksum(msg);
+    msg->checksum = icmp_frag_needed_checksum(msg);
+}
+
+static __always_inline void
+build_icmp_time_exceeded(struct icmp_time_exceeded *msg, const struct ipv4_quote *quote)
+{
+    __builtin_memset(msg, 0, sizeof(*msg));
+    msg->type = ICMP_TIME_EXCEEDED;
+    msg->code = ICMP_EXC_TTL;
+    msg->unused = 0;
+    msg->quote = *quote;
+    msg->checksum = 0;
+    msg->checksum = icmp_time_exceeded_checksum(msg);
+}
+
+static __always_inline void
+write_dslite_inner_icmp_iph(struct iphdr *icmp_iph, const struct ipv4_quote *quote)
+{
+    icmp_iph->version = 4;
+    icmp_iph->ihl = 5;
+    icmp_iph->tos = 0;
+    icmp_iph->id = 0;
+    icmp_iph->frag_off = 0;
+    icmp_iph->ttl = 64;
+    icmp_iph->protocol = IPPROTO_ICMP;
+    icmp_iph->saddr = bpf_htonl(B4_WELL_KNOWN_IPV4);
+    icmp_iph->daddr = quote->iph.saddr;
 }
 
 /*
@@ -302,30 +399,42 @@ write_dslite_icmp_frag_needed(struct ethhdr *eth, struct ipv6hdr *outer_iph,
                               struct iphdr *icmp_iph, struct icmp_frag_needed *icmp,
                               const struct ipv4_quote *quote,
                               const struct in6_addr *b4_addr,
-                              const struct in6_addr *aftr_addr,
-                              __u32 icmp_src_ip_host_order, __u16 next_mtu)
+                              const struct in6_addr *aftr_addr, __u16 next_mtu)
 {
     struct icmp_frag_needed msg = {};
 
-    swap_eth_addrs(eth);
     eth->h_proto = bpf_htons(ETH_P_IPV6);
 
     write_outer_ipv6(outer_iph, b4_addr, aftr_addr, IPPROTO_IPIP,
                      (__u16)ICMP_FRAG_REPLY_L3_LEN);
 
-    icmp_iph->version = 4;
-    icmp_iph->ihl = 5;
-    icmp_iph->tos = 0;
+    write_dslite_inner_icmp_iph(icmp_iph, quote);
     icmp_iph->tot_len = bpf_htons((__u16)ICMP_FRAG_REPLY_L3_LEN);
-    icmp_iph->id = 0;
-    icmp_iph->frag_off = 0;
-    icmp_iph->ttl = 64;
-    icmp_iph->protocol = IPPROTO_ICMP;
-    icmp_iph->saddr = bpf_htonl(icmp_src_ip_host_order);
-    icmp_iph->daddr = quote->iph.saddr;
     ipv4_checksum(icmp_iph);
 
     build_icmp_frag_needed(&msg, quote, next_mtu);
+    __builtin_memcpy(icmp, &msg, sizeof(msg));
+}
+
+static __always_inline void
+write_dslite_icmp_time_exceeded(struct ethhdr *eth, struct ipv6hdr *outer_iph,
+                                struct iphdr *icmp_iph, struct icmp_time_exceeded *icmp,
+                                const struct ipv4_quote *quote,
+                                const struct in6_addr *b4_addr,
+                                const struct in6_addr *aftr_addr)
+{
+    struct icmp_time_exceeded msg = {};
+
+    eth->h_proto = bpf_htons(ETH_P_IPV6);
+
+    write_outer_ipv6(outer_iph, b4_addr, aftr_addr, IPPROTO_IPIP,
+                     (__u16)ICMP_TIME_EXCEEDED_REPLY_L3_LEN);
+
+    write_dslite_inner_icmp_iph(icmp_iph, quote);
+    icmp_iph->tot_len = bpf_htons((__u16)ICMP_TIME_EXCEEDED_REPLY_L3_LEN);
+    ipv4_checksum(icmp_iph);
+
+    build_icmp_time_exceeded(&msg, quote);
     __builtin_memcpy(icmp, &msg, sizeof(msg));
 }
 

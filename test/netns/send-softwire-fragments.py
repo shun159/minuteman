@@ -33,7 +33,7 @@ def checksum16(data: bytes) -> int:
     return (~total) & 0xFFFF
 
 
-def build_inner_ipv4(src_ip: str, dst_ip: str, payload_len: int) -> bytes:
+def build_inner_ipv4(src_ip: str, dst_ip: str, payload_len: int, ttl: int = 64) -> bytes:
     # ICMP echo request (type 8) with a payload big enough that the whole inner
     # packet spans two IPv6 fragments once encapsulated.
     icmp_id, icmp_seq = 0x4242, 1
@@ -46,13 +46,13 @@ def build_inner_ipv4(src_ip: str, dst_ip: str, payload_len: int) -> bytes:
     ihl_ver = (4 << 4) | 5
     ip = struct.pack(
         "!BBHHHBBH4s4s",
-        ihl_ver, 0, total_len, 0x1234, 0, 64, 1, 0,
+        ihl_ver, 0, total_len, 0x1234, 0, ttl, 1, 0,
         socket.inet_aton(src_ip), socket.inet_aton(dst_ip),
     )
     ip_csum = checksum16(ip)
     ip = struct.pack(
         "!BBHHHBBH4s4s",
-        ihl_ver, 0, total_len, 0x1234, 0, 64, 1, ip_csum,
+        ihl_ver, 0, total_len, 0x1234, 0, ttl, 1, ip_csum,
         socket.inet_aton(src_ip), socket.inet_aton(dst_ip),
     )
     return ip + icmp
@@ -83,6 +83,8 @@ def main() -> None:
     #                            is off-LAN, to exercise the decap martian drop (the
     #                            softwire slow path's IPv4 default route must not turn
     #                            the B4 into a reflector -- STAT_DECAP_MARTIAN).
+    #   "ttl1" -> a whole softwire packet to a LAN client with inner TTL=1, to
+    #             exercise B4-originated ICMPv4 Time Exceeded on the decap path.
     mode = sys.argv[6] if len(sys.argv) > 6 else "frag"
 
     dst_mac = bytes.fromhex(dst_mac_s.replace(":", ""))
@@ -99,6 +101,14 @@ def main() -> None:
         s.send(eth + pkt)
         s.close()
         print(f"sent 1 softwire packet (inner dst {inner_dst}, off-LAN) to {dst_mac_s} via {iface}")
+        return
+
+    if mode == "ttl1":
+        inner = build_inner_ipv4("203.0.113.2", "192.168.1.2", 32, ttl=1)
+        pkt = ipv6_header(aftr6, b4_6, len(inner), IPPROTO_IPIP) + inner
+        s.send(eth + pkt)
+        s.close()
+        print(f"sent 1 softwire packet (inner TTL=1) to {dst_mac_s} via {iface}")
         return
 
     inner = build_inner_ipv4("203.0.113.2", "192.168.1.2", 1200)

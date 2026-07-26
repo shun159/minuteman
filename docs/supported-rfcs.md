@@ -23,7 +23,7 @@ Provisioning Protocol many Japanese VNEs use instead of the DHCPv6 AFTR-Name —
 
 | RFC | Title | Support | Notes |
 |-----|-------|:---:|-------|
-| **6333** | Dual-Stack Lite Broadband Deployments Following IPv4 Exhaustion | ◐ | B4 element: XDP encap/decap datapath, MTU/PMTUD handling. §5.3 fragmentation is met on both halves: reassembly via the kernel companion `ip6tnl` (`internal/slowpath` — kernel reassembles a fragmented softwire before the ip6tnl decaps), fragmentation via the in-XDP outer-IPv6 fragmenter (`encap_fragment_outer` + `internal/fragpath`), which encapsulates the oversized inner IPv4 whole and fragments the **outer IPv6**, DF ignored per errata 5847 → RFC 2473 §7.2(b). Residual: packets the XDP fragmenter can't take (>4 fragments / jumbo inner / degenerate MTU — see backlog §4's residual note) fall back to the ip6tnl, which fragments the inner IPv4. Remaining gap: §5.7 well-known B4 address 192.0.0.2 (backlog #3). |
+| **6333** | Dual-Stack Lite Broadband Deployments Following IPv4 Exhaustion | ◐ | B4 element: XDP encap/decap datapath, MTU/PMTUD handling. §5.3 fragmentation is met on both halves: reassembly via the kernel companion `ip6tnl` (`internal/slowpath` — kernel reassembles a fragmented softwire before the ip6tnl decaps), fragmentation via the in-XDP outer-IPv6 fragmenter (`encap_fragment_outer` + `internal/fragpath`), which encapsulates the oversized inner IPv4 whole and fragments the **outer IPv6**, DF ignored per errata 5847 → RFC 2473 §7.2(b). Tunnel-originated ICMPv4 uses the §5.7 well-known B4 address `192.0.0.2`. Residual: packets the XDP fragmenter can't take (>4 fragments / jumbo inner / degenerate MTU — see backlog §4's residual note) fall back to the ip6tnl, which fragments the inner IPv4. |
 | **7785** | Recommendations for Prefix Binding in the Context of Softwire Dual-Stack Lite | ◐ | Basis for **dynamic B4**: on a WAN (B4) address change minuteman re-selects the source and hard-switches. §4 Rec 3 (AFTR migrates NAT state to the new B4) is relied on when the AFTR provides it, else flows break. §4 Rec 4 (PCP ANNOUNCE) ✗ — minuteman has no PCP. |
 | **2473** | Generic Packet Tunneling in IPv6 | ○ | DS-Lite uses `nexthdr = IPPROTO_IPIP` directly (no encapsulation-limit option). §7.2(b) tunnel fragmentation (encapsulate whole, fragment the outer IPv6) is what the in-XDP fragmenter implements. Reactive ICMPv6-error → ICMPv4 relay (§8) is ✗ (backlog #5). |
 
@@ -68,8 +68,8 @@ Provisioning Protocol many Japanese VNEs use instead of the DHCPv6 AFTR-Name —
 |-----|-------|:---:|-------|
 | **4443** | ICMPv6 for IPv6 | ◐ | In-datapath Packet Too Big origination with per-CPU token-bucket rate-limiting (§2.4(f)). Quote is fixed-size (invoking header + 8 bytes), not "as much as fits in the min MTU". |
 | **791** | Internet Protocol | ○ | Minimum IPv4 MTU (68 B) as the DHCPv4 Interface-MTU floor. |
-| **1812** | Requirements for IP Version 4 Routers | ◐ | §5.3.1 inner-TTL Time Exceeded: the outbound (encap) direction is now answered by the kernel via the softwire slow path's IPv4 default route; the inbound (decap) direction is still a gap (backlog #3). |
-| **7335** | IPv4 Service Continuity Prefix | ✗ | The 192.0.0.0/29 realm / 192.0.0.2 B4 address is not yet used (backlog #3). |
+| **1812** | Requirements for IP Version 4 Routers | ◐ | §5.3.1 inner-TTL Time Exceeded: the outbound (encap) direction is answered by the kernel via the softwire slow path's IPv4 default route; the inbound (decap) direction is answered in XDP as a softwire-encapsulated ICMPv4 Time Exceeded, suppressed per §4.3.2.7 for non-initial fragments, ICMP errors and non-unicast sources. Only these ICMP-origination rules are in scope — the rest of the router requirements are not. |
+| **7335** | IPv4 Service Continuity Prefix | ○ | Tunnel-originated ICMPv4 uses the 192.0.0.0/29 realm's B4 well-known address `192.0.0.2`. |
 
 ## Test rig / documentation conventions only
 

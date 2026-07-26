@@ -51,26 +51,23 @@ right.
 pointer consulted per send) so a Renew never restarts the worker; or plumb a "restarting, not shutting
 down" signal that suppresses the final RA.
 
-## 3. Tunnel-originated ICMPv4: decap-side Time Exceeded, and the B4 well-known address is unused — RFC 1812 §5.3.1, RFC 6333 §5.7 + RFC 7335
+## 3. ~~Tunnel-originated ICMPv4: decap-side Time Exceeded, and the B4 well-known address is unused~~ — RESOLVED
 
-Two related gaps around ICMPv4 the B4 itself must originate:
+The B4 now originates tunnel-side ICMPv4 from the well-known B4 address `192.0.0.2`
+(RFC 6333 §5.7 / RFC 7335). Decap-side inner TTL expiry is handled in XDP:
+`xdp_dslite_decap` rewrites the still-encapsulated frame into a softwire-encapsulated
+ICMPv4 Time Exceeded reply back toward the AFTR, counted as `ICMPTimeExceeded`.
+The outbound encap-side TTL expiry remains handled by the kernel through the companion
+`ip6tnl` and its IPv4 default route.
 
-- **Inner TTL expiry — outbound now handled, inbound still not** (RFC 1812 §5.3.1 MUST).
-  `xdp_dslite_encap` XDP_PASSes an inner TTL≤1 packet to the kernel; since the softwire fragmentation
-  slow path added the companion `ip6tnl` and an IPv4 default route through it (`internal/slowpath`),
-  the kernel now has a route to forward toward and answers **ICMPv4 Time Exceeded** for the expiry
-  (verified against the netns rig — a LAN `ping -t 1` gets Time Exceeded from the CPE, where it used to
-  get Destination Unreachable). What remains is the **decap** side: `xdp_dslite_decap` XDP_PASSes the
-  *still-encapsulated* packet on an inner-TTL check that runs pre-decap, but the companion ip6tnl
-  decapsulates it (its outer header is `nexthdr == IPPROTO_IPIP`) and then the inner TTL≤1 packet is
-  dropped by the kernel's own forwarding without a softwire-re-encapsulated Time Exceeded going back to
-  the original IPv4 sender, so inbound traceroute still gets no reply at the B4 hop.
-- **192.0.0.2 unused** (RFC 6333 §5.7 + RFC 7335): the B4's tunnel-side ICMP (today only its ICMPv4
-  Fragmentation-Needed replies) is sourced from the LAN gateway's private IPv4 instead of the
-  well-known B4 address.
-
-**Effect:** inbound traceroute and PMTUD-adjacent tooling still misbehave at the B4 hop; reachability
-itself unaffected.
+The decap-side reply is deliberately narrow, so that "TTL expired" never swallows a
+packet the B4 was not forwarding in the first place: it is decided *after* the LAN FIB
+lookup (a packet addressed to one of the CPE's own IPv4 addresses is `NOT_FWDED` and is
+delivered locally at TTL 1, as RFC 1812 §5.3.1 requires), it is suppressed for the cases
+§4.3.2.7 forbids (non-initial fragment, ICMP error, non-unicast source), and anything the
+XDP rewrite can't express — an offending packet smaller than the 110-byte reply, IPv4
+options — is `XDP_PASS`ed so the companion `ip6tnl` plus the kernel's own forwarding
+originate the error instead.
 
 ## 4. ~~Softwire fragmentation is inner-IPv4, not RFC-canonical outer-IPv6~~ — RESOLVED (in-XDP outer-IPv6 fragmentation); residual fallback cases remain
 
