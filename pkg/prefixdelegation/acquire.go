@@ -3,17 +3,19 @@ package prefixdelegation
 import (
 	"context"
 	"fmt"
-	"time"
+	"slices"
 
 	"github.com/shun159/miniteman/pkg/dhcpv6"
 )
 
 // usableIAPD extracts and validates an OPTION_IA_PD from msg: it must be
-// present, decode cleanly, report no failure status, and carry at least one
-// delegated prefix. Returns an error describing what's wrong if not -- the
-// caller treats any such error as "discard and retry", per RFC 3315's
-// general validation rule (never fail the whole exchange over one bad
-// message).
+// present, decode cleanly, report no failure status, carry at least one
+// delegated prefix left after §21.22's preferred-beyond-valid ones are
+// dropped, and not carry the T1 > T2 > 0 combination RFC 9915 §21.21
+// tells a client to discard the option over. Returns an error
+// describing what's wrong if not -- the caller treats any such error as
+// "discard and retry", per RFC 3315's general validation rule (never fail
+// the whole exchange over one bad message).
 func usableIAPD(msg *dhcpv6.Message) (*IAPD, dhcpv6.DUID, error) {
 	serverID, ok := msg.Options.ServerID()
 	if !ok {
@@ -33,8 +35,23 @@ func usableIAPD(msg *dhcpv6.Message) (*IAPD, dhcpv6.DUID, error) {
 	if iapd.StatusCode != nil && iapd.StatusCode.Code != StatusSuccess {
 		return nil, nil, fmt.Errorf("prefixdelegation: server returned status %d (%s)", iapd.StatusCode.Code, iapd.StatusCode.Message)
 	}
+	// RFC 9915 §21.22: "The client MUST discard any prefixes for which the
+	// preferred lifetime is greater than the valid lifetime." Dropping
+	// them individually (rather than the whole IA_PD) is what the MUST
+	// says, and it keeps the lease timers derived from lifetimes that
+	// make sense -- see effectiveTimers.
+	iapd.Prefixes = slices.DeleteFunc(iapd.Prefixes, func(p IAPrefix) bool {
+		return p.PreferredLifetime > p.ValidLifetime
+	})
 	if len(iapd.Prefixes) == 0 {
-		return nil, nil, fmt.Errorf("prefixdelegation: IA_PD carries no delegated prefixes")
+		return nil, nil, fmt.Errorf("prefixdelegation: IA_PD carries no usable delegated prefixes")
+	}
+	// RFC 9915 §21.21: an IA_PD with T1 greater than T2, both non-zero,
+	// is invalid -- the client discards the option and processes the rest
+	// of the message as though the server hadn't sent it. Discarding the
+	// only IA_PD in play leaves nothing usable, so it becomes a retry.
+	if iapd.T2 > 0 && iapd.T1 > iapd.T2 {
+		return nil, nil, fmt.Errorf("prefixdelegation: IA_PD has T1 (%v) greater than T2 (%v)", iapd.T1, iapd.T2)
 	}
 	return iapd, serverID, nil
 }
@@ -83,12 +100,6 @@ func Acquire(ctx context.Context, ifaceName string) (*Lease, error) {
 			continue
 		}
 
-		return &Lease{
-			ServerID:   serverID,
-			Prefixes:   granted.Prefixes,
-			T1:         granted.T1,
-			T2:         granted.T2,
-			AcquiredAt: time.Now(),
-		}, nil
+		return newLease(serverID, granted), nil
 	}
 }

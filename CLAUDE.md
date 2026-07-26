@@ -27,7 +27,9 @@ further down — this is just the index of what exists and which flag turns it o
   re-selected when the WAN address changes (renumbering/lease/reconnect), so the softwire survives a WAN
   renumbering instead of needing a restart. `-b4` still pins it statically.
 - **DHCPv6 Prefix Delegation** (`-dhcpv6-pd`, RFC 3633) — acquires and maintains a delegated prefix,
-  carves one `/64` per `-lan` interface from it, and RAs it out (RFC 4861) for LAN SLAAC.
+  carves one `/64` per `-lan` interface from it, and RAs it out (RFC 4861) for LAN SLAAC. Renewal runs on
+  the server's T1/T2, or — when the server sends 0 to leave that timing to the requesting router — on
+  timers derived from the prefix's own preferred lifetime (RFC 9915 §14.2, see `pkg/prefixdelegation`).
 - **NDProxy** (`-ndproxy`, RFC 4389) — the alternative WAN model some ISPs use instead of PD (one shared
   WAN `/64`, extended onto the LAN): actively verifies a LAN target before proxying NS/NA for it, rather
   than passively snooping. Mutually exclusive with `-dhcpv6-pd` (alternative WAN provisioning models).
@@ -52,7 +54,7 @@ further down — this is just the index of what exists and which flag turns it o
   reassembles before the ip6tnl decapsulates (§5.3's "reassembly MUST happen before decapsulation"). The
   ip6tnl also remains the *fallback* for what the XDP fragmenter can't take (`STAT_ENCAP_FRAG_SLOW`: >4
   fragments, inner beyond `fragpath.MaxInnerLen`, degenerate MTU — there the kernel fragments the inner
-  IPv4, a reachability fallback, not §5.3 conformance; backlog §3's residual note) and for a decapped
+  IPv4, a reachability fallback, not §5.3 conformance; backlog §2's residual note) and for a decapped
   inner too big for a non-DF LAN egress. Created at startup and repointed on an AFTR migration /
   B4 switch. A side benefit is that the IPv4 default route lets the kernel answer ICMPv4 Time Exceeded for
   an expiring inner TTL outbound. To keep that default route from turning the decap
@@ -82,7 +84,7 @@ Not yet implemented:
   `cmd/minuteman`'s policy beyond the current dslite-only capability request.
 - A handful of RFC 7084/6333 compliance gaps. Softwire fragmentation (RFC 6333 §5.3) is now addressed on
   both halves (in-XDP outer-IPv6 fragmentation + kernel-ip6tnl reassembly — see the **Softwire
-  fragmentation** feature above); only its fallback cases (backlog §3's residual note) still fragment the
+  fragmentation** feature above); only its fallback cases (backlog §2's residual note) still fragment the
   inner IPv4. The remaining gaps are in `docs/rfc-compliance-backlog.md`, priority-ordered with the
   specific code each points at. Non-protocol operability/test-ergonomics improvements are tracked
   separately in `docs/operability-backlog.md` — its #1 (out-of-band stats via a bpffs-pinned map + the
@@ -128,12 +130,14 @@ sudo ./test/netns/smoketest.sh   # starts minuteman itself + pings/curls end-to-
 sudo ./test/netns/teardown.sh    # tears everything down (always safe to re-run)
 ```
 
-Eight independent env-var toggles select what `setup.sh` builds and what `smoketest.sh` asserts —
+Nine independent env-var toggles select what `setup.sh` builds and what `smoketest.sh` asserts —
 `MM_AFTR_DISCOVERY` (`dhcpv6`/`hb46pp`), `MM_WAN_MODEL` (`dhcpv6-pd`/`ndproxy`), `MM_DNS_PROXY`,
 `MM_DHCPV4`, `MM_DUALSTACK`, `MM_IPV6_SW_RSS`, `MM_DYNAMIC_B4` (omit `-b4` and drive a WAN-renumbering
 scenario), `MM_SOFTWIRE_FRAG` (exercise softwire fragmentation both ways — oversized non-DF *and* DF
 pings outbound, both expected to round-trip via the in-XDP outer-IPv6 fragmenter, and a hand-crafted
-fragmented softwire packet inbound via `send-softwire-fragments.py`) — plus the full list of
+fragmented softwire packet inbound via `send-softwire-fragments.py`), `MM_PD_ZERO_TIMERS` (have Kea
+delegate with T1=T2=0 on short lifetimes, so the client-derived renewal timer is asserted and a real
+renewal is waited out — adds ~90s) — plus the full list of
 verified-passing combinations. See
 **`test/netns/README.md`** for all of that detail; it's a rig-operation runbook, not something most tasks
 need loaded up front.
@@ -409,6 +413,19 @@ orphaned the running kernel's module directory — reboot to fix that).
   refresh interval: a lease that's never renewed actually expires and breaks LAN connectivity, so this
   drives RFC 3315's full renewal ladder (Renew at T1 → Rebind at T2 on failure → fresh `Acquire` on failure)
   indefinitely, calling back into the caller on every change, and sends a best-effort `Release` on shutdown.
+  The T1/T2 that ladder runs on are not necessarily the server's: `timers.go`'s `effectiveTimers` resolves
+  a delegated 0 — RFC 9915 §21.21's way of leaving the renewal timing to the requesting router, which
+  §14.2 then requires to choose times that avoid message storms and in particular *not* transmit
+  immediately — into §21.21's own recommended 0.5 × / 0.8 × of the shortest preferred lifetime, floored by
+  `minDerivedT1` (1 minute, §14.1's rate-limiting MUST expressed as a cadence), capped by the shortest
+  *valid* lifetime (a Renew scheduled past the binding's own death can only fail into a full re-Acquire —
+  more messages than renewing in time, so the ceiling serves the same anti-storm purpose as the floor)
+  and clamped to keep
+  T1 ≤ T2 whichever of the two the server did pin; a non-zero server value is used verbatim, since §21.21
+  makes that a MUST, and `usableIAPD` discards an IA_PD carrying the T1 > T2 > 0 combination §21.21 calls
+  invalid (plus, per §21.22, any individual prefix whose preferred lifetime exceeds its valid one). Taken literally instead, T1=0 renewed on every exchange RTT — a storm against any server that
+  sends it (the netns rig's `MM_PD_ZERO_TIMERS=1` mode is the regression test). Outgoing IA_PDs zero
+  their own T1/T2 (§21.21's client-side SHOULD; the server ignores them anyway).
 - **`pkg/routeradvert/`** — RFC 4861 (Neighbor Discovery) logic covering only what a CPE needs: sending
   Router Advertisements on the LAN side, plus (`solicit.go`) sending Router Solicitations upstream on the
   WAN side — `SolicitRouters` transmits §6.3.7's host cadence (3 RSes, 4s apart) and lets the kernel

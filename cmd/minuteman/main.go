@@ -409,6 +409,12 @@ func runPrefixDelegation(ctx context.Context, wanIface string, lans cliconfig.LA
 	reconcileAndLog := func(l *prefixdelegation.Lease) {
 		var err error
 		p := l.Prefixes[0]
+		// The renewal timers are worth a line of their own: they may be
+		// ones minuteman derived rather than ones the server sent (RFC
+		// 9915 §14.2 leaves them to the client when the server sends 0),
+		// so this is the only place an operator can see what the lease is
+		// actually running on.
+		log.Printf("DHCPv6-PD lease on %s: prefix %s, renew in %s, rebind in %s", wanIface, p.Prefix, l.T1, l.T2)
 		assigned, err = lanprefix.Reconcile(p.Prefix, p.ValidLifetime, p.PreferredLifetime, lanIfaces, assigned)
 		if err != nil {
 			log.Printf("reconciling LAN addresses: %v", err)

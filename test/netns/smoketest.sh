@@ -10,7 +10,10 @@
 # RFC 4389 NDProxy extending the WAN's own SLAAC prefix onto the LAN. If
 # setup.sh was run with MM_DNS_PROXY=1, also spot-checks minuteman's DNS
 # proxy (RFC 6333's B4 SHOULD); if with MM_DHCPV4=1, has mm-host acquire its
-# IPv4 lease from minuteman's DHCPv4 server (RFC 2131) and checks it.
+# IPv4 lease from minuteman's DHCPv4 server (RFC 2131) and checks it; if with
+# MM_PD_ZERO_TIMERS=1, waits out the renewal timer minuteman derived for
+# itself from a T1=T2=0 delegation (RFC 9915 §14.2) and checks it renewed
+# once on it rather than storming the server (this mode alone adds ~90s).
 #
 # Starts minuteman itself (if not already running) and stops it again on
 # exit, unless it detects an existing instance to leave alone.
@@ -168,6 +171,30 @@ softwire_frag_enabled=0
 if [[ -f "$SOFTWIRE_FRAG_ENABLED_FILE" && "$(cat "$SOFTWIRE_FRAG_ENABLED_FILE")" == 1 ]]; then
     softwire_frag_enabled=1
 fi
+
+pd_zero_timers=0
+if [[ -f "$PD_ZERO_TIMERS_FILE" && "$(cat "$PD_ZERO_TIMERS_FILE")" == 1 ]]; then
+    pd_zero_timers=1
+fi
+# The T1 minuteman derives from Kea's zero timers under MM_PD_ZERO_TIMERS:
+# 0.5 x PD_ZERO_PREFERRED_LIFETIME, per RFC 9915 §21.21's recommended ratio
+# (see pkg/prefixdelegation's effectiveTimers), formatted as time.Duration
+# prints it -- both the value the log line below is matched against and the
+# interval the renewal check waits out.
+pd_zero_t1=$((PD_ZERO_PREFERRED_LIFETIME / 2))
+pd_zero_t2=$((PD_ZERO_PREFERRED_LIFETIME * 4 / 5))
+fmt_duration() { printf '%dm%ds' $(($1 / 60)) $(($1 % 60)); }
+
+# kea_renew_count prints how many Renew messages mm-isp's Kea has logged
+# receiving so far (0 if it has no log yet) -- the renewal check below
+# compares two readings of this rather than an absolute count, since Kea's
+# log spans the whole rig lifetime and may already hold a previous
+# smoketest run's renewals.
+kea_renew_count() {
+    local n
+    n="$(grep -c "RENEW (type 5) received" "$KEA_LOG" 2>/dev/null || true)"
+    echo "${n:-0}"
+}
 # -b4 is omitted under MM_DYNAMIC_B4=1 (minuteman selects it dynamically); pinned
 # to WAN_CPE_ADDR otherwise.
 b4_flags=(-b4 "${WAN_CPE_ADDR%/*}")
@@ -203,6 +230,15 @@ else
         -stats-interval 0 >"$RUNDIR/minuteman.log" 2>&1 &
     minuteman_pid=$!
     started_minuteman=1
+    # When the DHCPv6-PD renewal check runs at the end of this script, it
+    # has to have waited out a full derived T1 measured from the lease --
+    # which is acquired a second or two after this point. Everything the
+    # script does in between counts toward that wait, so its baseline for
+    # Kea's Renew count has to be taken here, not there: on a slow enough
+    # run (or with enough other toggles on) the renewal it looks for can
+    # land before the final check even starts.
+    minuteman_started_at=$(date +%s)
+    kea_renews0="$(kea_renew_count)"
     # DHCPv6 discovery includes an RFC 3315 initial random delay (up to 1s)
     # before its first retransmission-timed attempt; DHCPv6-PD's own
     # Solicit/Request exchange (or, in ndproxy mode, the WAN prefix
@@ -334,6 +370,16 @@ else
     if [[ $started_minuteman -eq 1 ]]; then
         check "minuteman acquired the delegated prefix and assigned it to $VETH_CPE_HOST (see $RUNDIR/minuteman.log)" \
             grep -q "assigned $pd_lan_addr to $VETH_CPE_HOST (from delegated prefix $PD_POOL_PREFIX)" "$RUNDIR/minuteman.log"
+        if [[ $pd_zero_timers -eq 1 ]]; then
+            # Kea delegated with T1 = T2 = 0 (RFC 9915 §21.21: the renewal
+            # timing is the requesting router's to choose), so minuteman
+            # must have picked §21.21's recommended ratios of the ${PD_ZERO_PREFERRED_LIFETIME}s
+            # preferred lifetime for itself rather than taking the 0s
+            # literally. The renewal that timer schedules is checked at the
+            # end of this script, once it has had time to happen.
+            check "minuteman chose its own renewal timers for a T1=T2=0 delegation (RFC 9915 §14.2: renew $(fmt_duration $pd_zero_t1), rebind $(fmt_duration $pd_zero_t2))" \
+                grep -q "DHCPv6-PD lease on $VETH_CPE_ISP: prefix $PD_POOL_PREFIX, renew in $(fmt_duration $pd_zero_t1), rebind in $(fmt_duration $pd_zero_t2)" "$RUNDIR/minuteman.log"
+        fi
     fi
     check "$VETH_CPE_HOST carries the delegated-prefix address" \
         bash -c "ip netns exec $NETNS_CPE ip -6 addr show dev $VETH_CPE_HOST | grep -q '$pd_lan_addr/64'"
@@ -654,6 +700,54 @@ if [[ $dualstack_enabled -eq 1 ]]; then
         ipv6_rss="$(read_stat IPv6RSSRedirect)"
         check "IPv6 software-RSS fanned native-IPv6 packets across CPUs (datapath IPv6RSSRedirect +$((ipv6_rss - ipv6_rss0)))" \
             test "$ipv6_rss" -gt "$ipv6_rss0"
+    fi
+fi
+
+# Deliberately last: this is the one check that has to wait out a real timer
+# (the T1 minuteman derived for itself, PD_ZERO_PREFERRED_LIFETIME / 2), so
+# every check above overlaps with the waiting.
+if [[ $pd_zero_timers -eq 1 ]]; then
+    echo "== DHCPv6-PD renewal on client-chosen timers (RFC 9915 §14.2) =="
+    if [[ $started_minuteman -ne 1 ]]; then
+        echo "SKIP: reusing an already-running minuteman, whose lease age is unknown"
+    else
+        # Wait until a derived T1 has fully elapsed since the lease was
+        # acquired (a second or two after minuteman started), plus slack for
+        # the exchange itself.
+        renew_deadline=$((minuteman_started_at + pd_zero_t1 + 20))
+        now="$(date +%s)"
+        if ((now < renew_deadline)); then
+            echo "   waiting $((renew_deadline - now))s for the derived T1 ($(fmt_duration $pd_zero_t1)) to elapse"
+            sleep $((renew_deadline - now))
+        fi
+        elapsed=$(($(date +%s) - minuteman_started_at))
+
+        # Every successful Renew re-applies the lease and logs a line, so
+        # these lines are "1 acquire + one per renewal". The upper bound is
+        # what makes this a regression test for the storm: taking a T1 of 0
+        # literally renewed on every exchange RTT (hundreds of lines here),
+        # whereas the client's own choice can never be more often than
+        # pkg/prefixdelegation's minDerivedT1 floor.
+        pd_zero_min_interval=60 # pkg/prefixdelegation's minDerivedT1
+        leases="$(grep -c "DHCPv6-PD lease on $VETH_CPE_ISP:" "$RUNDIR/minuteman.log")"
+        max_leases=$((2 + elapsed / pd_zero_min_interval))
+        check "minuteman renewed the delegation at its derived T1 ($((leases - 1)) renewal(s) in ${elapsed}s)" \
+            test "$leases" -ge 2
+        check "minuteman did not storm the server with Renews ($leases lease application(s) in ${elapsed}s, at most $max_leases possible)" \
+            test "$leases" -le "$max_leases"
+
+        # Server-side confirmation that the renewal was a real exchange, not
+        # just minuteman re-applying a lease it already had. Counted from
+        # the baseline taken when minuteman started, so a renewal that
+        # happened while the checks above ran still counts.
+        kea_renews="$(kea_renew_count)"
+        check "mm-isp's Kea received the Renew(s) ($((kea_renews - kea_renews0)) in ${elapsed}s)" \
+            test "$((kea_renews - kea_renews0))" -ge 1
+
+        # A renewal must not disturb what the lease already produced: same
+        # delegated prefix, same LAN address carved from it.
+        check "the delegated prefix survived the renewal unchanged ($pd_lan_addr still on $VETH_CPE_HOST)" \
+            bash -c "ip netns exec $NETNS_CPE ip -6 addr show dev $VETH_CPE_HOST | grep -q '$pd_lan_addr/64'"
     fi
 fi
 

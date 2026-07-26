@@ -4,36 +4,18 @@ minuteman works as a DS-Lite B4 (verified end-to-end against the netns rig — s
 `test/netns/README.md`), but measured strictly against the base RFC 7084 (IPv6 CE Router Requirements)
 and RFC 6333, these gaps remain. Ordered by real-world impact, highest first. Last checked against the
 codebase 2026-07-26. (RFC 7084's own updates — RFC 9096 renumbering reaction and RFC 9818 LAN-side
-prefix delegation — are not targeted; see the RFC 9096 item in §5 and `docs/supported-rfcs.md`.)
+prefix delegation — are not targeted; see the RFC 9096 item in §4 and `docs/supported-rfcs.md`.)
 
 Softwire fragmentation (RFC 6333 §5.3) is now addressed on both halves: reassembly by the
 `internal/slowpath` companion `ip6tnl` (kernel reassembles before decapsulation), fragmentation by the
 in-XDP outer-IPv6 fragmenter (`encap_fragment_outer` + the `internal/fragpath` companion veth pairs) —
-see the resolved §3 below for the residual fallback cases that still take the old inner-IPv4 path.
+see the resolved §2 below for the residual fallback cases that still take the old inner-IPv4 path.
 Tunnel-originated ICMPv4 (decap-side Time Exceeded plus the RFC 6333 §5.7 well-known B4 address) is also
-resolved and no longer tracked here.
+resolved and no longer tracked here, as is the DHCPv6-PD client-chosen-timer gap (a T1/T2 of 0 is now
+resolved through `pkg/prefixdelegation`'s `effectiveTimers` per RFC 9915 §14.2, and an IA_PD with
+T1 > T2 > 0 is discarded per §21.21 — exercised end-to-end by the rig's `MM_PD_ZERO_TIMERS=1` mode).
 
-## 1. DHCPv6-PD takes the server's T1/T2 literally, including 0 — RFC 3633 §9 / RFC 9915 §14.2
-
-`pkg/prefixdelegation/maintain.go`'s `Maintain` sleeps until `AcquiredAt + T1` with the
-server-supplied T1 used as-is, and nothing anywhere derives client-side timers: a delegating router
-that sets T1=T2=0 is delegating the renewal timing to the requesting router (RFC 3633 §9), which
-RFC 9915 §14.2 ("Client Behavior when T1 and/or T2 Are 0") then requires to choose its own times —
-explicitly *not immediately*, and avoiding message storms (0.5 × / 0.8 × the shortest preferred
-lifetime, the ratio DHCPv6 recommends for server-set timers, is the usual choice). Taken literally,
-T1=0 makes `sleepUntil` return immediately, so every successful Renew flows straight into the next — a
-busy Renew loop hammering the delegating server for as long as it keeps answering (each iteration is
-one exchange RTT, no sleep at all). T1 > T2 (RFC 9915 §21.21: a requesting router discards such an
-IA_PD) isn't sanity-checked either, and `tryRenew`'s deadline of `AcquiredAt + T2` goes similarly
-wrong when T2=0.
-
-**Effect:** real delegating routers do send T1=T2=0; against one, minuteman becomes a renew storm.
-Never exercised by the netns rig (its Kea is configured with renew-timer 1800).
-
-**Fix:** when T1 and/or T2 is 0, derive them from the shortest preferred lifetime per RFC 9915 §14.2
-(with a sane floor, and no immediate transmit); discard IA_PDs carrying 0 < T2 < T1.
-
-## 2. Every Renew restarts the LAN RA workers through their shutdown path — RFC 4861 §6.2.5 misapplied
+## 1. Every Renew restarts the LAN RA workers through their shutdown path — RFC 4861 §6.2.5 misapplied
 
 `internal/lanprefix.RAManager.Sync` deliberately restarts every RA worker on every lease change (to
 pick up refreshed lifetimes — its comment claims restarting has no churn equivalent to `Reconcile`'s),
@@ -53,7 +35,7 @@ right.
 pointer consulted per send) so a Renew never restarts the worker; or plumb a "restarting, not shutting
 down" signal that suppresses the final RA.
 
-## 3. ~~Softwire fragmentation is inner-IPv4, not RFC-canonical outer-IPv6~~ — RESOLVED (in-XDP outer-IPv6 fragmentation); residual fallback cases remain
+## 2. ~~Softwire fragmentation is inner-IPv4, not RFC-canonical outer-IPv6~~ — RESOLVED (in-XDP outer-IPv6 fragmentation); residual fallback cases remain
 
 RFC 6333 §5.3 (with the original "The inner IPv4 packet MUST NOT be fragmented; fragmentation MUST happen
 after encapsulation", and errata 5847 pointing at RFC 2473 §7.2(b), ignoring the DF bit) requires the B4 to
@@ -85,19 +67,19 @@ XDP-attached LAN veth caps the pair's MTU so a client can't emit a >1500 inner p
 packet then takes the ip6tnl fallback (`EncapFragSlow` advances, `EncapFragXDP` does not) and draws an
 ICMPv4 Fragmentation-Needed (PMTUD) rather than blackholing.
 
-## 4. Tunnel ICMPv6 relay — RFC 2473 §8
+## 3. Tunnel ICMPv6 relay — RFC 2473 §8
 
 No reactive translation exists of an ICMPv6 error about the softwire packet itself (e.g. a Packet Too Big
 or Time Exceeded from an intermediate IPv6 router on the B4↔AFTR path) into an ICMPv4 error toward the
 original IPv4 sender. The encap path's own proactive `bpf_check_mtu`-based PtB only covers the
 locally-known egress MTU, not a smaller MTU somewhere further along the IPv6 path.
 
-## 5. Minor / acceptable for a home CPE
+## 4. Minor / acceptable for a home CPE
 
 - During an AFTR graceful migration's drain window the softwire slow-path companion ip6tnl is repointed at
   the *new* AFTR at cutover. A *draining* flow's XDP-fragmented packets are unaffected (the in-XDP
   fragmenter reads the same per-packet next-hop slot as normal encap, so its fragments follow flow
-  affinity), but the rare packet that falls to the ip6tnl *fallback* (see §3's residual) during a drain is
+  affinity), but the rare packet that falls to the ip6tnl *fallback* (see §2's residual) during a drain is
   encapsulated toward the new AFTR and dropped until the flow finishes — the fast path's dual-AFTR decap is
   unaffected.
 
