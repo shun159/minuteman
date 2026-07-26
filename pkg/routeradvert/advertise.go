@@ -74,6 +74,51 @@ type Config struct {
 	RDNSSAddr netip.Addr
 }
 
+// Updater carries Config changes into a running Serve, so a caller whose
+// advertised prefix or lifetimes changed can refresh them without
+// cancelling and restarting the goroutine.
+//
+// Restarting would be equivalent but for one thing: cancellation is Serve's
+// *shutdown* path, so it emits RFC 4861 §6.2.5's RouterLifetime=0
+// advertisement -- and, since the RDNSS option's lifetime tracks the router
+// lifetime (see buildRA), an RDNSS Lifetime=0 with it. Every LAN client is
+// told this router is going away and its DNS server is unusable, moments
+// before the replacement worker announces both again. Updating in place
+// keeps that shutdown signal for actual shutdowns; see
+// internal/lanprefix.RAManager, which reaches here on every DHCPv6-PD Renew.
+//
+// The zero Updater is unusable; call NewUpdater.
+type Updater struct {
+	ch chan Config
+}
+
+// NewUpdater returns an Updater ready to be passed to Serve.
+func NewUpdater() *Updater {
+	return &Updater{ch: make(chan Config, 1)}
+}
+
+// Set makes cfg the Config Serve advertises from its next send onwards.
+//
+// It never blocks: the channel is size-1 latest-wins, so an update Serve
+// hasn't picked up yet is replaced rather than queued -- only the newest
+// Config is meaningful, the same coalescing cmd/minuteman's WAN-change
+// signal does. Set is for a single producer goroutine (minuteman's RA
+// managers each drive their workers from one), and is safe alongside the
+// Serve consuming the channel.
+func (u *Updater) Set(cfg Config) {
+	select {
+	case <-u.ch: // drop an update Serve hasn't consumed: cfg supersedes it
+	default:
+	}
+	select {
+	case u.ch <- cfg:
+	default:
+		// Unreachable with a single producer -- the drain above emptied
+		// the one slot and only this goroutine fills it. Non-blocking
+		// anyway, so misuse can never deadlock a caller here.
+	}
+}
+
 // Serve sends RFC 4861 Router Advertisements on ifaceName: periodically
 // (unsolicited, ramping from a fast initial burst per §10's
 // MAX_INITIAL_RTR_ADVERTISEMENTS/MAX_INITIAL_RTR_ADVERT_INTERVAL to the
@@ -82,12 +127,18 @@ type Config struct {
 // once per minDelayBetweenRAs, delayed by up to maxRADelayTime to avoid
 // synchronized replies, per §10).
 //
+// updates, when non-nil, replaces cfg while Serve runs (see Updater); a new
+// Config that differs from the current one is advertised promptly rather
+// than at the next scheduled RA, still respecting §6.2.4's
+// MIN_DELAY_BETWEEN_RAS floor between consecutive multicast RAs. A nil
+// Updater means cfg is fixed for this Serve's lifetime.
+//
 // Blocks until ctx is cancelled, at which point it sends one final RA with
 // RouterLifetime=0 (RFC 4861 §6.2.5, best-effort -- tells already-configured
 // hosts to stop treating this router as a default) before returning nil. A
 // non-nil error means opening the socket or a send failed outright; ctx
 // cancellation itself always yields a nil return.
-func Serve(ctx context.Context, ifaceName string, cfg Config) error {
+func Serve(ctx context.Context, ifaceName string, cfg Config, updates *Updater) error {
 	conn, err := Listen(ifaceName)
 	if err != nil {
 		return err
@@ -101,6 +152,13 @@ func Serve(ctx context.Context, ifaceName string, cfg Config) error {
 	mac := ifi.HardwareAddr
 
 	solicitations := conn.Solicitations()
+
+	// A nil channel blocks forever in the select below, which is exactly
+	// what a caller passing no Updater wants.
+	var updateCh <-chan Config
+	if updates != nil {
+		updateCh = updates.ch
+	}
 
 	next := time.Now() // send the first RA immediately
 	sent := 0
@@ -127,6 +185,20 @@ func Serve(ctx context.Context, ifaceName string, cfg Config) error {
 			lastSent = time.Now()
 			sent++
 			next = lastSent.Add(nextUnsolicitedInterval(sent))
+
+		case newCfg := <-updateCh:
+			timer.Stop()
+			if newCfg == cfg {
+				continue // nothing LAN clients would see differently
+			}
+			cfg = newCfg
+			// Announce the change instead of sitting on it for up to
+			// MaxRtrAdvInterval, but never breach §6.2.4's floor on
+			// consecutive multicast RAs.
+			next = time.Now()
+			if earliest := lastSent.Add(minDelayBetweenRAs); earliest.After(next) {
+				next = earliest
+			}
 
 		case _, ok := <-solicitations:
 			timer.Stop()

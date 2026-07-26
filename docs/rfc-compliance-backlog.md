@@ -4,38 +4,31 @@ minuteman works as a DS-Lite B4 (verified end-to-end against the netns rig — s
 `test/netns/README.md`), but measured strictly against the base RFC 7084 (IPv6 CE Router Requirements)
 and RFC 6333, these gaps remain. Ordered by real-world impact, highest first. Last checked against the
 codebase 2026-07-26. (RFC 7084's own updates — RFC 9096 renumbering reaction and RFC 9818 LAN-side
-prefix delegation — are not targeted; see the RFC 9096 item in §4 and `docs/supported-rfcs.md`.)
+prefix delegation — are not targeted; see the RFC 9096 item in §3 and `docs/supported-rfcs.md`.)
 
 Softwire fragmentation (RFC 6333 §5.3) is now addressed on both halves: reassembly by the
 `internal/slowpath` companion `ip6tnl` (kernel reassembles before decapsulation), fragmentation by the
 in-XDP outer-IPv6 fragmenter (`encap_fragment_outer` + the `internal/fragpath` companion veth pairs) —
-see the resolved §2 below for the residual fallback cases that still take the old inner-IPv4 path.
+see the resolved §1 below for the residual fallback cases that still take the old inner-IPv4 path.
 Tunnel-originated ICMPv4 (decap-side Time Exceeded plus the RFC 6333 §5.7 well-known B4 address) is also
 resolved and no longer tracked here, as is the DHCPv6-PD client-chosen-timer gap (a T1/T2 of 0 is now
 resolved through `pkg/prefixdelegation`'s `effectiveTimers` per RFC 9915 §14.2, and an IA_PD with
-T1 > T2 > 0 is discarded per §21.21 — exercised end-to-end by the rig's `MM_PD_ZERO_TIMERS=1` mode).
+T1 > T2 > 0 is discarded per §21.21 — exercised end-to-end by the rig's `MM_PD_ZERO_TIMERS=1` mode), and
+so is the RA-worker restart that misapplied RFC 4861 §6.2.5: `pkg/routeradvert.Serve` now takes config
+changes in place through a `routeradvert.Updater` (a size-1 latest-wins `Config` channel, applied
+promptly but no sooner than §6.2.4's MIN_DELAY_BETWEEN_RAS after the previous RA), and both
+`internal/lanprefix.RAManager.Sync` and `internal/wanextend`'s `raManager.sync` push updates instead of
+cancel-and-restart — so a DHCPv6-PD Renew no longer emits the §6.2.5 RouterLifetime=0 (and RDNSS
+Lifetime=0) shutdown RA that withdrew every LAN client's default route and DNS server once per T1
+interval. Cancellation still emits it, for actual shutdowns. Verified in the rig's
+`MM_PD_ZERO_TIMERS=1` mode by capturing the LAN's RAs (`tcpdump` in `mm-host`) across a real renewal:
+the renewal drew one immediate RA carrying the refreshed prefix lifetimes with RouterLifetime still
+1800s, and the only RouterLifetime=0 in the whole capture was the one minuteman sent on shutdown. What
+this does *not* do is deprecate a superseded prefix when a renewal actually changes it (advertising the
+old one with PreferredLifetime=0) — that's the RFC 9096 item in §3, and the restart it replaced didn't
+do it either.
 
-## 1. Every Renew restarts the LAN RA workers through their shutdown path — RFC 4861 §6.2.5 misapplied
-
-`internal/lanprefix.RAManager.Sync` deliberately restarts every RA worker on every lease change (to
-pick up refreshed lifetimes — its comment claims restarting has no churn equivalent to `Reconcile`'s),
-but "restart" is cancel-then-start, and `pkg/routeradvert.Serve`'s cancellation path sends the RFC
-4861 §6.2.5 graceful-shutdown RA: RouterLifetime=0, and (since RDNSS lifetime is tied to
-RouterLifetime in `buildRA`) RDNSS Lifetime=0 with it. So on every T1 Renew, every LAN client is told
-"this router is going away and stop using its DNS server", then re-told everything a moment later by
-the new worker's immediate first RA. The final RA is exactly the churn the comment says doesn't exist.
-
-**Effect:** periodic (every T1 interval) transient default-route withdrawal plus RDNSS invalidation on
-all LAN clients — a brief routing/resolver flap per renewal, worse on hosts that honour RDNSS
-lifetimes promptly. `internal/wanextend`'s raManager has the same shutdown-RA-on-restart shape but
-only restarts on an actual WAN prefix change, where deprecating the old state is at least arguably
-right.
-
-**Fix direction:** let `routeradvert.Serve` take lifetime/config updates in place (channel or atomic
-pointer consulted per send) so a Renew never restarts the worker; or plumb a "restarting, not shutting
-down" signal that suppresses the final RA.
-
-## 2. ~~Softwire fragmentation is inner-IPv4, not RFC-canonical outer-IPv6~~ — RESOLVED (in-XDP outer-IPv6 fragmentation); residual fallback cases remain
+## 1. ~~Softwire fragmentation is inner-IPv4, not RFC-canonical outer-IPv6~~ — RESOLVED (in-XDP outer-IPv6 fragmentation); residual fallback cases remain
 
 RFC 6333 §5.3 (with the original "The inner IPv4 packet MUST NOT be fragmented; fragmentation MUST happen
 after encapsulation", and errata 5847 pointing at RFC 2473 §7.2(b), ignoring the DF bit) requires the B4 to
@@ -67,19 +60,19 @@ XDP-attached LAN veth caps the pair's MTU so a client can't emit a >1500 inner p
 packet then takes the ip6tnl fallback (`EncapFragSlow` advances, `EncapFragXDP` does not) and draws an
 ICMPv4 Fragmentation-Needed (PMTUD) rather than blackholing.
 
-## 3. Tunnel ICMPv6 relay — RFC 2473 §8
+## 2. Tunnel ICMPv6 relay — RFC 2473 §8
 
 No reactive translation exists of an ICMPv6 error about the softwire packet itself (e.g. a Packet Too Big
 or Time Exceeded from an intermediate IPv6 router on the B4↔AFTR path) into an ICMPv4 error toward the
 original IPv4 sender. The encap path's own proactive `bpf_check_mtu`-based PtB only covers the
 locally-known egress MTU, not a smaller MTU somewhere further along the IPv6 path.
 
-## 4. Minor / acceptable for a home CPE
+## 3. Minor / acceptable for a home CPE
 
 - During an AFTR graceful migration's drain window the softwire slow-path companion ip6tnl is repointed at
   the *new* AFTR at cutover. A *draining* flow's XDP-fragmented packets are unaffected (the in-XDP
   fragmenter reads the same per-packet next-hop slot as normal encap, so its fragments follow flow
-  affinity), but the rare packet that falls to the ip6tnl *fallback* (see §2's residual) during a drain is
+  affinity), but the rare packet that falls to the ip6tnl *fallback* (see §1's residual) during a drain is
   encapsulated toward the new AFTR and dropped until the flow finishes — the fast path's dual-AFTR decap is
   unaffected.
 

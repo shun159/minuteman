@@ -27,8 +27,20 @@ const (
 // raWorker tracks one running routeradvert.Serve goroutine for a single LAN
 // interface, mirroring internal/lanprefix's own raWorker/RAManager shape.
 type raWorker struct {
-	cancel context.CancelFunc
-	done   chan struct{}
+	cancel  context.CancelFunc
+	done    chan struct{}
+	updates *routeradvert.Updater
+}
+
+// alive reports whether the worker's goroutine is still running -- see
+// internal/lanprefix's identically-shaped raWorker.alive.
+func (w *raWorker) alive() bool {
+	select {
+	case <-w.done:
+		return false
+	default:
+		return true
+	}
 }
 
 // raManager drives one routeradvert.Serve goroutine per LAN interface,
@@ -48,15 +60,49 @@ func newRAManager(rdnssByIface map[string]netip.Addr) *raManager {
 	return &raManager{workers: make(map[string]*raWorker), rdnssByIface: rdnssByIface}
 }
 
-// sync restarts every lanIfaces worker to advertise prefix, tracking each
-// on wg. Always restarts, matching internal/lanprefix.RAManager.Sync's own
-// "restarting is cheap" reasoning -- callers only invoke this from
-// WatchChanges' onChange (or once, from Serve's initial known prefix), so
-// there's no risk of restarting on an unchanged value in practice.
+// sync makes prefix the one every lanIfaces worker advertises, starting a
+// worker (tracked on wg) for an interface that has none yet and updating
+// the running one in place otherwise -- the same reasoning as
+// internal/lanprefix.RAManager.Sync: cancelling a worker is
+// routeradvert.Serve's shutdown path, which announces RouterLifetime=0 (RFC
+// 4861 §6.2.5) before exiting, so restarting on a WAN prefix change would
+// withdraw the default route and the RDNSS server from every LAN client for
+// as long as the replacement takes to announce itself.
+//
+// That final RA never deprecated the *old* prefix anyway -- it carries a
+// Prefix Information Option for the outgoing prefix with its lifetimes
+// intact -- so nothing about renumbering is lost by not restarting. LAN
+// clients keep their old SLAAC address until its own advertised valid
+// lifetime runs out either way; advertising the superseded prefix with
+// PreferredLifetime=0 to deprecate it promptly is RFC 9096 territory, an
+// open item in docs/rfc-compliance-backlog.md.
+//
+// A worker that exited on its own (Serve returned an error) is replaced by
+// a fresh one.
 func (m *raManager) sync(ctx context.Context, prefix netip.Prefix, lanIfaces []string, wg *sync.WaitGroup) {
 	for _, iface := range lanIfaces {
-		m.stop(iface)
-		m.start(ctx, iface, prefix, wg)
+		cfg := m.config(iface, prefix)
+		if w, ok := m.workers[iface]; ok {
+			if w.alive() {
+				w.updates.Set(cfg)
+				continue
+			}
+			m.stop(iface) // dead: release its context, then replace it
+		}
+		m.start(ctx, iface, cfg, wg)
+	}
+}
+
+// config builds the Router Advertisement configuration for one LAN
+// interface: the shared WAN prefix with On-Link cleared (see the package
+// doc) and this interface's RDNSS address, if any.
+func (m *raManager) config(iface string, prefix netip.Prefix) routeradvert.Config {
+	return routeradvert.Config{
+		Prefix:            prefix,
+		OnLink:            false,
+		ValidLifetime:     validLifetime,
+		PreferredLifetime: preferredLifetime,
+		RDNSSAddr:         m.rdnssByIface[iface],
 	}
 }
 
@@ -72,23 +118,17 @@ func (m *raManager) stop(iface string) {
 	delete(m.workers, iface)
 }
 
-func (m *raManager) start(ctx context.Context, iface string, prefix netip.Prefix, wg *sync.WaitGroup) {
+func (m *raManager) start(ctx context.Context, iface string, cfg routeradvert.Config, wg *sync.WaitGroup) {
 	workerCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
-	m.workers[iface] = &raWorker{cancel: cancel, done: done}
+	updates := routeradvert.NewUpdater()
+	m.workers[iface] = &raWorker{cancel: cancel, done: done, updates: updates}
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer close(done)
-		err := routeradvert.Serve(workerCtx, iface, routeradvert.Config{
-			Prefix:            prefix,
-			OnLink:            false,
-			ValidLifetime:     validLifetime,
-			PreferredLifetime: preferredLifetime,
-			RDNSSAddr:         m.rdnssByIface[iface],
-		})
-		if err != nil {
+		if err := routeradvert.Serve(workerCtx, iface, cfg, updates); err != nil {
 			log.Printf("wanextend: RA serving on %s ended unexpectedly: %v", iface, err)
 		}
 	}()

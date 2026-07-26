@@ -542,7 +542,7 @@ if [[ $softwire_frag_enabled -eq 1 && $started_minuteman -eq 1 ]]; then
     check "the off-LAN decapped packet was dropped in XDP (datapath DecapMartian +$((martian - martian0)))" \
         test "$martian" -gt "$martian0"
 
-    # --- Encap fallback (backlog §4 residual): a packet the in-XDP fragmenter
+    # --- Encap fallback (backlog §1 residual): a packet the in-XDP fragmenter
     # can't take must fall to the kernel ip6tnl (EncapFragSlow) -- and crucially
     # a *DF* one must still draw an ICMPv4 Fragmentation-Needed (PMTUD) rather
     # than silently blackhole. That's the specific regression risk this PR
