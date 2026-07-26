@@ -14,6 +14,10 @@ import (
 // gets an answer, falling back to a fresh Acquire if Rebind doesn't either
 // (RFC 3315 §18.1.3/§18.1.4). lease is mutated in place as it's renewed.
 //
+// The T1/T2 driving that ladder are the lease's effective ones, never the
+// server's literal 0 (see effectiveTimers), so a server that delegates the
+// renewal timing to its client doesn't turn this loop into a renew storm.
+//
 // onLeaseChange is called every time the lease actually changes -- a
 // successful Renew/Rebind, or a fresh Acquire -- but not for the lease
 // passed in; callers are expected to have already applied that one
@@ -104,13 +108,7 @@ func leaseFromReply(serverID dhcpv6.DUID, reply *dhcpv6.Message) (*Lease, error)
 	if serverID == nil {
 		serverID = replyServerID
 	}
-	return &Lease{
-		ServerID:   serverID,
-		Prefixes:   granted.Prefixes,
-		T1:         granted.T1,
-		T2:         granted.T2,
-		AcquiredAt: time.Now(),
-	}, nil
+	return newLease(serverID, granted), nil
 }
 
 // releaseLease sends a best-effort Release for lease (RFC 3315 §18.1.6): a

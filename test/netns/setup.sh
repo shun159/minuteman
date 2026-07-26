@@ -47,6 +47,12 @@
 # pairs naturally with MM_DHCPV4=1 so mm-host holds both a DHCPv4 and a SLAAC
 # address at once.
 #
+# MM_PD_ZERO_TIMERS ("0"/unset (default) or "1", dhcpv6-pd mode only) makes Kea
+# delegate the prefix with T1 = T2 = 0 -- the RFC 9915 §21.21 way of leaving the
+# renewal timing to the requesting router -- on shortened lifetimes, so
+# smoketest.sh can watch minuteman derive its own T1 (§14.2) and renew exactly
+# once on it instead of storming the server. Changes no minuteman flag.
+#
 # MM_SOFTWIRE_FRAG ("0"/unset (default) or "1") makes smoketest.sh exercise the
 # softwire fragmentation slow path (RFC 6333 §5.3) in both directions -- an
 # oversized non-DF ping the encap must hand to the kernel to fragment, and a
@@ -128,6 +134,20 @@ case "$SOFTWIRE_FRAG" in
     exit 1
     ;;
 esac
+
+PD_ZERO_TIMERS="${MM_PD_ZERO_TIMERS:-0}"
+case "$PD_ZERO_TIMERS" in
+0 | 1) ;;
+*)
+    echo "error: MM_PD_ZERO_TIMERS must be '0' or '1' (got '$PD_ZERO_TIMERS')" >&2
+    exit 1
+    ;;
+esac
+if [[ "$PD_ZERO_TIMERS" == 1 && "$WAN_MODEL" != dhcpv6-pd ]]; then
+    echo "error: MM_PD_ZERO_TIMERS=1 needs MM_WAN_MODEL=dhcpv6-pd (got '$WAN_MODEL'):" >&2
+    echo "  it changes the T1/T2 Kea sends in the delegation, and ndproxy mode has none." >&2
+    exit 1
+fi
 
 # veth TX checksum/GSO/TSO/SG offloads leave TCP segments with an unfinalized
 # (CHECKSUM_PARTIAL) checksum, on the assumption that a real NIC (or the
@@ -336,6 +356,23 @@ if [[ "$WAN_MODEL" == dhcpv6-pd ]]; then
         ]"
 fi
 kea_subnet6+=" }"
+# Renewal timing Kea hands the requesting router. Normally the rig's own
+# fixed T1/T2 (RFC 9915 §21.21's 0.5 x / 0.8 x of the preferred lifetime,
+# spelled out rather than left to Kea's calculate-tee-times); under
+# MM_PD_ZERO_TIMERS, no timers at all plus calculate-tee-times disabled,
+# which is how Kea is asked to send T1 = T2 = 0 -- the "renewal timing is
+# the client's to choose" case of §14.2 that minuteman's effectiveTimers
+# handles. The shortened lifetimes that go with it (see common.sh) put the
+# derived T1 at 65s, inside a smoketest run.
+kea_timers="\"renew-timer\": 1800,
+    \"rebind-timer\": 2880,
+    \"preferred-lifetime\": 3600,
+    \"valid-lifetime\": 7200,"
+if [[ "$PD_ZERO_TIMERS" == 1 ]]; then
+    kea_timers="\"calculate-tee-times\": false,
+    \"preferred-lifetime\": $PD_ZERO_PREFERRED_LIFETIME,
+    \"valid-lifetime\": $PD_ZERO_VALID_LIFETIME,"
+fi
 cat >"$KEA_CONF" <<EOF
 {
   "Dhcp6": {
@@ -346,10 +383,7 @@ cat >"$KEA_CONF" <<EOF
       "type": "memfile",
       "persist": false
     },
-    "renew-timer": 1800,
-    "rebind-timer": 2880,
-    "preferred-lifetime": 3600,
-    "valid-lifetime": 7200,
+    $kea_timers
     "option-data": [
       $kea_option_data
     ],
@@ -415,6 +449,7 @@ echo "$DHCPV4" >"$DHCPV4_ENABLED_FILE"
 echo "$DUALSTACK" >"$DUALSTACK_ENABLED_FILE"
 echo "$DYNAMIC_B4" >"$DYNAMIC_B4_FILE"
 echo "$SOFTWIRE_FRAG" >"$SOFTWIRE_FRAG_ENABLED_FILE"
+echo "$PD_ZERO_TIMERS" >"$PD_ZERO_TIMERS_FILE"
 
 echo "== mm-cpe: B4 element (minuteman runs here) =="
 # ip_forward/net.ipv6.conf.all.forwarding=1 (required for bpf_fib_lookup() in

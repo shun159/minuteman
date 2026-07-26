@@ -205,6 +205,21 @@ DYNAMIC_B4_FILE="$RUNDIR/dynamic-b4"
 # Off by default (MM_SOFTWIRE_FRAG unset or "0").
 SOFTWIRE_FRAG_ENABLED_FILE="$RUNDIR/softwire-frag-enabled"
 
+# Whether Kea delegates the prefix with T1 = T2 = 0 -- an eighth independent
+# toggle, meaningful only in the dhcpv6-pd WAN model. Sending 0 is how a
+# delegating router leaves the renewal timing to the requesting router (RFC
+# 9915 §21.21), which §14.2 then requires to pick its own times without
+# transmitting immediately; minuteman derives them from the shortest
+# preferred lifetime (pkg/prefixdelegation's effectiveTimers). Kea is asked
+# for this by disabling calculate-tee-times and omitting renew-timer/
+# rebind-timer entirely, and the lifetimes below (rather than the standard
+# 3600/7200) shrink the derived T1 to 0.5 x 130s = 65s, so one real renewal
+# lands inside a smoketest run instead of half an hour later. Off by default
+# (MM_PD_ZERO_TIMERS unset or "0").
+PD_ZERO_TIMERS_FILE="$RUNDIR/pd-zero-timers"
+PD_ZERO_PREFERRED_LIFETIME=130
+PD_ZERO_VALID_LIFETIME=260
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MINUTEMAN_BIN="$REPO_ROOT/bin/minuteman"
 

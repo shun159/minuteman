@@ -106,7 +106,7 @@ fallback stays untouched), and (c) hand-crafts a fragmented softwire packet towa
 B4 with `send-softwire-fragments.py` (a real Linux AFTR never emits outer-IPv6 fragments, so it can't be
 driven from the rig's own traffic) so the decap must `XDP_PASS` it for kernel reassembly — asserting the
 inner echo reaches the LAN client and reappears in `DecapReasmPass`. It then also (d) exercises the encap
-*fallback* the fast path can't take (backlog §3's residual note): it temporarily shrinks the WAN link's MTU
+*fallback* the fast path can't take (backlog §2's residual note): it temporarily shrinks the WAN link's MTU
 below the fragment size `frag_unit` was computed from at startup, so an oversized *DF* ping falls to the
 kernel `ip6tnl` instead of the in-XDP fragmenter, and asserts `EncapFragSlow` advances, `EncapFragXDP` does
 *not*, and — the specific regression risk from this PR routing DF packets to the fallback — the client
@@ -115,6 +115,21 @@ restores the MTU. (The over-`MaxInnerLen` inner-size trigger isn't reachable fro
 XDP-attached LAN veth caps the pair's MTU, so a client can't emit a >1500 inner packet in the first place —
 which is also why that residual is genuinely unreachable on a standard 1500 deployment.) Composes with the
 other toggles.
+
+A ninth independent toggle, `MM_PD_ZERO_TIMERS` (`0` default or `1`, `dhcpv6-pd` mode only — `setup.sh`
+rejects the `ndproxy` combination, which has no delegation to time), makes Kea delegate with `T1 = T2 = 0`:
+the RFC 9915 §21.21 way for a delegating router to leave the renewal timing to the requesting router, which
+§14.2 then requires to choose its own times without transmitting immediately. Kea is asked for it by
+disabling `calculate-tee-times` and omitting `renew-timer`/`rebind-timer`, and the prefix's lifetimes drop
+to 130s/260s (from 3600/7200) so the T1 minuteman derives — 0.5 × the shortest preferred lifetime, §21.21's
+own recommended ratio — is 65s and a real renewal lands inside one smoketest run. It changes no minuteman
+flag. `smoketest.sh` asserts the derived timers in the lease log line (`renew in 1m5s, rebind in 1m44s`),
+then, as its very last check so everything else overlaps the wait, waits the T1 out and asserts minuteman
+renewed on it: at least one renewal happened, Kea's own log recorded receiving the Renew, the delegated
+prefix and its carved LAN address are unchanged across it, and — the actual regression this guards — the
+number of lease applications stays within what the client's own timers permit (taking `T1 = 0` literally
+renewed on every exchange RTT, hundreds of times over the same window). Adds ~90s to the run, in this mode
+only.
 
 Independently of `MM_SOFTWIRE_FRAG`, `smoketest.sh` also hand-crafts a whole softwire packet whose inner
 IPv4 TTL is 1, and asserts that the B4 returns a softwire-encapsulated ICMPv4 Time Exceeded toward the
@@ -182,8 +197,12 @@ verified passing from a fresh setup for:
   softwire packet reassembled and delivered to the LAN client (with `DecapReasmPass` advancing), and the
   encap ip6tnl *fallback* forced by a runtime WAN-MTU shrink: a DF oversized packet takes the fallback
   (`EncapFragSlow` advancing, `EncapFragXDP` untouched) and draws an ICMPv4 Fragmentation-Needed on the LAN
+- `MM_PD_ZERO_TIMERS=1` (against `dhcpv6` AFTR discovery + `dhcpv6-pd`): Kea delegating with `T1 = T2 = 0`,
+  minuteman deriving 65s/104s from the 130s preferred lifetime and renewing exactly once on that timer
+  within an 85s window (Kea logging the single `RENEW`, the prefix unchanged across it)
 - the default (all toggles off), re-run after the `xdp_dslite_encap` non-unicast-bypass change to confirm
-  no regression
+  no regression, and again after the DHCPv6-PD client-chosen-timer change (server-set `T1`/`T2` still used
+  verbatim: `renew in 30m0s, rebind in 48m0s` from Kea's 1800/2880)
 
 The uncrossed corners of these independent axes haven't each been re-run, but they are independent code
 paths (AFTR discovery, LAN IPv6 provisioning, DNS forwarding, LAN IPv4 provisioning, native-IPv6
