@@ -2,3 +2,4 @@ bpf/vmlinux.h
 *.o
 bpf_x86_*.go
 bin/
+.claude/**
