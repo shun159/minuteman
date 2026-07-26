@@ -54,7 +54,7 @@ further down — this is just the index of what exists and which flag turns it o
   reassembles before the ip6tnl decapsulates (§5.3's "reassembly MUST happen before decapsulation"). The
   ip6tnl also remains the *fallback* for what the XDP fragmenter can't take (`STAT_ENCAP_FRAG_SLOW`: >4
   fragments, inner beyond `fragpath.MaxInnerLen`, degenerate MTU — there the kernel fragments the inner
-  IPv4, a reachability fallback, not §5.3 conformance; backlog §2's residual note) and for a decapped
+  IPv4, a reachability fallback, not §5.3 conformance; backlog §1's residual note) and for a decapped
   inner too big for a non-DF LAN egress. Created at startup and repointed on an AFTR migration /
   B4 switch. A side benefit is that the IPv4 default route lets the kernel answer ICMPv4 Time Exceeded for
   an expiring inner TTL outbound. To keep that default route from turning the decap
@@ -84,7 +84,7 @@ Not yet implemented:
   `cmd/minuteman`'s policy beyond the current dslite-only capability request.
 - A handful of RFC 7084/6333 compliance gaps. Softwire fragmentation (RFC 6333 §5.3) is now addressed on
   both halves (in-XDP outer-IPv6 fragmentation + kernel-ip6tnl reassembly — see the **Softwire
-  fragmentation** feature above); only its fallback cases (backlog §2's residual note) still fragment the
+  fragmentation** feature above); only its fallback cases (backlog §1's residual note) still fragment the
   inner IPv4. The remaining gaps are in `docs/rfc-compliance-backlog.md`, priority-ordered with the
   specific code each points at. Non-protocol operability/test-ergonomics improvements are tracked
   separately in `docs/operability-backlog.md` — its #1 (out-of-band stats via a bpffs-pinned map + the
@@ -440,11 +440,20 @@ orphaned the running kernel's module directory — reboot to fix that).
   actually receives Router Solicitations, setting both hop limits to 255 (RFC 4861 §6.1.2's anti-spoofing
   requirement), and installing an `ICMP6_FILTER` so its read loop only wakes for Router Solicitation
   traffic (`ICMP6_FILTER`'s sockopt-name constant isn't exported by `x/sys/unix` on Linux, so it's vendored
-  locally, the same rationale as `bpf/uapi/linux/*.h`). `advertise.go`'s `Serve(ctx, iface, cfg)` is the
+  locally, the same rationale as `bpf/uapi/linux/*.h`). `advertise.go`'s `Serve(ctx, iface, cfg, updates)`
+  is the
   actual RFC 4861 §6.2/§10 timing — a fast initial burst of RAs, settling into a jittered periodic
   cadence, plus rate-limited replies to inbound Router Solicitations — ending with a best-effort final
   `RouterLifetime=0` RA when `ctx` is cancelled (§6.2.5's graceful-shutdown signal), mirroring
-  `prefixdelegation.Maintain`'s blocks-until-cancelled shape. A send failing with `EADDRNOTAVAIL` is
+  `prefixdelegation.Maintain`'s blocks-until-cancelled shape. `updates` (an `*Updater`, nil for a
+  never-changing config) is how a caller replaces `cfg` *without* restarting the goroutine: a size-1
+  latest-wins channel of `Config`s, each applied in place and — if it differs from the current one —
+  advertised promptly rather than at the next scheduled RA, subject to §6.2.4's `MIN_DELAY_BETWEEN_RAS`
+  floor. It exists because cancel-then-restart is not a neutral way to change what's advertised:
+  cancellation is the *shutdown* path above, so a restart tells every LAN client the router (and, since
+  the RDNSS option's lifetime tracks `RouterLifetime`, its DNS server) is going away moments before the
+  replacement worker re-announces both — a flap `internal/lanprefix` used to inflict on every DHCPv6-PD
+  Renew. A send failing with `EADDRNOTAVAIL` is
   retried on DAD's ~1s timescale (`tentativeRetryInterval`) rather than treated as fatal: it means the
   interface's link-local source is still tentative, which genuinely happens in minuteman's startup
   sequence (XDP attach can bounce the link, and the LAN address assignment lands immediately before
@@ -655,11 +664,13 @@ orphaned the running kernel's module directory — reboot to fix that).
   each interface's `ValidLifetime`/`PreferredLifetime` (taken from the delegated prefix, not derived) on the
   resulting `Assignment` for `ra.go` to consume. `ra.go`'s `RAManager` drives one `pkg/routeradvert.Serve`
   goroutine per LAN interface from those `Assignment`s (`OnLink: true`, since a PD delegation really is
-  distinct per LAN interface): `Sync()` always restarts a LAN interface's worker on every call (not just
-  when its `Subnet` changes), since a Renew resets the lifetimes even when the subnet itself doesn't change
-  and a long-running `Serve` goroutine has no other way to pick that up — restarting is cheap, unlike
-  `Reconcile`'s netlink unchanged-skip optimization above, which exists to avoid churn restarting an RA
-  sender doesn't have an equivalent of.
+  distinct per LAN interface): `Sync()` pushes each interface's new `Config` into its already-running
+  worker via `routeradvert.Updater` (starting one only where none runs yet, or where a previous one died
+  of a socket error), since a Renew resets the lifetimes even when the subnet itself doesn't change and a
+  long-running `Serve` goroutine has no other way to pick that up. It used to cancel-and-restart the
+  worker for that, which is *not* the cheap operation the old comment here claimed: cancellation is
+  `Serve`'s shutdown path, so every Renew flapped each LAN client's default route and RDNSS server via a
+  `RouterLifetime=0` RA (the resolved §1 of `docs/rfc-compliance-backlog.md`).
 - **`internal/wanextend`** — the NDProxy *policy* layer, mirroring `internal/lanprefix`'s split from its
   protocol client (`pkg/ndproxy`) but for the single-shared-WAN-`/64` model instead of a distinct PD
   delegation. `discover.go`'s `DiscoverPrefix(ctx, wanIfindex)` blocks, polling `pkg/netlink.Socket.Addrs`
@@ -681,8 +692,11 @@ orphaned the running kernel's module directory — reboot to fix that).
   `pkg/routeradvert.Serve` goroutine per LAN interface, all broadcasting the same prefix (`OnLink: false`)
   — unlike `internal/lanprefix.RAManager`, which advertises a distinct subnet per interface from an
   `Assignment` list, NDProxy extends one shared prefix onto every LAN interface uniformly, so `sync()` takes
-  a single `netip.Prefix` rather than a per-interface list; it always restarts every worker on each call,
-  the same "restarting is cheap" reasoning `internal/lanprefix.RAManager.Sync` uses. `hostroutes.go`'s
+  a single `netip.Prefix` rather than a per-interface list; like `RAManager.Sync` it updates each running
+  worker in place through a `routeradvert.Updater` rather than restarting it — the final
+  `RouterLifetime=0` RA a restart emits never deprecated the outgoing prefix anyway (that PIO still
+  carries its lifetimes intact), so restarting only cost LAN clients their default route and RDNSS server
+  for the length of the changeover. `hostroutes.go`'s
   `HostRoutes` wraps a `pkg/netlink.Socket` for the lifetime of one `pkg/ndproxy.Serve` run, matching its
   `Config.OnActive`/`OnInactive` callback shapes: `Install` adds a `/128` route to a confirmed-active target
   out its LAN interface (`AddRoute`, so the kernel's own forwarding decision picks the right `-lan`

@@ -106,7 +106,7 @@ fallback stays untouched), and (c) hand-crafts a fragmented softwire packet towa
 B4 with `send-softwire-fragments.py` (a real Linux AFTR never emits outer-IPv6 fragments, so it can't be
 driven from the rig's own traffic) so the decap must `XDP_PASS` it for kernel reassembly — asserting the
 inner echo reaches the LAN client and reappears in `DecapReasmPass`. It then also (d) exercises the encap
-*fallback* the fast path can't take (backlog §2's residual note): it temporarily shrinks the WAN link's MTU
+*fallback* the fast path can't take (backlog §1's residual note): it temporarily shrinks the WAN link's MTU
 below the fragment size `frag_unit` was computed from at startup, so an oversized *DF* ping falls to the
 kernel `ip6tnl` instead of the in-XDP fragmenter, and asserts `EncapFragSlow` advances, `EncapFragXDP` does
 *not*, and — the specific regression risk from this PR routing DF packets to the fallback — the client
@@ -199,7 +199,14 @@ verified passing from a fresh setup for:
   (`EncapFragSlow` advancing, `EncapFragXDP` untouched) and draws an ICMPv4 Fragmentation-Needed on the LAN
 - `MM_PD_ZERO_TIMERS=1` (against `dhcpv6` AFTR discovery + `dhcpv6-pd`): Kea delegating with `T1 = T2 = 0`,
   minuteman deriving 65s/104s from the 130s preferred lifetime and renewing exactly once on that timer
-  within an 85s window (Kea logging the single `RENEW`, the prefix unchanged across it)
+  within an 85s window (Kea logging the single `RENEW`, the prefix unchanged across it). Re-run after the
+  RA in-place-update change (`routeradvert.Updater`) with a `tcpdump` on `mm-host`'s LAN link alongside
+  it, since this is the mode where a renewal actually lands inside one run: the renewal drew a single
+  immediate RA carrying the refreshed prefix lifetimes at `router lifetime 1800s`, and the only
+  `router lifetime 0s` RA in the capture was minuteman's own shutdown one. The smoketest itself doesn't
+  assert this (it never inspects RAs beyond the client's SLAAC result), so verifying it again means
+  capturing again:
+  `sudo ip netns exec mm-host tcpdump -i v-host-cpe -v "icmp6 and ip6[40] == 134"`
 - the default (all toggles off), re-run after the `xdp_dslite_encap` non-unicast-bypass change to confirm
   no regression, and again after the DHCPv6-PD client-chosen-timer change (server-set `T1`/`T2` still used
   verbatim: `renew in 30m0s, rebind in 48m0s` from Kea's 1800/2880)
