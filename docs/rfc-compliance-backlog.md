@@ -69,12 +69,48 @@ XDP-attached LAN veth caps the pair's MTU so a client can't emit a >1500 inner p
 packet then takes the ip6tnl fallback (`EncapFragSlow` advances, `EncapFragXDP` does not) and draws an
 ICMPv4 Fragmentation-Needed (PMTUD) rather than blackholing.
 
-## 2. Tunnel ICMPv6 relay — RFC 2473 §8
+## 2. ~~Tunnel ICMPv6 relay~~ — RESOLVED (in-XDP relay + learned softwire path MTU), RFC 2473 §8
 
-No reactive translation exists of an ICMPv6 error about the softwire packet itself (e.g. a Packet Too Big
-or Time Exceeded from an intermediate IPv6 router on the B4↔AFTR path) into an ICMPv4 error toward the
-original IPv4 sender. The encap path's own proactive `bpf_check_mtu`-based PtB only covers the
-locally-known egress MTU, not a smaller MTU somewhere further along the IPv6 path.
+An ICMPv6 error about the softwire packet itself — a Packet Too Big or Time Exceeded from an intermediate
+IPv6 router on the B4↔AFTR path — is now translated in the datapath into an ICMPv4 error toward the
+original IPv4 sender (`handle_tunnel_icmpv6` in `bpf/datapath.bpf.c`), and a Packet Too Big additionally
+teaches the encap side a path MTU its own `bpf_check_mtu` can never see (that only covers the local WAN
+device). Type mapping follows RFC 7915 §5.3; the reply is sourced from the well-known B4 address
+`192.0.0.2` (RFC 6333 §5.7) like every other ICMPv4 error this datapath originates, and goes through the
+same RFC 1812 §4.3.2.7 eligibility gate and per-CPU rate limiter.
+
+Two details worth keeping in mind:
+
+- **Packet Too Big is relayed only for a DF quote.** Without DF the sender can't act on a next-hop MTU,
+  and this B4's answer is instead to fragment the outer IPv6 at the learned MTU (RFC 6333 §5.3 /
+  errata 5847 → RFC 2473 §7.2(b), the same DF-ignoring stance §1 above settled on). That error is
+  *consumed* rather than passed up, since the kernel would otherwise relay the very signal minuteman
+  deliberately isn't sending.
+- **The learned MTU is acted on in two places with two different owners.** Encap clamps its effective MTU
+  against it per packet (`tunnel_pmtu_for`), immediately. The fragment size (`b4_config.frag_unit`) and
+  the companion ip6tnl's device MTU are recomputed by userspace instead (`cmd/minuteman`'s
+  `watchTunnelPMTU`, a 2s tick), because `encap_fragment_outer` and the `xdp_softwire_frag<i>` programs
+  read `frag_unit` at different moments for the same packet — a value that changed in between would
+  produce a fragment set that can never reassemble. In the seconds between the two, an oversized packet
+  takes the ip6tnl fallback (`EncapFragSlow`) rather than being fragmented too big. Readings age out after
+  10 minutes on both sides, so a path that widens again needs no announcement.
+
+**What this replaced.** Measured against the netns rig on kernel 7.0.11 before the change: an ICMPv6
+Packet Too Big about a softwire packet *was* already reaching the LAN client as an ICMPv4 Fragmentation
+Needed — not from the datapath, but from the kernel, via the `internal/slowpath` companion ip6tnl's own
+error handling. So the softwire was not opaque to PMTUD in practice. What the kernel path did *not* do,
+and this does: it sourced the error from a LAN gateway address rather than `192.0.0.2`; it translated
+ICMPv6 Time Exceeded into ICMPv4 **Host Unreachable** rather than Time Exceeded; it relayed nothing at all
+when the quote was small (a synthetic 60-byte quote drew no relay, a real router's ~1232-byte one did);
+and, most consequentially, none of it reached the XDP fragmenter, which kept slicing to the WAN device's
+MTU and so kept handing the narrow path fragments it could only drop — every oversized packet costing a
+round of Packet Too Big plus client-side re-fragmentation, and non-DF traffic depending entirely on the
+client honouring a relayed ICMPv4 error to get through at all.
+
+Verified end-to-end in the netns rig (`MM_TUNNEL_ICMP=1`): each error type injected and relayed with the
+right ICMPv4 type and source, an error quoting someone else's softwire ignored, and — with the ISP↔AFTR
+core link narrowed to 1400 while the CPE's WAN stays at 1500 — the learned MTU applied to both the
+fragmenter and the companion ip6tnl, after which oversized DF *and* non-DF traffic crosses at 0% loss.
 
 ## 3. Minor / acceptable for a home CPE
 

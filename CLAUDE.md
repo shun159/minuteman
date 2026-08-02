@@ -60,6 +60,16 @@ further down — this is just the index of what exists and which flag turns it o
   an expiring inner TTL outbound. To keep that default route from turning the decap
   path into a reflector, a decapped inner IPv4 that the FIB resolves off-LAN (back toward the companion
   tunnel) is dropped in XDP (`STAT_DECAP_MARTIAN`) rather than passed to the kernel.
+- **Tunnel ICMPv6 relay + learned softwire path MTU** (always on; RFC 2473 §8/§6.7) — an ICMPv6 error an
+  intermediate router on the B4↔AFTR path sends *about a softwire packet* (Packet Too Big, Time Exceeded,
+  Destination Unreachable) is translated in XDP into an ICMPv4 error toward the LAN client whose packet it
+  quoted (`handle_tunnel_icmpv6`, RFC 7915 §5.3's type table, sourced from `192.0.0.2`), and a Packet Too
+  Big also records a softwire path MTU the encap side's own `bpf_check_mtu` can never see — it only knows
+  the local WAN device. Encap clamps against that reading per packet; the fragment size and the companion
+  ip6tnl's MTU are re-derived from it by userspace (`cmd/minuteman`'s `watchTunnelPMTU`), because the
+  fragmenter's two halves read `frag_unit` at different moments and a value that changed in between would
+  produce an unreassemblable fragment set. A Packet Too Big about a *non-DF* packet is consumed rather than
+  relayed: the answer there is to fragment at the learned MTU, not to push the problem back.
 - **Tunnel-originated ICMPv4** (always on; RFC 1812 §5.3.1 + §4.3.2.7, RFC 6333 §5.7 / RFC 7335) — the
   ICMPv4 errors the B4 itself originates back through the softwire (Fragmentation Needed on the decap
   path, and now Time Exceeded for an inner TTL that expires *inbound*, `STAT_ICMP_TIME_EXCEEDED`) are
@@ -130,14 +140,17 @@ sudo ./test/netns/smoketest.sh   # starts minuteman itself + pings/curls end-to-
 sudo ./test/netns/teardown.sh    # tears everything down (always safe to re-run)
 ```
 
-Nine independent env-var toggles select what `setup.sh` builds and what `smoketest.sh` asserts —
+Ten independent env-var toggles select what `setup.sh` builds and what `smoketest.sh` asserts —
 `MM_AFTR_DISCOVERY` (`dhcpv6`/`hb46pp`), `MM_WAN_MODEL` (`dhcpv6-pd`/`ndproxy`), `MM_DNS_PROXY`,
 `MM_DHCPV4`, `MM_DUALSTACK`, `MM_IPV6_SW_RSS`, `MM_DYNAMIC_B4` (omit `-b4` and drive a WAN-renumbering
 scenario), `MM_SOFTWIRE_FRAG` (exercise softwire fragmentation both ways — oversized non-DF *and* DF
 pings outbound, both expected to round-trip via the in-XDP outer-IPv6 fragmenter, and a hand-crafted
 fragmented softwire packet inbound via `send-softwire-fragments.py`), `MM_PD_ZERO_TIMERS` (have Kea
 delegate with T1=T2=0 on short lifetimes, so the client-derived renewal timer is asserted and a real
-renewal is waited out — adds ~90s) — plus the full list of
+renewal is waited out — adds ~90s), `MM_TUNNEL_ICMP` (inject each ICMPv6-error-about-a-softwire type and
+assert the relayed ICMPv4, then narrow the ISP↔AFTR core link so a *real* Packet Too Big is drawn and the
+learned path MTU is asserted to reach both the fragmenter and the companion ip6tnl; runs last, since a
+learned MTU lingers 10 minutes and would re-size what `MM_SOFTWIRE_FRAG` asserts on) — plus the full list of
 verified-passing combinations. See
 **`test/netns/README.md`** for all of that detail; it's a rig-operation runbook, not something most tasks
 need loaded up front.
@@ -238,6 +251,20 @@ orphaned the running kernel's module directory — reboot to fix that).
     ip6tnl decap (`STAT_DECAP_REASM_PASS`), since XDP can't reassemble. Native
     (non-softwire) IPv6 arriving on the WAN — the `outer_iph->nexthdr != IPPROTO_IPIP` case, previously
     `XDP_PASS`ed to the kernel — takes the same native-IPv6 forwarding fastpath instead.
+  - `handle_tunnel_icmpv6` (called from `xdp_dslite_decap` before the native-IPv6 branch) — the RFC 2473
+    §8 tunnel ICMP relay. An inbound ICMPv6 error is claimed only when its quote is one of *this* B4's own
+    softwire packets (`find_dslite_local_slot`: quoted saddr/daddr match a `next_hops` slot's B4/AFTR pair
+    *and* the error is addressed to that same B4) and the quoted inner IPv4 resolves to a managed LAN
+    interface — together the spoof check, since believing a fabricated quote would let anyone on the IPv6
+    internet inject ICMPv4 errors into the LAN or shrink the softwire MTU. It then rewrites the frame in
+    place (trim to `ICMPV4_ERROR_FRAME_LEN`, `write_lan_icmpv4_error`) into an untunneled ICMPv4 error out
+    the LAN — untunneled, unlike the decap path's replies above, because here the original sender *is* a
+    LAN client. A Packet Too Big first records the path MTU (`learn_tunnel_pmtu` → the `tunnel_pmtus`
+    map, floored at 1280 per RFC 8201 §4, aged out after 10 minutes) and is then relayed only if the quote
+    had DF; a non-DF one is dropped, having been consumed. Anything not claimed falls through to the
+    native-IPv6 path exactly as before (`TUNNEL_ICMP_NOT_MINE`), so an ordinary ICMPv6 packet addressed to
+    the CPE still reaches the kernel — the caller re-derives its packet pointers after the call, since the
+    verifier merges the `bpf_xdp_adjust_tail` path into the one that didn't touch the frame.
   - `handle_ipv6_forward` — the native-IPv6 forwarding fastpath, a plain IPv6 router step shared by the
     encap (LAN-ingress), decap (WAN-ingress) and `xdp_ipv6_fwd_cpu` (software-RSS) programs. It does in XDP
     what the kernel slow path would otherwise do for every transit IPv6 packet: `bpf_fib_lookup(AF_INET6)`,
@@ -270,7 +297,9 @@ orphaned the running kernel's module directory — reboot to fix that).
   - Config is held in BPF maps, not hardcoded: `b4_config_map` (single-entry `ARRAY`: B4/AFTR IPv6 addresses,
     fallback WAN MACs, WAN ifindex, and the softwire fragmenter's `frag_unit`/`frag_max_inner`) and
     `lan_configs` (`HASH` keyed by LAN ifindex: gateway IPv4, inner MTU); the fragmenter adds the
-    `frag_ports` `DEVMAP` of companion-veth ifindexes.
+    `frag_ports` `DEVMAP` of companion-veth ifindexes, and the tunnel ICMP relay the `tunnel_pmtus`
+    `ARRAY` (per `next_hop` slot: the learned softwire path MTU + a `bpf_ktime_get_ns` stamp, written by
+    the datapath and read by both encap and userspace).
     The optional IPv6 software-RSS stage adds `ipv6_rss_config_map`/`ipv6_rss_cpus`/`cpu_map_v6` (separate
     from the dormant DS-Lite `fanout_*`/`cpu_map`). Per-path counters live in the `stats` `PERCPU_ARRAY`
     (see `enum stat_id`; the field/index order in `pkg/datapath/stats.go`'s `statID` and the `Stats` struct
@@ -324,6 +353,11 @@ orphaned the running kernel's module directory — reboot to fix that).
     attach-then-populate, so the datapath (whose `encap_fragment_outer` guard checks `frag_ports`
     resolves) never broadcasts into a pair with no consumer. `MaxSoftwireFrags` (4) mirrors the C
     `MAX_SOFTWIRE_FRAGS` and is what `fragpath.NumPairs` is defined from.
+  - `pmtu.go` — `TunnelPMTU()` reads the smallest not-yet-aged-out softwire path MTU across the
+    `tunnel_pmtus` slots (aged on the same `CLOCK_MONOTONIC` the datapath stamps with, `TunnelPMTUExpiry`
+    mirroring the C `TUNNEL_PMTU_EXPIRY_NS`), and `SetSoftwireMTU(mtu)` re-derives `b4_config.frag_unit`
+    from it — the only field of `b4_config` written after startup, and the reason the derivation lives in
+    Go rather than in the datapath (see the `handle_tunnel_icmpv6` bullet).
   - `ipv6_rss.go` — `EnableIPv6SoftwareRSS([]uint32)` turns on the native-IPv6 software-RSS cpumap stage
     across the given CPU ids: it populates `cpu_map_v6` with `bpfBpfCpumapVal{Qsize, prog: XdpIpv6FwdCpu.FD()}`
     per CPU, fills `ipv6_rss_cpus` (slot → cpu), and sets `ipv6_rss_config{Enabled, CpuCount}`. Off unless
@@ -520,7 +554,9 @@ orphaned the running kernel's module directory — reboot to fix that).
   `RT_SCOPE_LINK` — matching `ip route add <dst> dev <iface>`; family follows the prefix, so the same call
   serves `internal/wanextend`'s IPv6 `/128` host routes and `internal/slowpath`'s IPv4 default route, and a
   `/0` prefix omits `RTA_DST`; `AddRoute` is `NLM_F_REPLACE`-idempotent too), and
-  `AddIP6Tnl`/`SetIP6TnlEndpoints`/`AddVeth`/`SetLinkUp`/`DelLink` for the companion device lifecycles.
+  `AddIP6Tnl`/`SetIP6TnlEndpoints`/`AddVeth`/`SetLinkUp`/`SetLinkMTU`/`DelLink` for the companion device
+  lifecycles (`SetLinkMTU` exists for the ip6tnl's MTU, which has to follow a learned softwire path MTU or
+  the fallback keeps fragmenting to a size the path drops).
 - **`pkg/dnsproxy/`** — the DNS proxy RFC 6333 recommends a DS-Lite B4 run (the B4 SHOULD act as a DNS
   proxy for LAN clients): opaque byte-relay only, no DNS message parsing, caching, or rewriting of any
   kind, so it's simple enough to have no unit tests of its own (like `pkg/ndproxy`/`pkg/routeradvert`'s raw
@@ -617,7 +653,10 @@ orphaned the running kernel's module directory — reboot to fix that).
   can't be relied on, so minuteman cuts cleanly) then re-triggers AFTR discovery. The watcher only signals (size-1
   latest-wins channel); the loop re-queries the source itself so no stale value rides the channel, and
   `migrateAFTR`'s long waits also select on the signal (returning `errMigrationInterrupted`) so a WAN
-  change interrupts even a multi-hour drain. When `-dhcpv6-pd` is set, `runPrefixDelegation()` similarly blocks
+  change interrupts even a multi-hour drain. `watchTunnelPMTU()` (always started, `pmtu.go`) polls the path MTU the datapath learns from inbound
+  ICMPv6 Packet Too Big messages and applies it to the two things userspace owns — the fragmenter's
+  `frag_unit` and the companion ip6tnl's MTU — including the widening direction, since a reading that ages
+  out simply stops being reported. When `-dhcpv6-pd` is set, `runPrefixDelegation()` similarly blocks
   on `pkg/prefixdelegation.Acquire`, then applies the initial LAN assignment via
   `internal/lanprefix.Reconcile` synchronously (before the datapath is considered "up"), syncs an
   `internal/lanprefix.RAManager` against the result (starting one `pkg/routeradvert.Serve` goroutine per
@@ -723,7 +762,9 @@ orphaned the running kernel's module directory — reboot to fix that).
   adds the default route (fail-fast at startup — a home CPE has no other IPv4 path, and a missing
   `ip6_tunnel` module surfaces as an error rather than silent degradation), `SetEndpoints(b4, aftr)`
   repoints it in place (changelink, keeping the route) after an AFTR migration's cutover or a dynamic-B4
-  hard switch (best-effort: a runtime failure only lags fragmentation, not the fast path), and `Close()`
+  hard switch (best-effort: a runtime failure only lags fragmentation, not the fast path),
+  `SetSoftwireMTU(mtu)` re-derives the device MTU when the datapath learns a narrower softwire path MTU
+  (same best-effort stance), and `Close()`
   deletes it best-effort on shutdown. `cmd/minuteman` creates it right after `SetB4Config` for every run
   (static or dynamic) and hands it to `runAFTRRediscovery` so the single endpoint owner can repoint it;
   its `defer Close()` runs after `bgWG.Wait()` (so the rediscovery goroutine has drained) but before

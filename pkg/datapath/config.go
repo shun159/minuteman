@@ -175,6 +175,14 @@ func (l *Loader) writeNextHop(slot uint32, b4, aftr netip.Addr) error {
 			"(state=%d active=%d old=%d); end the migration first", slot, c.state, c.activeSlot, c.oldSlot)
 	}
 
+	// A learned softwire path MTU belongs to the endpoint pair it was learned
+	// for, not to the slot: leaving it in place would clamp a brand-new
+	// softwire (and, via TunnelPMTU, the fragment size) to whatever the
+	// previous occupant's path could take.
+	if err := l.clearTunnelPMTU(slot); err != nil {
+		return err
+	}
+
 	val := bpfNextHop{Valid: 1}
 	val.B4Addr.In6U.U6Addr8 = b4.As16()
 	val.AftrAddr.In6U.U6Addr8 = aftr.As16()
@@ -192,7 +200,9 @@ func (l *Loader) clearNextHop(slot uint32) error {
 	if err := l.objs.NextHops.Put(&slot, &val); err != nil {
 		return fmt.Errorf("clearing next-hop slot %d: %w", slot, err)
 	}
-	return nil
+	// Same reason as in writeNextHop: a retired endpoint pair's path MTU must
+	// not keep constraining the softwire that is still running.
+	return l.clearTunnelPMTU(slot)
 }
 
 // SetLANConfig installs the configuration for a LAN interface, keyed by its

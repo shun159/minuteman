@@ -265,6 +265,16 @@ func buildSetLinkUpMessage(seq uint32, ifindex int) []byte {
 	return buildMessage(unix.RTM_NEWLINK, unix.NLM_F_REQUEST|unix.NLM_F_ACK, seq, body)
 }
 
+// buildSetLinkMTUMessage builds an RTM_NEWLINK request setting ifindex's MTU.
+func buildSetLinkMTUMessage(seq uint32, ifindex, mtu int) []byte {
+	mtuBuf := make([]byte, 4)
+	binary.NativeEndian.PutUint32(mtuBuf, uint32(mtu))
+
+	body := buildIfInfoBody(ifindex, 0, 0)
+	body = append(body, encodeRtAttr(unix.IFLA_MTU, mtuBuf)...)
+	return buildMessage(unix.RTM_NEWLINK, unix.NLM_F_REQUEST|unix.NLM_F_ACK, seq, body)
+}
+
 // buildDelLinkMessage builds an RTM_DELLINK request deleting ifindex.
 func buildDelLinkMessage(seq uint32, ifindex int) []byte {
 	body := buildIfInfoBody(ifindex, 0, 0)

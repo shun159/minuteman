@@ -131,6 +131,28 @@ number of lease applications stays within what the client's own timers permit (t
 renewed on every exchange RTT, hundreds of times over the same window). Adds ~90s to the run, in this mode
 only.
 
+A tenth independent toggle, `MM_TUNNEL_ICMP` (`0` default or `1`), exercises the tunnel ICMPv6 relay
+(RFC 2473 §8) — an ICMPv6 error an intermediate IPv6 router on the B4↔AFTR path sends *about a softwire
+packet*, which the B4 has to turn into an ICMPv4 error toward the LAN client whose packet it quoted.
+It changes no minuteman flag (the relay, like DS-Lite's own forwarding, is always on) and runs in two
+halves. First, deterministically: `send-softwire-fragments.py`'s `icmp6ptb`/`icmp6texc`/`icmp6unreach`
+modes inject each error type from `mm-isp`, and `smoketest.sh` asserts the ICMPv4 that appears on the LAN
+is the right type (RFC 7915 §5.3's mapping: Packet Too Big → Fragmentation Needed with the 40-byte tunnel
+overhead deducted, Time Exceeded → Time Exceeded — explicitly *not* Host Unreachable, which is what the
+kernel `ip6tnl` produced for this before — Destination Unreachable → its ICMPv4 counterpart) and is
+sourced from the well-known B4 address `192.0.0.2` (RFC 6333 §5.7), with `TunnelICMPRelay` advancing; an
+`icmp6bogus` error quoting a softwire between two addresses that are *not* this B4's must be ignored
+outright, since believing one would let anyone on the IPv6 internet inject ICMPv4 errors into the LAN or
+talk the B4 into a smaller path MTU. Second, for real: it narrows the ISP↔AFTR core link to 1400 while
+leaving the CPE's own WAN at 1500 — so nothing local can see the narrowing and learning it from the
+resulting Packet Too Big is the only way the fragmenter stops emitting fragments the path can only drop —
+and asserts minuteman learns that path MTU (`TunnelPMTU`, and the log line `softwire path MTU: 1400`),
+re-sizes the companion `ip6tnl` to match (1360), and then carries oversized non-DF **and** DF traffic
+across the narrowed path with no loss and no PMTUD signal at all, still via the in-XDP fragmenter
+(`EncapFragXDP`), before restoring the link. It runs as the last datapath section on purpose: a learned
+path MTU stays in force for ten minutes (`datapath.TunnelPMTUExpiry`), which would re-size the fragments
+the `MM_SOFTWIRE_FRAG` checks assert on. Composes with the other toggles.
+
 Independently of `MM_SOFTWIRE_FRAG`, `smoketest.sh` also hand-crafts a whole softwire packet whose inner
 IPv4 TTL is 1, and asserts that the B4 returns a softwire-encapsulated ICMPv4 Time Exceeded toward the
 AFTR, sourced from the DS-Lite well-known B4 address `192.0.0.2`, with the `ICMPTimeExceeded` counter
@@ -197,6 +219,11 @@ verified passing from a fresh setup for:
   softwire packet reassembled and delivered to the LAN client (with `DecapReasmPass` advancing), and the
   encap ip6tnl *fallback* forced by a runtime WAN-MTU shrink: a DF oversized packet takes the fallback
   (`EncapFragSlow` advancing, `EncapFragXDP` untouched) and draws an ICMPv4 Fragmentation-Needed on the LAN
+- `MM_TUNNEL_ICMP=1` (against `dhcpv6` AFTR discovery + `dhcpv6-pd`, alongside `MM_SOFTWIRE_FRAG=1`): all
+  three injected error types relayed with the right ICMPv4 type and the `192.0.0.2` source, a bogus quote
+  ignored, and the narrowed-core-link half end-to-end — the learned path MTU applied to both the
+  fragmenter (fragments confirmed on the ISP link as `frag (0|1352)` + `frag (1352|148)`, i.e. outer
+  packets of 1400 and 196) and the companion `ip6tnl`, with oversized DF and non-DF pings then at 0% loss
 - `MM_PD_ZERO_TIMERS=1` (against `dhcpv6` AFTR discovery + `dhcpv6-pd`): Kea delegating with `T1 = T2 = 0`,
   minuteman deriving 65s/104s from the 130s preferred lifetime and renewing exactly once on that timer
   within an 85s window (Kea logging the single `RENEW`, the prefix unchanged across it). Re-run after the

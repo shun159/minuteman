@@ -74,6 +74,10 @@ func runStats(args []string) error {
 		{"DecapMartian", stats.DecapMartian},
 		{"EncapFragXDP", stats.EncapFragXDP},
 		{"EncapFragSeg", stats.EncapFragSeg},
+		{"TunnelICMPRelay", stats.TunnelICMPRelay},
+		{"TunnelICMPPass", stats.TunnelICMPPass},
+		{"TunnelICMPDrop", stats.TunnelICMPDrop},
+		{"TunnelPMTU", stats.TunnelPMTU},
 	} {
 		fmt.Printf("%s: %d\n", c.name, c.value)
 	}

@@ -59,6 +59,14 @@
 # hand-crafted fragmented softwire packet the decap must hand up for kernel
 # reassembly. Changes no minuteman flag and no topology; see common.sh.
 #
+# MM_TUNNEL_ICMP ("0"/unset (default) or "1") makes smoketest.sh exercise the
+# tunnel ICMPv6 relay (RFC 2473 §8): ICMPv6 errors *about a softwire packet*,
+# both hand-injected and drawn for real by narrowing the ISP<->AFTR core link
+# below the CPE's own WAN MTU, must come out on the LAN as ICMPv4 errors from
+# 192.0.0.2 and must re-size the softwire fragmenter to the learned path MTU.
+# Changes no minuteman flag; narrows one link only for the duration of its own
+# checks. See common.sh.
+#
 # After this completes, run minuteman as the B4 with test/netns/run-cpe.sh,
 # then test end-to-end connectivity with test/netns/smoketest.sh (both read
 # the modes this script recorded and act/assert accordingly).
@@ -131,6 +139,15 @@ case "$SOFTWIRE_FRAG" in
 0 | 1) ;;
 *)
     echo "error: MM_SOFTWIRE_FRAG must be '0' or '1' (got '$SOFTWIRE_FRAG')" >&2
+    exit 1
+    ;;
+esac
+
+TUNNEL_ICMP="${MM_TUNNEL_ICMP:-0}"
+case "$TUNNEL_ICMP" in
+0 | 1) ;;
+*)
+    echo "error: MM_TUNNEL_ICMP must be '0' or '1' (got '$TUNNEL_ICMP')" >&2
     exit 1
     ;;
 esac
@@ -449,6 +466,7 @@ echo "$DHCPV4" >"$DHCPV4_ENABLED_FILE"
 echo "$DUALSTACK" >"$DUALSTACK_ENABLED_FILE"
 echo "$DYNAMIC_B4" >"$DYNAMIC_B4_FILE"
 echo "$SOFTWIRE_FRAG" >"$SOFTWIRE_FRAG_ENABLED_FILE"
+echo "$TUNNEL_ICMP" >"$TUNNEL_ICMP_ENABLED_FILE"
 echo "$PD_ZERO_TIMERS" >"$PD_ZERO_TIMERS_FILE"
 
 echo "== mm-cpe: B4 element (minuteman runs here) =="

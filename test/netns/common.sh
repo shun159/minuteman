@@ -216,6 +216,30 @@ SOFTWIRE_FRAG_ENABLED_FILE="$RUNDIR/softwire-frag-enabled"
 # 3600/7200) shrink the derived T1 to 0.5 x 130s = 65s, so one real renewal
 # lands inside a smoketest run instead of half an hour later. Off by default
 # (MM_PD_ZERO_TIMERS unset or "0").
+# Whether smoketest.sh exercises the tunnel ICMPv6 relay (RFC 2473 §8) -- a
+# ninth independent toggle. When on it (a) injects ICMPv6 errors *about a
+# softwire packet* toward the B4 with send-softwire-fragments.py's icmp6*
+# modes, asserting each is relayed to the LAN client as the right ICMPv4 error
+# from the RFC 6333 §5.7 well-known B4 address, and (b) narrows the ISP<->AFTR
+# core link to CORE_NARROW_MTU so real oversized traffic draws a real Packet
+# Too Big from mm-isp, asserting minuteman learns that path MTU and re-sizes
+# both the in-XDP fragmenter and the companion ip6tnl to it (the link is
+# restored afterwards). It changes no minuteman flag -- the relay, like
+# DS-Lite's own forwarding, is always on. Off by default (MM_TUNNEL_ICMP unset
+# or "0").
+#
+# Deliberately the last datapath section smoketest.sh runs: a learned path MTU
+# stays in force for 10 minutes (datapath.TunnelPMTUExpiry), which would change
+# the fragment sizes the MM_SOFTWIRE_FRAG checks assert on.
+TUNNEL_ICMP_ENABLED_FILE="$RUNDIR/tunnel-icmp-enabled"
+CORE_NARROW_MTU=1400
+# The MTU the *hand-injected* Packet Too Big reports, kept distinct from
+# CORE_NARROW_MTU: an injected error is learned as a real path MTU just the
+# same, so sharing the value would let the injection satisfy the assertions
+# meant for the narrowed link (the log line and the resulting ip6tnl MTU)
+# before that link is ever narrowed.
+INJECTED_PTB_MTU=1420
+
 PD_ZERO_TIMERS_FILE="$RUNDIR/pd-zero-timers"
 PD_ZERO_PREFERRED_LIFETIME=130
 PD_ZERO_VALID_LIFETIME=260

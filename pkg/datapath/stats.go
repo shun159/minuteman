@@ -46,6 +46,10 @@ const (
 	statEncapFragXDP
 	statEncapFragSeg
 	statICMPTimeExceeded
+	statTunnelICMPRelay
+	statTunnelICMPPass
+	statTunnelICMPDrop
+	statTunnelPMTU
 	statMax
 )
 
@@ -108,6 +112,11 @@ func sumStats(m *ebpf.Map) (Stats, error) {
 		statEncapFragSeg: &s.EncapFragSeg,
 
 		statICMPTimeExceeded: &s.ICMPTimeExceeded,
+
+		statTunnelICMPRelay: &s.TunnelICMPRelay,
+		statTunnelICMPPass:  &s.TunnelICMPPass,
+		statTunnelICMPDrop:  &s.TunnelICMPDrop,
+		statTunnelPMTU:      &s.TunnelPMTU,
 	}
 
 	for id, dst := range fields {
