@@ -346,6 +346,28 @@ func TestBuildSetLinkUpMessage(t *testing.T) {
 	}
 }
 
+func TestBuildSetLinkMTUMessage(t *testing.T) {
+	msg := buildSetLinkMTUMessage(4, 21, 1360)
+	if got := binary.NativeEndian.Uint16(msg[4:6]); got != unix.RTM_NEWLINK {
+		t.Errorf("nlmsghdr.Type = %d, want RTM_NEWLINK", got)
+	}
+	ifi := msg[unix.SizeofNlMsghdr:]
+	if got := binary.NativeEndian.Uint32(ifi[4:8]); got != 21 {
+		t.Errorf("ifinfomsg.Index = %d, want 21", got)
+	}
+	// An MTU change must not disturb the link's flags: a zero Change mask is
+	// what tells the kernel to leave every one of them alone.
+	if got := binary.NativeEndian.Uint32(ifi[12:16]); got != 0 {
+		t.Errorf("ifinfomsg.Change = %#x, want 0 (flags untouched)", got)
+	}
+
+	attrs := map[uint16][]byte{}
+	walkAttrs(t, ifi[unix.SizeofIfInfomsg:], attrs)
+	if mtu := attrs[unix.IFLA_MTU]; len(mtu) != 4 || binary.NativeEndian.Uint32(mtu) != 1360 {
+		t.Errorf("IFLA_MTU = %v, want 1360", mtu)
+	}
+}
+
 func TestBuildDelLinkMessage(t *testing.T) {
 	msg := buildDelLinkMessage(3, 21)
 	if got := binary.NativeEndian.Uint16(msg[4:6]); got != unix.RTM_DELLINK {

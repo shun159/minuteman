@@ -105,4 +105,19 @@ type Stats struct {
 	// sits at the end rather than next to ICMPFragNeeded because the enum it
 	// mirrors is append-only: the ids are the pinned map's keys.
 	ICMPTimeExceeded uint64
+
+	// These four cover the RFC 2473 §8 relay of an ICMPv6 error an intermediate
+	// router on the B4<->AFTR path sent about one of this B4's own softwire
+	// packets. Relay: turned into an ICMPv4 error toward the LAN client whose
+	// packet it quoted. Pass: about our softwire but not relayable here, handed
+	// to the kernel so its own ip6tnl gets a turn. Drop: consumed here with no
+	// relay, because the right answer is something other than an ICMPv4 error
+	// (a non-DF Packet Too Big, answered by fragmenting at the learned MTU) or
+	// because RFC 1812 §4.3.2.7 forbids originating one. PMTU: a softwire path
+	// MTU learned from a Packet Too Big, counted whether or not it was relayed
+	// and only when the reading actually changes.
+	TunnelICMPRelay uint64
+	TunnelICMPPass  uint64
+	TunnelICMPDrop  uint64
+	TunnelPMTU      uint64
 }

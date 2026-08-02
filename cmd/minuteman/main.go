@@ -368,6 +368,12 @@ func run() error {
 	if aftrDynamic || dynamicB4 {
 		runAFTRRediscovery(ctx, dp, tun, b4, dynamicB4, aftrDynamic, *wanIface, wanIfindex, identity, disc, &bgWG)
 	}
+	// Follows the softwire path MTU the datapath learns from ICMPv6 Packet Too
+	// Big messages about its own tunnel packets, applying it to the fragment
+	// size and the companion ip6tnl (RFC 2473 §8/§6.7). Always on: a narrower
+	// link somewhere along the B4<->AFTR path is not a configuration, and
+	// nothing happens at all until one is actually reported.
+	watchTunnelPMTU(ctx, dp, tun, wanNetIface.MTU, &bgWG)
 	defer bgWG.Wait()
 
 	// Written only now, after every fail-fast startup step above, so the

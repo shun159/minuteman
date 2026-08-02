@@ -78,6 +78,37 @@ struct lan_config {
     __u16 flags;
 };
 
+/*
+ * The softwire path MTU learned from an ICMPv6 Packet Too Big about one of our
+ * own tunnel packets (RFC 2473 §6.7/§8), per next_hop slot -- the encap path's
+ * own bpf_check_mtu only ever sees the *local* WAN device's MTU, so without
+ * this a narrower link further along the B4<->AFTR path is invisible to it.
+ *
+ * The datapath only *learns* here; acting on it is split: encap clamps its
+ * effective MTU against this value per packet, while the fragment size
+ * (b4_config.frag_unit) and the companion ip6tnl's MTU are recomputed by
+ * userspace, which polls this map. Deriving frag_unit in the datapath instead
+ * would let encap_fragment_outer and the xdp_softwire_frag<i> programs read
+ * two different units for one packet's clones (they read it at different
+ * times) and emit a fragment set that can never reassemble.
+ *
+ * updated_ns == 0 means nothing learned. Userspace ages an entry out on its own
+ * clock, restoring the device MTU when the narrow path stops being reported.
+ */
+struct tunnel_pmtu {
+    __u32 mtu;
+    __u32 pad;
+    __u64 updated_ns;
+};
+
+/*
+ * How long a learned softwire path MTU is trusted before a larger reading may
+ * replace it -- 10 minutes, the same window the kernel gives its own IPv4 PMTU
+ * cache entries (ip_rt_mtu_expires). Userspace uses the same figure to decide
+ * when to hand the fragment size back to the WAN device's own MTU.
+ */
+#define TUNNEL_PMTU_EXPIRY_NS (600ULL * 1000000000ULL)
+
 struct fanout_config {
     __u32 enabled;
     __u32 cpu_count;
@@ -108,6 +139,13 @@ struct {
     __type(key, __u32); /* slot index */
     __type(value, struct next_hop);
 } next_hops SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, NUM_NEXT_HOPS);
+    __type(key, __u32); /* next_hop slot index */
+    __type(value, struct tunnel_pmtu);
+} tunnel_pmtus SEC(".maps");
 
 /*
  * Migration control: one bit-packed __u32 that drives which next_hop slot a
@@ -335,6 +373,19 @@ enum stat_id {
      * different revision. New counters go before STAT_MAX, never in the middle.
      */
     STAT_ICMP_TIME_EXCEEDED,
+    /*
+     * Tunnel ICMPv6 relay (RFC 2473 §8): an ICMPv6 error an intermediate router
+     * on the B4<->AFTR path sent *about* a softwire packet, translated here into
+     * an ICMPv4 error toward the LAN client whose packet it quoted.
+     */
+    STAT_TUNNEL_ICMP_RELAY, /* relayed to the LAN as an ICMPv4 error */
+    STAT_TUNNEL_ICMP_PASS,  /* about our softwire, not relayable here: XDP_PASSed
+                             * so the kernel's own ip6tnl gets its turn */
+    STAT_TUNNEL_ICMP_DROP,  /* consumed here without a relay: the answer is
+                             * something other than an ICMPv4 error (a non-DF
+                             * Packet Too Big, whose answer is to fragment at the
+                             * learned MTU), or RFC 1812 §4.3.2.7 forbids one */
+    STAT_TUNNEL_PMTU,       /* softwire path MTU learned from a Packet Too Big */
     STAT_MAX,
 };
 
@@ -777,6 +828,23 @@ maybe_redirect_to_cpu(struct xdp_md *ctx, const struct iphdr *inner_iph, void *d
         return 0;
 
     return bpf_redirect_map(&cpu_map, *cpu, 0);
+}
+
+/*
+ * The softwire path MTU learned for this slot, or 0 if nothing has been
+ * learned or the reading has aged out (see tunnel_pmtus / learn_tunnel_pmtu).
+ * Expiry is checked on read as well as on write so a path that widens again
+ * stops constraining encap even if no further ICMPv6 error ever arrives.
+ */
+static __always_inline __u32
+tunnel_pmtu_for(__u32 slot)
+{
+    struct tunnel_pmtu *e = bpf_map_lookup_elem(&tunnel_pmtus, &slot);
+    if (!e || e->updated_ns == 0)
+        return 0;
+    if (bpf_ktime_get_ns() - e->updated_ns > TUNNEL_PMTU_EXPIRY_NS)
+        return 0;
+    return e->mtu;
 }
 
 /*
@@ -1250,16 +1318,34 @@ xdp_dslite_encap(struct xdp_md *ctx)
     __u32 wan_mtu = 0;
     int ret =
         check_dev_mtu(ctx, cfg->wan_ifindex, TUNNEL_L3_OVERHEAD + inner_len, &wan_mtu);
-    if (ret == BPF_MTU_CHK_RET_FRAG_NEEDED)
+    if (ret != 0 && ret != BPF_MTU_CHK_RET_FRAG_NEEDED)
+        return XDP_DROP;
+
+    /*
+     * bpf_check_mtu only knows the local WAN device's MTU. A narrower link
+     * further along the B4<->AFTR path shows up as an ICMPv6 Packet Too Big
+     * about one of our own softwire packets, which the decap side records
+     * (handle_tunnel_icmpv6 -> learn_tunnel_pmtu); honouring it here is what
+     * keeps the packet from being sent at a size the path will only drop
+     * again. The fragment *size* still comes from b4_config.frag_unit, which
+     * userspace recomputes from the same reading -- until it does, an
+     * oversized packet lands on the ip6tnl fallback rather than being
+     * fragmented too big (see encap_fragment_outer's guard against frag_unit
+     * exceeding the MTU passed here).
+     */
+    __u32 eff_mtu = wan_mtu;
+    __u32 learned_mtu = tunnel_pmtu_for(slot);
+    if (learned_mtu != 0 && learned_mtu < eff_mtu)
+        eff_mtu = learned_mtu;
+
+    if (ret == BPF_MTU_CHK_RET_FRAG_NEEDED || TUNNEL_L3_OVERHEAD + inner_len > eff_mtu)
         /*
-         * Too big for the WAN once encapsulated: encapsulate whole and
+         * Too big for the softwire once encapsulated: encapsulate whole and
          * fragment the *outer IPv6*, DF ignored (RFC 6333 §5.3 / errata 5847
          * -> RFC 2473 §7.2(b)); see encap_fragment_outer for the mechanism
          * and its ip6tnl fallback.
          */
-        return encap_fragment_outer(ctx, l2_len, inner_iph, inner_len, cfg, wan_mtu);
-    if (ret != 0)
-        return XDP_DROP;
+        return encap_fragment_outer(ctx, l2_len, inner_iph, inner_len, cfg, eff_mtu);
 
     if (inner_iph->ttl <= 1) {
         increase_stats_count(STAT_PASS);
@@ -1589,6 +1675,296 @@ send_dslite_icmp_time_exceeded(struct xdp_md *ctx, const struct b4_config *cfg,
     return redirect_to_ifindex(cfg->wan_ifindex, STAT_REDIRECT_WAN);
 }
 
+/*
+ * Returned by handle_tunnel_icmpv6 for a packet it decided isn't its business:
+ * the caller then carries on with the branch it would have taken anyway (the
+ * native-IPv6 fastpath), rather than this having to guess an XDP action for
+ * every ICMPv6 packet that merely arrived on the WAN. Outside the XDP_* range
+ * on purpose.
+ */
+#define TUNNEL_ICMP_NOT_MINE (-1)
+
+/*
+ * Records the softwire path MTU an ICMPv6 Packet Too Big reported for one of
+ * our own tunnel packets. Floored at the IPv6 minimum MTU (RFC 8201 §4: a node
+ * must not reduce its path MTU below 1280), which is also what makes a forged
+ * PtB harmless -- the smallest MTU anyone can talk us into is one every IPv6
+ * path must already support.
+ *
+ * A *smaller* MTU is always taken; a larger one only once the current reading
+ * has aged out, so a single stale or forged large value can't undo a real
+ * narrowing. Userspace ages entries on the same timescale (see tunnel_pmtus).
+ */
+static __always_inline void
+learn_tunnel_pmtu(__u32 slot, __u32 mtu)
+{
+    if (mtu < IPV6_MIN_MTU)
+        mtu = IPV6_MIN_MTU;
+
+    struct tunnel_pmtu *e = bpf_map_lookup_elem(&tunnel_pmtus, &slot);
+    if (!e)
+        return;
+
+    __u64 now = bpf_ktime_get_ns();
+    if (e->updated_ns != 0 && mtu >= e->mtu &&
+        now - e->updated_ns < TUNNEL_PMTU_EXPIRY_NS)
+        return;
+
+    e->mtu = mtu;
+    e->updated_ns = now;
+    increase_stats_count(STAT_TUNNEL_PMTU);
+}
+
+/*
+ * The next_hop slot whose softwire the given quoted header describes -- i.e.
+ * one of *our own* outbound tunnel packets (b4 -> aftr), the reverse of
+ * find_dslite_peer_nh's inbound match. `error_dst` is the destination of the
+ * ICMPv6 error carrying the quote, required to be that same slot's B4 address:
+ * an error about our softwire that wasn't addressed to us isn't ours to act on.
+ */
+static __always_inline int
+find_dslite_local_slot(const struct ipv6hdr *quoted, const struct in6_addr *error_dst)
+{
+#pragma unroll
+    for (int i = 0; i < NUM_NEXT_HOPS; i++) {
+        __u32 slot = i;
+        struct next_hop *nh = bpf_map_lookup_elem(&next_hops, &slot);
+        if (nh && nh->valid && ipv6_addr_equal(&quoted->saddr, &nh->b4_addr) &&
+            ipv6_addr_equal(&quoted->daddr, &nh->aftr_addr) &&
+            ipv6_addr_equal(error_dst, &nh->b4_addr))
+            return i;
+    }
+    return -1;
+}
+
+/*
+ * RFC 2473 §8: relays an ICMPv6 error an intermediate IPv6 router on the
+ * B4<->AFTR path sent *about a softwire packet* into an ICMPv4 error toward the
+ * LAN client whose packet it quoted. Without this the tunnel is opaque to the
+ * error -- the IPv4 sender learns nothing, since the ICMPv6 error is addressed
+ * to the B4, not to it. The encap path's own bpf_check_mtu only ever sees the
+ * local WAN device's MTU, so a Packet Too Big from further along the path is
+ * the *only* way a narrower link there becomes known; it is also recorded
+ * (learn_tunnel_pmtu) whether or not it is relayed.
+ *
+ * The type mapping follows RFC 7915 §5.3's ICMPv6->ICMPv4 table. Packet Too Big
+ * is relayed only for a DF quote: without DF the sender can't act on a
+ * next-hop-MTU signal, and this B4 answers that case by fragmenting the outer
+ * IPv6 at the learned MTU instead (RFC 6333 §5.3 / errata 5847 -> RFC 2473
+ * §7.2(b), the same DF-ignoring stance encap_fragment_outer takes).
+ *
+ * Anything not matched here is left alone (TUNNEL_ICMP_NOT_MINE) or handed to
+ * the kernel (XDP_PASS), never dropped silently: a plain ICMPv6 error addressed
+ * to the CPE itself must still reach the local stack.
+ */
+static __always_inline int
+handle_tunnel_icmpv6(struct xdp_md *ctx, __u64 l2_len, const struct ipv6hdr *ip6h,
+                     __u8 *data_end)
+{
+    struct icmpv6_error_hdr *icmp6 = (struct icmpv6_error_hdr *)(ip6h + 1);
+    if ((void *)(icmp6 + 1) > (void *)data_end)
+        return TUNNEL_ICMP_NOT_MINE;
+
+    if (icmp6->type != ICMPV6_DEST_UNREACH && icmp6->type != ICMPV6_PKT_TOOBIG &&
+        icmp6->type != ICMPV6_TIME_EXCEED)
+        return TUNNEL_ICMP_NOT_MINE;
+
+    /* The invoking packet, as much of it as the sender quoted. */
+    struct ipv6hdr *quoted = (struct ipv6hdr *)(icmp6 + 1);
+    if ((void *)(quoted + 1) > (void *)data_end)
+        return TUNNEL_ICMP_NOT_MINE;
+
+    int slot = find_dslite_local_slot(quoted, &ip6h->daddr);
+    if (slot < 0)
+        return TUNNEL_ICMP_NOT_MINE;
+
+    /*
+     * Past this point the error is definitely about a softwire packet this B4
+     * sent, so every remaining exit is a counted decision rather than a
+     * fallthrough to the native-IPv6 path.
+     */
+    struct iphdr *inner = 0;
+    if (quoted->nexthdr == IPPROTO_IPIP) {
+        inner = (struct iphdr *)(quoted + 1);
+    } else if (quoted->nexthdr == IPPROTO_FRAGMENT) {
+        /*
+         * The quote is one of our own outer-IPv6 fragments. Only the first
+         * carries the inner IPv4 header; a later one has nothing to address a
+         * relayed error to (and its arrival means the first was seen too).
+         */
+        struct frag_hdr *fh = (struct frag_hdr *)(quoted + 1);
+        if ((void *)(fh + 1) > (void *)data_end) {
+            increase_stats_count(STAT_TUNNEL_ICMP_PASS);
+            return XDP_PASS;
+        }
+        if ((fh->frag_off & bpf_htons(0xfff8)) != 0 || fh->nexthdr != IPPROTO_IPIP) {
+            increase_stats_count(STAT_TUNNEL_ICMP_PASS);
+            return XDP_PASS;
+        }
+        inner = (struct iphdr *)(fh + 1);
+    } else {
+        increase_stats_count(STAT_TUNNEL_ICMP_PASS);
+        return XDP_PASS;
+    }
+
+    if ((void *)inner + ICMP_FRAG_QUOTE_LEN > (void *)data_end || inner->version != 4 ||
+        inner->ihl != 5) {
+        /* Too little of the invoking packet quoted to build a reply from, or an
+         * inner this datapath's fixed-size quote can't express (IPv4 options). */
+        increase_stats_count(STAT_TUNNEL_ICMP_PASS);
+        return XDP_PASS;
+    }
+
+    struct ipv4_quote quote = {};
+    copy_ipv4_quote(&quote, inner);
+
+    __u8 rel_type = 0, rel_code = 0;
+    __u32 rel_extra = 0;
+    bool relay = false;
+
+    switch (icmp6->type) {
+    case ICMPV6_PKT_TOOBIG: {
+        __u32 ptb_mtu = bpf_ntohl(icmp6->extra);
+
+        learn_tunnel_pmtu((__u32)slot, ptb_mtu);
+
+        if (!ipv4_has_df(&quote.iph)) {
+            /*
+             * A sender that didn't set DF can't act on a next-hop MTU, and this
+             * B4's answer for it is to fragment the outer IPv6 at the MTU just
+             * learned rather than push the problem back (RFC 6333 §5.3 /
+             * errata 5847 -> RFC 2473 §7.2(b)). Everything of value has been
+             * taken from the error, so it is consumed here: XDP_PASSing it
+             * would just let the kernel's own ip6tnl relay the very signal
+             * minuteman deliberately isn't sending.
+             */
+            increase_stats_count(STAT_TUNNEL_ICMP_DROP);
+            return XDP_DROP;
+        }
+
+        __u32 next_mtu = ptb_mtu > TUNNEL_L3_OVERHEAD ? ptb_mtu - TUNNEL_L3_OVERHEAD : 0;
+        if (next_mtu < ICMPV4_MIN_MTU)
+            next_mtu = ICMPV4_MIN_MTU;
+        if (next_mtu > 0xffff)
+            next_mtu = 0xffff;
+
+        rel_type = ICMP_DEST_UNREACH;
+        rel_code = ICMP_FRAG_NEEDED;
+        rel_extra = next_mtu; /* low 16 bits of the word == next-hop MTU */
+        relay = true;
+        break;
+    }
+    case ICMPV6_TIME_EXCEED:
+        rel_type = ICMP_TIME_EXCEEDED;
+        rel_code = icmp6->code == 1 ? ICMP_EXC_FRAGTIME : ICMP_EXC_TTL;
+        relay = true;
+        break;
+    case ICMPV6_DEST_UNREACH:
+        switch (icmp6->code) {
+        case ICMPV6_NOROUTE:
+        case ICMPV6_ADDR_UNREACH:
+            rel_type = ICMP_DEST_UNREACH;
+            rel_code = ICMP_HOST_UNREACH;
+            relay = true;
+            break;
+        case ICMPV6_ADM_PROHIBITED:
+        case ICMPV6_POLICY_FAIL:
+            rel_type = ICMP_DEST_UNREACH;
+            rel_code = ICMP_HOST_ANO;
+            relay = true;
+            break;
+        }
+        break;
+    }
+
+    if (!relay) {
+        increase_stats_count(STAT_TUNNEL_ICMP_PASS);
+        return XDP_PASS;
+    }
+
+    /*
+     * RFC 1812 §4.3.2.7, exactly as on the paths that originate these errors.
+     * Dropped rather than XDP_PASSed: the rule forbids the error being
+     * originated at all, and passing it up would just have the kernel's ip6tnl
+     * originate the one this datapath is refusing to.
+     */
+    if (!icmp_error_eligible(&quote)) {
+        increase_stats_count(STAT_TUNNEL_ICMP_DROP);
+        return XDP_DROP;
+    }
+
+    struct b4_config *g = get_b4_config();
+    if (!g) {
+        increase_stats_count(STAT_NO_CONFIG);
+        return XDP_PASS;
+    }
+
+    /*
+     * Resolve the LAN client the relayed error is addressed to. Requiring it to
+     * resolve to a managed LAN interface is also the spoof check: an ICMPv6
+     * error quoting a fabricated inner source can't reach a LAN egress, and one
+     * quoting a real LAN client's address is exactly what a genuine error does.
+     */
+    struct bpf_fib_lookup fib = {};
+    fib.family = AF_INET;
+    fib.l4_protocol = IPPROTO_ICMP;
+    fib.tot_len = (__u16)ICMPV4_ERROR_L3_LEN;
+    fib.ipv4_dst = quote.iph.saddr;
+    fib.ifindex = ctx->ingress_ifindex;
+
+    if (bpf_fib_lookup(ctx, &fib, sizeof(fib), 0) != BPF_FIB_LKUP_RET_SUCCESS ||
+        fib.ifindex == g->wan_ifindex || !get_lan_config(fib.ifindex)) {
+        increase_stats_count(STAT_TUNNEL_ICMP_PASS);
+        return XDP_PASS;
+    }
+
+    __u8 *data = (__u8 *)(long)ctx->data;
+    __u32 old_len = (__u32)(data_end - data);
+    if (l2_len != OUTER_ETH_LEN || old_len < ICMPV4_ERROR_FRAME_LEN) {
+        increase_stats_count(STAT_TUNNEL_ICMP_PASS);
+        return XDP_PASS;
+    }
+
+    /*
+     * Last, so the token is spent only on an error that is actually about to be
+     * written: every check above can still bail out to the kernel, and this
+     * bucket is shared with the datapath's own originated errors
+     * (send_dslite_icmp_frag_needed, send_icmpv6_pkt_too_big) -- a stream of
+     * matching-but-unrelayable ICMPv6 would otherwise starve those of tokens.
+     */
+    if (!icmp_error_allowed()) {
+        increase_stats_count(STAT_ICMP_RATE_LIMITED);
+        return XDP_DROP;
+    }
+
+    if (old_len > ICMPV4_ERROR_FRAME_LEN &&
+        bpf_xdp_adjust_tail(ctx, (int)ICMPV4_ERROR_FRAME_LEN - (int)old_len) < 0) {
+        increase_stats_count(STAT_ABORT);
+        return XDP_ABORTED;
+    }
+
+    data = (__u8 *)(long)ctx->data;
+    data_end = (__u8 *)(long)ctx->data_end;
+
+    struct ethhdr *eth = (struct ethhdr *)data;
+    struct iphdr *out_iph = (struct iphdr *)(data + OUTER_ETH_LEN);
+    struct icmpv4_error *out_icmp =
+        (struct icmpv4_error *)(data + OUTER_ETH_LEN + sizeof(struct iphdr));
+
+    if ((void *)(eth + 1) > (void *)data_end ||
+        (void *)(out_iph + 1) > (void *)data_end ||
+        (void *)(out_icmp + 1) > (void *)data_end) {
+        increase_stats_count(STAT_ABORT);
+        return XDP_ABORTED;
+    }
+
+    write_lan_icmpv4_error(eth, out_iph, out_icmp, &quote, &fib, rel_type, rel_code,
+                           rel_extra);
+
+    increase_stats_count(STAT_TUNNEL_ICMP_RELAY);
+    return redirect_to_ifindex(fib.ifindex, STAT_REDIRECT_LAN);
+}
+
 static __always_inline int
 handle_xdp_dslite_decap(struct xdp_md *ctx)
 {
@@ -1795,6 +2171,31 @@ xdp_dslite_decap(struct xdp_md *ctx)
     if (outer_iph->nexthdr == IPPROTO_FRAGMENT && find_dslite_peer_nh(outer_iph)) {
         increase_stats_count(STAT_DECAP_REASM_PASS);
         return XDP_PASS;
+    }
+
+    /*
+     * An ICMPv6 error about a softwire packet we sent (RFC 2473 §8): relayed to
+     * the LAN client as an ICMPv4 error, and mined for the path MTU. Checked
+     * before the native-IPv6 branch below, which would otherwise XDP_PASS it as
+     * ordinary traffic addressed to the CPE -- anything this doesn't claim
+     * still takes exactly that path.
+     */
+    if (outer_iph->nexthdr == IPPROTO_ICMPV6) {
+        int relayed = handle_tunnel_icmpv6(ctx, l2_len, outer_iph, data_end);
+        if (relayed != TUNNEL_ICMP_NOT_MINE)
+            return relayed;
+        /*
+         * Nothing was touched on the path that returns NOT_MINE, but one of the
+         * other paths through that function calls bpf_xdp_adjust_tail, and the
+         * verifier merges them: every packet pointer derived before the call is
+         * a scalar to it from here on. Re-derive them.
+         */
+        data = (__u8 *)(long)ctx->data;
+        data_end = (__u8 *)(long)ctx->data_end;
+        if (parse_l2_ipv6(data, data_end, &l2_len, &outer_iph) != 1) {
+            increase_stats_count(STAT_DECAP_PASS);
+            return XDP_PASS;
+        }
     }
 
     if (outer_iph->nexthdr != IPPROTO_IPIP) {

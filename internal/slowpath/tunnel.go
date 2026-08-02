@@ -17,8 +17,9 @@
 //     decapsulates the result before it's forwarded to the LAN.
 //
 // It mirrors internal/wanextend.HostRoutes: one long-lived netlink socket,
-// opened at construction, single-writer (the caller drives it from one
-// goroutine), torn down on Close.
+// opened at construction, torn down on Close. Unlike that one it has more than
+// one caller (endpoints and MTU are driven by different goroutines), so its
+// mutating methods take a lock -- see Tunnel.
 package slowpath
 
 import (
@@ -27,6 +28,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"sync"
 
 	"golang.org/x/sys/unix"
 
@@ -43,20 +45,43 @@ const deviceName = "mm-dslite0"
 // piece still fits the WAN.
 const tunnelOverhead = 40
 
-// minTunnelMTU floors the tunnel MTU at the IPv6 minimum (1280), so a
-// pathologically small WAN MTU can't yield a nonsensical or negative one.
-const minTunnelMTU = 1280
+// minSoftwireMTU floors the *softwire* MTU at the IPv6 minimum (1280), so a
+// pathologically small WAN MTU -- or a learned path MTU that reports one --
+// can't yield a nonsensical or negative device MTU.
+const minSoftwireMTU = 1280
+
+// tunnelMTU derives the companion device's MTU from the softwire MTU: the inner
+// IPv4 it carries has to fit inside the outer IPv6 packet, so the device is the
+// softwire MTU less the encapsulation.
+//
+// The floor deliberately applies to the softwire MTU rather than to the result.
+// Flooring the result instead would hand the kernel a 1280-byte device MTU for a
+// path that just reported 1280 -- and every fragment the kernel then made would
+// leave as a 1320-byte outer packet the path can only drop again, which is
+// exactly the case a learned path MTU is most likely to be (1280 is the value
+// nested tunnels report, and learn_tunnel_pmtu floors its own readings there).
+func tunnelMTU(softwireMTU int) int {
+	return max(softwireMTU, minSoftwireMTU) - tunnelOverhead
+}
 
 // defaultRoute is the IPv4 destination the companion device carries: all of
 // them. The softwire is the B4's only IPv4 path.
 var defaultRoute = netip.PrefixFrom(netip.IPv4Unspecified(), 0)
 
 // Tunnel owns the companion ip6tnl device and the IPv4 default route pointing
-// at it. Not safe for concurrent use: the caller (cmd/minuteman's single
-// rediscovery owner, plus one-time startup) drives it from one goroutine.
+// at it.
+//
+// Its mutating methods serialize against each other. Two independent goroutines
+// legitimately drive this device -- cmd/minuteman's rediscovery owner repoints
+// its endpoints, and its path-MTU watcher resizes it -- and the netlink socket
+// underneath is a single-writer request/reply channel (one Send, one Recvfrom,
+// matched by an incrementing sequence number), so unsynchronized callers would
+// consume each other's ACKs and report failures for requests that in fact
+// succeeded.
 type Tunnel struct {
+	mu      sync.Mutex
 	sock    *netlink.Socket
-	mtu     int // tunnel device MTU (WAN MTU - tunnelOverhead)
+	mtu     int // tunnel device MTU (softwire MTU - tunnelOverhead)
 	ifindex int
 }
 
@@ -68,8 +93,7 @@ func New(wanMTU int) (*Tunnel, error) {
 	if err != nil {
 		return nil, err
 	}
-	mtu := max(wanMTU-tunnelOverhead, minTunnelMTU)
-	return &Tunnel{sock: sock, mtu: mtu}, nil
+	return &Tunnel{sock: sock, mtu: tunnelMTU(wanMTU)}, nil
 }
 
 // Ensure creates the companion ip6tnl for the (b4, aftr) softwire and installs
@@ -78,6 +102,9 @@ func New(wanMTU int) (*Tunnel, error) {
 // ip6_tunnel kernel module (EOPNOTSUPP) is a misconfiguration the operator must
 // see rather than a condition to silently degrade past.
 func (t *Tunnel) Ensure(b4, aftr netip.Addr) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	// Remove a stale device from a previous (crashed) run before the exclusive
 	// create below would collide with it. Absent is the normal case.
 	if ifi, err := net.InterfaceByName(deviceName); err == nil {
@@ -116,6 +143,9 @@ func (t *Tunnel) Ensure(b4, aftr netip.Addr) error {
 // path is already carrying whole packets on the new softwire, and only the
 // fragmentation slow path lags until the next successful update.
 func (t *Tunnel) SetEndpoints(b4, aftr netip.Addr) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	if t.ifindex == 0 {
 		return fmt.Errorf("slowpath: SetEndpoints before Ensure")
 	}
@@ -125,11 +155,42 @@ func (t *Tunnel) SetEndpoints(b4, aftr netip.Addr) error {
 	return nil
 }
 
+// SetSoftwireMTU re-derives the companion device's MTU from a new softwire MTU
+// -- the WAN device's own normally, or the smaller path MTU the datapath
+// learned from an ICMPv6 Packet Too Big about one of its own tunnel packets
+// (RFC 2473 §8). It matters because this device's MTU is what the kernel
+// fragments the inner IPv4 to on every fallback path: left at the WAN figure it
+// would keep handing the narrow path pieces it can only drop again.
+//
+// A no-op when the derived MTU is unchanged, and best-effort in the same sense
+// as SetEndpoints: the fast path has already adapted (encap clamps against the
+// same reading per packet), so a failure here only lags the fallback.
+func (t *Tunnel) SetSoftwireMTU(softwireMTU int) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.ifindex == 0 {
+		return fmt.Errorf("slowpath: SetSoftwireMTU before Ensure")
+	}
+	mtu := tunnelMTU(softwireMTU)
+	if mtu == t.mtu {
+		return nil
+	}
+	if err := t.sock.SetLinkMTU(t.ifindex, mtu); err != nil {
+		return fmt.Errorf("slowpath: setting %s MTU to %d: %w", deviceName, mtu, err)
+	}
+	t.mtu = mtu
+	return nil
+}
+
 // Close deletes the companion device (which takes its IPv4 default route with
 // it) and closes the netlink socket. The delete is best-effort: a device that
 // outlives the process is cleaned up by the next run's Ensure anyway, so a
 // failure here is logged, not returned (matching wanextend.HostRoutes.Remove).
 func (t *Tunnel) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	if t.ifindex != 0 {
 		if err := t.sock.DelLink(t.ifindex); err != nil {
 			log.Printf("slowpath: removing %s on shutdown: %v", deviceName, err)

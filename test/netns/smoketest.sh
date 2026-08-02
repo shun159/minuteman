@@ -172,6 +172,11 @@ if [[ -f "$SOFTWIRE_FRAG_ENABLED_FILE" && "$(cat "$SOFTWIRE_FRAG_ENABLED_FILE")"
     softwire_frag_enabled=1
 fi
 
+tunnel_icmp_enabled=0
+if [[ -f "$TUNNEL_ICMP_ENABLED_FILE" && "$(cat "$TUNNEL_ICMP_ENABLED_FILE")" == 1 ]]; then
+    tunnel_icmp_enabled=1
+fi
+
 pd_zero_timers=0
 if [[ -f "$PD_ZERO_TIMERS_FILE" && "$(cat "$PD_ZERO_TIMERS_FILE")" == 1 ]]; then
     pd_zero_timers=1
@@ -701,6 +706,138 @@ if [[ $dualstack_enabled -eq 1 ]]; then
         check "IPv6 software-RSS fanned native-IPv6 packets across CPUs (datapath IPv6RSSRedirect +$((ipv6_rss - ipv6_rss0)))" \
             test "$ipv6_rss" -gt "$ipv6_rss0"
     fi
+fi
+
+if [[ $tunnel_icmp_enabled -eq 1 && $started_minuteman -eq 1 ]]; then
+    echo "== Tunnel ICMPv6 relay (RFC 2473 §8): an ICMPv6 error about a softwire packet becomes an ICMPv4 error to the LAN client =="
+
+    # Runs after every other datapath section on purpose: the second half below
+    # leaves a learned softwire path MTU in force for 10 minutes
+    # (datapath.TunnelPMTUExpiry), which re-sizes the fragments the
+    # MM_SOFTWIRE_FRAG checks assert on.
+
+    wan_mac="$(ip netns exec "$NETNS_CPE" cat "/sys/class/net/$VETH_CPE_ISP/address")"
+    isp_mac="$(ip netns exec "$NETNS_ISP" cat "/sys/class/net/$VETH_ISP_CPE/address")"
+
+    # inject_tunnel_icmp <tag> <mode...> captures whatever ICMPv4 reaches the LAN
+    # client while one hand-crafted ICMPv6 error is sent to the B4 from the ISP
+    # side (as an intermediate router on the B4<->AFTR path would), leaving the
+    # capture in $tunnel_icmp_pcap for the caller to assert against.
+    inject_tunnel_icmp() {
+        local tag="$1"
+        shift
+        tunnel_icmp_pcap="$RUNDIR/tunnel-icmp-$tag.log"
+        ip netns exec "$NETNS_HOST" timeout 5 tcpdump -i "$VETH_HOST_CPE" -n icmp \
+            >"$tunnel_icmp_pcap" 2>/dev/null &
+        local td=$!
+        sleep 1
+        ip netns exec "$NETNS_ISP" python3 "$PWD/send-softwire-fragments.py" \
+            "$wan_mac" "$isp_mac" "$VETH_ISP_CPE" "${CORE_AFTR_ADDR%/*}" "${WAN_CPE_ADDR%/*}" "$@"
+        wait "$td" 2>/dev/null
+    }
+
+    relay0="$(read_stat TunnelICMPRelay)"
+    pmtu0="$(read_stat TunnelPMTU)"
+
+    # Packet Too Big about a DF packet: relayed as ICMPv4 Fragmentation Needed
+    # with the tunnel overhead taken off the reported MTU, sourced from the
+    # well-known B4 address rather than a LAN gateway address (RFC 6333 §5.7) --
+    # which is also what distinguishes minuteman's own relay from the kernel
+    # ip6tnl's, the only thing that answered these before.
+    #
+    # The MTU injected here is deliberately NOT CORE_NARROW_MTU: it is learned
+    # as a real path MTU too, so reusing that value would satisfy the second
+    # half's assertions below before the core link is even narrowed.
+    inject_tunnel_icmp ptb icmp6ptb "$INJECTED_PTB_MTU" df
+    check "an ICMPv6 Packet Too Big about a softwire packet is relayed as ICMPv4 Fragmentation Needed" \
+        bash -c "grep -q 'need to frag (mtu $((INJECTED_PTB_MTU - 40)))' '$RUNDIR/tunnel-icmp-ptb.log'"
+    check "the relayed ICMPv4 error uses the well-known 192.0.0.2 source (RFC 6333 §5.7)" \
+        bash -c "grep -q '192.0.0.2 > ${LAN_HOST_ADDR%/*}' '$RUNDIR/tunnel-icmp-ptb.log'"
+
+    # Hop limit expiring inside the tunnel: RFC 7915 §5.3 maps this to ICMPv4
+    # Time Exceeded. Asserted negatively too, since the kernel ip6tnl relays
+    # this one as Host Unreachable -- the wrong error entirely, and the reason
+    # this type is worth handling in the datapath at all.
+    inject_tunnel_icmp texc icmp6texc df
+    check "an ICMPv6 Time Exceeded about a softwire packet is relayed as ICMPv4 Time Exceeded" \
+        bash -c "grep -q 'time exceeded' '$RUNDIR/tunnel-icmp-texc.log'"
+    check "it is NOT relayed as Host Unreachable (what the kernel ip6tnl would have produced)" \
+        bash -c "! grep -q 'host .* unreachable' '$RUNDIR/tunnel-icmp-texc.log'"
+
+    inject_tunnel_icmp unreach icmp6unreach 1 df
+    check "an ICMPv6 Destination Unreachable (admin prohibited) is relayed as its ICMPv4 equivalent" \
+        bash -c "grep -q 'admin prohibited' '$RUNDIR/tunnel-icmp-unreach.log'"
+
+    relay="$(read_stat TunnelICMPRelay)"
+    check "the datapath counted the relays (TunnelICMPRelay +$((relay - relay0)))" \
+        test "$((relay - relay0))" -ge 3
+
+    # An ICMPv6 error quoting a softwire that is not this B4's must be ignored
+    # outright: believing one would let anyone on the IPv6 internet inject
+    # ICMPv4 errors into the LAN, or talk the B4 into a smaller path MTU.
+    relay0="$(read_stat TunnelICMPRelay)"
+    inject_tunnel_icmp bogus icmp6bogus "$INJECTED_PTB_MTU"
+    relay="$(read_stat TunnelICMPRelay)"
+    check "an ICMPv6 error quoting someone else's softwire is not relayed" \
+        bash -c "! grep -q 'unreachable' '$RUNDIR/tunnel-icmp-bogus.log'"
+    check "and is not counted as a relay (TunnelICMPRelay +$((relay - relay0)))" \
+        test "$relay" -eq "$relay0"
+
+    pmtu="$(read_stat TunnelPMTU)"
+    check "the softwire path MTU was learned from the Packet Too Big (TunnelPMTU +$((pmtu - pmtu0)))" \
+        test "$pmtu" -gt "$pmtu0"
+
+    # --- The same thing without hand-crafted packets: narrow the core link so a
+    # real router sends a real Packet Too Big about real traffic. The CPE's own
+    # WAN stays at 1500, so nothing local can see this -- learning it from the
+    # ICMPv6 error is the only way the fragmenter stops emitting fragments the
+    # path can only drop. ---
+    echo "-- a narrowed core link: real Packet Too Big, learned path MTU, re-sized fragments --"
+    ip netns exec "$NETNS_ISP" ip link set "$VETH_ISP_AFTR" mtu "$CORE_NARROW_MTU"
+    ip netns exec "$NETNS_AFTR" ip link set "$VETH_AFTR_ISP" mtu "$CORE_NARROW_MTU"
+    # Both caches would otherwise hide the narrowing: the client's from an
+    # earlier PMTUD signal, the CPE's from the kernel's own PMTU exception.
+    ip netns exec "$NETNS_HOST" ip route flush cache 2>/dev/null || true
+    ip netns exec "$NETNS_CPE" ip -6 route flush cache 2>/dev/null || true
+
+    frag_xdp0="$(read_stat EncapFragXDP)"
+    # The first oversized packet is still fragmented to the WAN's MTU and lost
+    # -- that loss is what produces the Packet Too Big -- so this is about what
+    # happens afterwards, not about this ping's own success.
+    ip netns exec "$NETNS_HOST" ping -M dont -s 1472 -c 2 -i 0.5 -W 2 \
+        -I "$VETH_HOST_CPE" "${PUBLIC_INET_ADDR%/*}" >/dev/null 2>&1 || true
+    # Give the userspace applier (cmd/minuteman's watchTunnelPMTU, a 2s tick)
+    # time to re-derive the fragment size and the companion device's MTU.
+    sleep 5
+
+    # Both of these can only be satisfied by the *real* Packet Too Big: the
+    # injected one above reported INJECTED_PTB_MTU, a different value, so
+    # neither the log line nor the device MTU below can already be there.
+    check "minuteman learned the narrowed softwire path MTU ($CORE_NARROW_MTU)" \
+        grep -q "softwire path MTU: $CORE_NARROW_MTU " "$RUNDIR/minuteman.log"
+    # WAN 1500 - 40 = 1460 before, CORE_NARROW_MTU - 40 after: the companion
+    # ip6tnl fragments the inner IPv4 on every fallback path, so it has to
+    # follow the same reading the fast path did.
+    check "the companion ip6tnl's MTU followed it ($((CORE_NARROW_MTU - 40)))" \
+        bash -c "ip netns exec $NETNS_CPE ip link show mm-dslite0 | grep -q 'mtu $((CORE_NARROW_MTU - 40))'"
+
+    # With the fragmenter re-sized, oversized traffic -- DF included, since this
+    # B4 fragments the outer IPv6 rather than signalling PMTUD (RFC 6333 §5.3 /
+    # errata 5847) -- crosses the narrowed path with no loss at all.
+    check "oversized non-DF traffic crosses the narrowed path once the MTU is learned" \
+        ip netns exec "$NETNS_HOST" ping -M dont -s 1472 -c 3 -W 2 -I "$VETH_HOST_CPE" "${PUBLIC_INET_ADDR%/*}"
+    check "oversized DF traffic does too (no PMTUD signal needed, DF ignored)" \
+        ip netns exec "$NETNS_HOST" ping -M do -s 1472 -c 3 -W 2 -I "$VETH_HOST_CPE" "${PUBLIC_INET_ADDR%/*}"
+
+    frag_xdp="$(read_stat EncapFragXDP)"
+    check "those packets were outer-fragmented in XDP, not handed to the kernel (EncapFragXDP +$((frag_xdp - frag_xdp0)))" \
+        test "$frag_xdp" -gt "$frag_xdp0"
+
+    # Restore the core link. The learned MTU stays in force for its own expiry
+    # (10 minutes), which only means smaller fragments than necessary until then.
+    ip netns exec "$NETNS_ISP" ip link set "$VETH_ISP_AFTR" mtu 1500
+    ip netns exec "$NETNS_AFTR" ip link set "$VETH_AFTR_ISP" mtu 1500
+    ip netns exec "$NETNS_HOST" ip route flush cache 2>/dev/null || true
 fi
 
 # Deliberately last: this is the one check that has to wait out a real timer

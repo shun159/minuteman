@@ -221,6 +221,16 @@ func (s *Socket) SetLinkUp(ifindex int) error {
 	return s.sendAndAck(buildSetLinkUpMessage(s.seq, ifindex), s.seq)
 }
 
+// SetLinkMTU sets ifindex's MTU. Used on the softwire slow path's companion
+// ip6tnl (internal/slowpath), whose MTU governs how the kernel fragments the
+// inner IPv4 on the fallback paths: once the datapath has learned a smaller
+// softwire path MTU from an ICMPv6 Packet Too Big, that device has to follow
+// or the fallback keeps producing packets the path drops.
+func (s *Socket) SetLinkMTU(ifindex, mtu int) error {
+	s.seq++
+	return s.sendAndAck(buildSetLinkMTUMessage(s.seq, ifindex, mtu), s.seq)
+}
+
 // DelLink deletes the network device ifindex (RTM_DELLINK).
 func (s *Socket) DelLink(ifindex int) error {
 	s.seq++

@@ -33,8 +33,30 @@
 #define IPPROTO_DSTOPTS 60
 #endif
 
+#ifndef ICMPV6_DEST_UNREACH
+#define ICMPV6_DEST_UNREACH 1
+#endif
+
 #ifndef ICMPV6_PKT_TOOBIG
 #define ICMPV6_PKT_TOOBIG 2
+#endif
+
+#ifndef ICMPV6_TIME_EXCEED
+#define ICMPV6_TIME_EXCEED 3
+#endif
+
+/* ICMPv6 Destination Unreachable codes (RFC 4443 §3.1) this datapath maps. */
+#ifndef ICMPV6_NOROUTE
+#define ICMPV6_NOROUTE 0
+#endif
+#ifndef ICMPV6_ADM_PROHIBITED
+#define ICMPV6_ADM_PROHIBITED 1
+#endif
+#ifndef ICMPV6_ADDR_UNREACH
+#define ICMPV6_ADDR_UNREACH 3
+#endif
+#ifndef ICMPV6_POLICY_FAIL
+#define ICMPV6_POLICY_FAIL 5
 #endif
 
 #ifndef IPV6_MIN_MTU
@@ -94,6 +116,26 @@ struct icmp_time_exceeded {
     (sizeof(struct iphdr) + sizeof(struct icmp_time_exceeded))
 
 /*
+ * The shape every ICMPv4 error shares: 4 header bytes, one type-specific 32-bit
+ * word (the next-hop MTU for Fragmentation Needed, unused/zero for the rest)
+ * and the quote. The two structs above name that word for their own type; this
+ * one is for the relay path (write_lan_icmpv4_error), which picks its type,
+ * code and word at runtime from an inbound ICMPv6 error and so can't be tied to
+ * a single one of them.
+ */
+struct icmpv4_error {
+    __u8 type;
+    __u8 code;
+    __u16 checksum;
+    __u32 extra;
+    struct ipv4_quote quote;
+};
+
+#define ICMPV4_ERROR_L3_LEN (sizeof(struct iphdr) + sizeof(struct icmpv4_error))
+/* Full L2 frame of a relayed ICMPv4 error: what the WAN frame is trimmed to. */
+#define ICMPV4_ERROR_FRAME_LEN (OUTER_ETH_LEN + ICMPV4_ERROR_L3_LEN)
+
+/*
  * The invoking-packet quote carried in an ICMPv6 Packet Too Big: the offending
  * IPv6 header plus 8 bytes past it. A fixed quote (like ipv4_quote) keeps the
  * reply a constant size; RFC 4443 only requires as much of the original as fits
@@ -116,6 +158,21 @@ struct icmpv6_pkt_too_big {
 
 #define ICMPV6_PTB_REPLY_L3_LEN                                                          \
     (sizeof(struct ipv6hdr) + sizeof(struct icmpv6_pkt_too_big))
+
+/*
+ * The fixed part of any *inbound* ICMPv6 error, for reading rather than
+ * writing: every error type shares these 8 bytes, and `extra` is the only
+ * type-specific one the relay path cares about (the MTU of a Packet Too Big;
+ * unused, and ignored here, for the rest). The quote follows, of a length the
+ * sender chose, so unlike the reply structs above this one deliberately
+ * describes only the header.
+ */
+struct icmpv6_error_hdr {
+    __u8 type;
+    __u8 code;
+    __u16 checksum;
+    __u32 extra;
+};
 
 static __always_inline __u16
 checksum_fold32(__u32 csum)
@@ -140,6 +197,19 @@ icmp_frag_needed_checksum(const struct icmp_frag_needed *icmp)
 
 static __always_inline __u16
 icmp_time_exceeded_checksum(const struct icmp_time_exceeded *icmp)
+{
+    __u32 csum = 0;
+    const __u16 *p = (const __u16 *)icmp;
+
+#pragma unroll
+    for (int i = 0; i < sizeof(*icmp) / 2; i++)
+        csum += (__u32)p[i];
+
+    return checksum_fold32(csum);
+}
+
+static __always_inline __u16
+icmpv4_error_checksum(const struct icmpv4_error *icmp)
 {
     __u32 csum = 0;
     const __u16 *p = (const __u16 *)icmp;
@@ -435,6 +505,46 @@ write_dslite_icmp_time_exceeded(struct ethhdr *eth, struct ipv6hdr *outer_iph,
     ipv4_checksum(icmp_iph);
 
     build_icmp_time_exceeded(&msg, quote);
+    __builtin_memcpy(icmp, &msg, sizeof(msg));
+}
+
+/*
+ * Writes a plain, *untunneled* ICMPv4 error toward the LAN, over a frame that
+ * arrived on the WAN. This is the RFC 2473 §8 relay's reply: the offending
+ * packet the inbound ICMPv6 error quoted was one this B4 sent on behalf of a
+ * LAN client, so unlike write_dslite_icmp_frag_needed's decap-path replies (the
+ * original sender is out on the IPv4 internet, reachable only through the
+ * softwire) the sender here is directly reachable and the reply must not be
+ * re-encapsulated. The source is still the well-known B4 address 192.0.0.2
+ * (RFC 6333 §5.7 / RFC 7335), the same as every other ICMPv4 error this
+ * datapath originates.
+ *
+ * The caller must have trimmed the frame to ICMPV4_ERROR_FRAME_LEN first and
+ * kept `quote` in its own storage: the bytes it was copied from are inside the
+ * region being overwritten here.
+ */
+static __always_inline void
+write_lan_icmpv4_error(struct ethhdr *eth, struct iphdr *iph, struct icmpv4_error *icmp,
+                       const struct ipv4_quote *quote, const struct bpf_fib_lookup *fib,
+                       __u8 type, __u8 code, __u32 extra)
+{
+    struct icmpv4_error msg = {};
+
+    __builtin_memcpy(eth->h_dest, fib->dmac, ETH_ALEN);
+    __builtin_memcpy(eth->h_source, fib->smac, ETH_ALEN);
+    eth->h_proto = bpf_htons(ETH_P_IP);
+
+    write_dslite_inner_icmp_iph(iph, quote);
+    iph->tot_len = bpf_htons((__u16)ICMPV4_ERROR_L3_LEN);
+    ipv4_checksum(iph);
+
+    msg.type = type;
+    msg.code = code;
+    msg.extra = bpf_htonl(extra);
+    msg.quote = *quote;
+    msg.checksum = 0;
+    msg.checksum = icmpv4_error_checksum(&msg);
+
     __builtin_memcpy(icmp, &msg, sizeof(msg));
 }
 
