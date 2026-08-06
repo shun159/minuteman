@@ -49,6 +49,19 @@ struct b4_config {
      * the ip6tnl rather than blackhole into a rejected enqueue.
      */
     __u32 frag_max_inner;
+    /*
+     * Largest TCP MSS a SYN crossing the softwire may advertise (see
+     * clamp_tcp_mss); 0 disables clamping entirely.
+     *
+     * Derived by userspace from the same softwire MTU that gives frag_unit its
+     * value, rather than from the encap path's own per-packet effective MTU,
+     * even though encap has that figure right there: an MSS only ever affects
+     * connections that have yet to send their SYN, so being a poll interval
+     * behind a newly learned path MTU costs nothing, and one value keeps both
+     * directions clamping to the same figure -- the decap side has no local MTU
+     * of its own to derive one from.
+     */
+    __u32 mss_clamp;
 };
 
 /*
@@ -386,6 +399,7 @@ enum stat_id {
                              * Packet Too Big, whose answer is to fragment at the
                              * learned MTU), or RFC 1812 §4.3.2.7 forbids one */
     STAT_TUNNEL_PMTU,       /* softwire path MTU learned from a Packet Too Big */
+    STAT_MSS_CLAMPED,       /* TCP SYN whose advertised MSS was lowered (clamp_tcp_mss) */
     STAT_MAX,
 };
 
@@ -1338,6 +1352,16 @@ xdp_dslite_encap(struct xdp_md *ctx)
     if (learned_mtu != 0 && learned_mtu < eff_mtu)
         eff_mtu = learned_mtu;
 
+    /*
+     * Clamp before the fragmentation branch, not after: a SYN is small enough
+     * that it never reaches encap_fragment_outer itself, and clamping it is
+     * precisely what keeps the *rest* of this connection from getting there.
+     * The rewrite is safe across the bpf_xdp_adjust_head below -- that only
+     * moves where the frame starts, leaving the bytes themselves in place.
+     */
+    if (cfg->mss_clamp != 0 && clamp_tcp_mss(inner_iph, data_end, (__u16)cfg->mss_clamp))
+        increase_stats_count(STAT_MSS_CLAMPED);
+
     if (ret == BPF_MTU_CHK_RET_FRAG_NEEDED || TUNNEL_L3_OVERHEAD + inner_len > eff_mtu)
         /*
          * Too big for the softwire once encapsulated: encapsulate whole and
@@ -2026,6 +2050,18 @@ handle_xdp_dslite_decap(struct xdp_md *ctx)
      */
     if (mig_state(ctrl_decap) != MIG_STEADY)
         touch_flow_affinity(ctrl_decap, inner_iph_pre, data_end, true);
+
+    /*
+     * The SYN a remote peer sends back through the softwire announces what *it*
+     * will accept, which is what bounds the segments the LAN client then sends
+     * into the softwire -- so this direction is clamped too, and for the encap
+     * side's benefit rather than this one's (see clamp_tcp_mss). Done here, on
+     * the still-encapsulated packet, so it applies equally to the slow paths
+     * below that hand the frame to the kernel instead of decapping it in XDP.
+     */
+    if (cfg->mss_clamp != 0 &&
+        clamp_tcp_mss(inner_iph_pre, data_end, (__u16)cfg->mss_clamp))
+        increase_stats_count(STAT_MSS_CLAMPED);
 
     struct ethhdr old_eth = *(struct ethhdr *)data;
 

@@ -50,6 +50,7 @@ const (
 	statTunnelICMPPass
 	statTunnelICMPDrop
 	statTunnelPMTU
+	statMSSClamped
 	statMax
 )
 
@@ -117,6 +118,8 @@ func sumStats(m *ebpf.Map) (Stats, error) {
 		statTunnelICMPPass:  &s.TunnelICMPPass,
 		statTunnelICMPDrop:  &s.TunnelICMPDrop,
 		statTunnelPMTU:      &s.TunnelPMTU,
+
+		statMSSClamped: &s.MSSClamped,
 	}
 
 	for id, dst := range fields {

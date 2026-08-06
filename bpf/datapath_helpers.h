@@ -254,6 +254,139 @@ decrease_ipv4_ttl(struct iphdr *iph)
     iph->ttl -= 1;
 }
 
+/*
+ * Replace one 16-bit word covered by an Internet checksum, updating the
+ * checksum incrementally (RFC 1624 eqn. 3, the kernel's own
+ * inet_proto_csum_replace2). Everything stays in network byte order:
+ * one's-complement addition is order-agnostic as long as the folded result is
+ * interpreted the same way it was built.
+ *
+ * XDP has no bpf_l4_csum_replace (that is a __sk_buff helper), so a datapath
+ * that rewrites an L4-covered field must do this itself.
+ */
+static __always_inline void
+csum_replace16(__sum16 *csum, __u16 old, __u16 replacement)
+{
+    __u32 sum = (__u32)(__u16) ~(*csum) + (__u32)(__u16)~old + (__u32)replacement;
+
+    *csum = (__sum16)checksum_fold32(sum);
+}
+
+#define TCP_OPT_EOL 0
+#define TCP_OPT_NOP 1
+#define TCP_OPT_MSS 2
+#define TCP_OPT_MSS_LEN 4
+
+/*
+ * The most TCP options walked looking for MSS. The option area is at most 40
+ * bytes and MSS is conventionally first or nearly so; a bound is required
+ * regardless (the verifier has no other way to bound the walk), and one that
+ * stops a few options short only means the rare pathological SYN goes
+ * unclamped -- the fragmenter still covers it.
+ */
+#define MAX_TCP_OPTIONS 10
+
+/*
+ * TCP MSS clamping: lower the MSS a TCP SYN advertises so the peer never sends
+ * a segment the softwire would have to fragment.
+ *
+ * This is not something any RFC requires -- it is the middlebox workaround RFC
+ * 4459 §3 lists among the four ways to deal with a tunnel's reduced MTU, and it
+ * rewrites traffic the CPE is only forwarding. It earns its place here for two
+ * reasons neither of which is protocol conformance: path MTU discovery fails
+ * outright wherever the ICMP it depends on is filtered, and TCP is the bulk of
+ * the traffic that would otherwise land on the in-XDP fragmenter's comparatively
+ * expensive clone-and-trim path (encap_fragment_outer).
+ *
+ * The MSS option is an announcement of what the *sender of the SYN* is willing
+ * to receive, so the two directions cross over: clamping a SYN leaving the LAN
+ * bounds what arrives through the softwire, and clamping one arriving from the
+ * AFTR bounds what the LAN client sends into it. Both entry points therefore
+ * call this, and both accept any SYN (with or without ACK) rather than just the
+ * connection-initiating one.
+ *
+ * Returns true only when a value was actually rewritten. An advertised MSS
+ * already at or below the clamp is left alone: this may only ever lower what an
+ * endpoint asked for, never raise it.
+ */
+static __always_inline bool
+clamp_tcp_mss(struct iphdr *iph, void *data_end, __u16 clamp)
+{
+    if (iph->protocol != IPPROTO_TCP || iph->ihl != 5)
+        return false;
+
+    /*
+     * Only the first fragment carries the TCP header; a later one holds option
+     * bytes this can neither locate nor checksum against.
+     */
+    if ((iph->frag_off & bpf_htons(IP_OFFSET)) != 0)
+        return false;
+
+    struct tcphdr *th = (struct tcphdr *)((__u8 *)iph + sizeof(*iph));
+    if ((void *)(th + 1) > data_end)
+        return false;
+
+    /* RST wins over every option on a SYN+RST; nothing will read the MSS. */
+    if (!th->syn || th->rst)
+        return false;
+
+    __u32 doff = (__u32)th->doff * 4;
+    if (doff <= sizeof(*th) || doff > 60)
+        return false;
+
+    __u32 off = sizeof(*th);
+
+    /*
+     * Left as a real loop rather than unrolled (clang declines to unroll it
+     * anyway, the paths through one iteration differing too much): the trip
+     * count is a compile-time constant and every packet access inside is bounds
+     * checked, which is all the verifier's bounded-loop support asks for.
+     */
+    for (int i = 0; i < MAX_TCP_OPTIONS; i++) {
+        /* off < doff <= 60 from here on, which is what bounds the pointer
+         * arithmetic below for the verifier. */
+        if (off >= doff)
+            break;
+
+        __u8 *opt = (__u8 *)th + off;
+        if ((void *)(opt + 1) > data_end)
+            break;
+
+        __u8 kind = opt[0];
+        if (kind == TCP_OPT_EOL)
+            break;
+        if (kind == TCP_OPT_NOP) {
+            off += 1;
+            continue;
+        }
+
+        if (off + 2 > doff || (void *)(opt + 2) > data_end)
+            break;
+        __u8 optlen = opt[1];
+        /* A length below 2 can't advance the walk: malformed, stop. */
+        if (optlen < 2 || off + optlen > doff)
+            break;
+
+        if (kind == TCP_OPT_MSS && optlen == TCP_OPT_MSS_LEN) {
+            if ((void *)(opt + TCP_OPT_MSS_LEN) > data_end)
+                break;
+
+            __u16 *mss = (__u16 *)(opt + 2);
+            if (bpf_ntohs(*mss) <= clamp)
+                return false;
+
+            __u16 clamped = bpf_htons(clamp);
+            csum_replace16(&th->check, *mss, clamped);
+            *mss = clamped;
+            return true;
+        }
+
+        off += optlen;
+    }
+
+    return false;
+}
+
 static __always_inline bool
 ipv6_addr_equal(const struct in6_addr *a, const struct in6_addr *b)
 {

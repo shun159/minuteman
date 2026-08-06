@@ -147,7 +147,9 @@ talk the B4 into a smaller path MTU. Second, for real: it narrows the ISP↔AFTR
 leaving the CPE's own WAN at 1500 — so nothing local can see the narrowing and learning it from the
 resulting Packet Too Big is the only way the fragmenter stops emitting fragments the path can only drop —
 and asserts minuteman learns that path MTU (`TunnelPMTU`, and the log line `softwire path MTU: 1400`),
-re-sizes the companion `ip6tnl` to match (1360), and then carries oversized non-DF **and** DF traffic
+re-sizes the companion `ip6tnl` to match (1360), re-derives the automatic TCP MSS clamp from it (a
+connection opened after the narrowing offers `mss 1320`, the third consumer of a learned reading), and then
+carries oversized non-DF **and** DF traffic
 across the narrowed path with no loss and no PMTUD signal at all, still via the in-XDP fragmenter
 (`EncapFragXDP`), before restoring the link. It runs as the last datapath section on purpose: a learned
 path MTU stays in force for ten minutes (`datapath.TunnelPMTUExpiry`), which would re-size the fragments
@@ -199,9 +201,14 @@ kernel without a matching module directory (`uname -r` disagrees with what's on 
 
 ## Verified-passing combinations
 
-The full smoketest (AFTR discovery, LAN IPv6 reachability, LAN IPv4 provisioning, and the DS-Lite data path
+The full smoketest (AFTR discovery, LAN IPv6 reachability, LAN IPv4 provisioning, TCP MSS clamping, and the
+DS-Lite data path
 end-to-end through the AFTR's decap+NAPT44 to the simulated internet and back, ICMP and TCP) has been
 verified passing from a fresh setup for:
+- the default combination (`dhcpv6` AFTR discovery + `dhcpv6-pd`, no toggles), which is also where TCP MSS
+  clamping is asserted unconditionally: the LAN client's SYN reaching the AFTR and the remote's SYN-ACK
+  reaching the LAN client both advertising `mss 1420` (the rig's 1500 WAN MTU less 40 + 40), the connection
+  completing (so the hand-rolled TCP checksum fixup is right), and `MSSClamped` advancing once per direction
 - `MM_AFTR_DISCOVERY=dhcpv6`/`hb46pp` (both against the `dhcpv6-pd` WAN model)
 - `MM_WAN_MODEL=dhcpv6-pd`/`ndproxy` (both against `dhcpv6` AFTR discovery)
 - `MM_DNS_PROXY=1`
@@ -223,7 +230,8 @@ verified passing from a fresh setup for:
   three injected error types relayed with the right ICMPv4 type and the `192.0.0.2` source, a bogus quote
   ignored, and the narrowed-core-link half end-to-end — the learned path MTU applied to both the
   fragmenter (fragments confirmed on the ISP link as `frag (0|1352)` + `frag (1352|148)`, i.e. outer
-  packets of 1400 and 196) and the companion `ip6tnl`, with oversized DF and non-DF pings then at 0% loss
+  packets of 1400 and 196), the companion `ip6tnl`, and the automatic TCP MSS clamp (a connection opened
+  after the narrowing offering `mss 1320`), with oversized DF and non-DF pings then at 0% loss
 - `MM_PD_ZERO_TIMERS=1` (against `dhcpv6` AFTR discovery + `dhcpv6-pd`): Kea delegating with `T1 = T2 = 0`,
   minuteman deriving 65s/104s from the 130s preferred lifetime and renewing exactly once on that timer
   within an 85s window (Kea logging the single `RENEW`, the prefix unchanged across it). Re-run after the
