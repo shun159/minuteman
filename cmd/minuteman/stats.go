@@ -78,6 +78,7 @@ func runStats(args []string) error {
 		{"TunnelICMPPass", stats.TunnelICMPPass},
 		{"TunnelICMPDrop", stats.TunnelICMPDrop},
 		{"TunnelPMTU", stats.TunnelPMTU},
+		{"MSSClamped", stats.MSSClamped},
 	} {
 		fmt.Printf("%s: %d\n", c.name, c.value)
 	}

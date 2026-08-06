@@ -52,6 +52,7 @@ func (l *Loader) SetB4Config(cfg B4Config) error {
 	if cfg.FragMaxInner > 0 {
 		val.FragMaxInner = uint32(cfg.FragMaxInner)
 	}
+	val.MssClamp = l.resolveMSSClamp(cfg.TCPMSSClamp, cfg.WANMTU)
 	// val.B4Addr/AftrAddr are intentionally left zero: the datapath reads
 	// the softwire addresses from the active next_hop slot, not from here
 	// (see resolve_softwire in bpf/datapath.bpf.c).

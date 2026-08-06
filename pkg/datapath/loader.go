@@ -19,6 +19,11 @@ type Loader struct {
 	wanIfindex uint32
 	lanLinks   map[uint32]link.Link
 	fragLinks  []link.Link
+
+	// mssClampAuto records that b4_config.mss_clamp was derived from the
+	// softwire MTU rather than pinned by the caller, so SetSoftwireMTU knows
+	// whether a newly learned path MTU may move it (see resolveMSSClamp).
+	mssClampAuto bool
 }
 
 // Load compiles-in objects (embedded at build time by bpf2go) and loads them

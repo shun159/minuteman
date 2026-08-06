@@ -59,19 +59,20 @@ func (l *Loader) clearTunnelPMTU(slot uint32) error {
 	return nil
 }
 
-// SetSoftwireMTU updates the in-XDP fragmenter's per-fragment payload size
-// (b4_config.frag_unit) to what fits the given softwire MTU -- the WAN device's
-// own MTU normally, or the smaller path MTU learned from an ICMPv6 Packet Too
-// Big (see TunnelPMTU). Everything else in b4_config is preserved.
+// SetSoftwireMTU updates what the datapath derives from the softwire MTU -- the
+// WAN device's own MTU normally, or the smaller path MTU learned from an ICMPv6
+// Packet Too Big (see TunnelPMTU): the in-XDP fragmenter's per-fragment payload
+// size (b4_config.frag_unit) and, when the caller asked for TCPMSSClampAuto, the
+// TCP MSS clamp. Everything else in b4_config is preserved.
 //
-// This is the only field of b4_config written after startup. The datapath reads
-// the struct field by field rather than as a snapshot, so a packet in flight
-// can read the new frag_unit beside the old value of another field; that is
-// harmless here precisely because no other field changes. What it must NOT do
-// is derive frag_unit in the datapath itself: encap_fragment_outer and the
-// xdp_softwire_frag<i> programs read it at different moments for the same
-// packet, and a value that changed in between would produce a fragment set
-// that can never reassemble.
+// These are the only fields of b4_config written after startup. The datapath
+// reads the struct field by field rather than as a snapshot, so a packet in
+// flight can read a new value beside the old value of another field; that is
+// harmless here because the two that move are read independently of everything
+// else. What it must NOT do is derive frag_unit in the datapath itself:
+// encap_fragment_outer and the xdp_softwire_frag<i> programs read it at
+// different moments for the same packet, and a value that changed in between
+// would produce a fragment set that can never reassemble.
 func (l *Loader) SetSoftwireMTU(mtu int) error {
 	key := uint32(0)
 	var val bpfB4Config
@@ -80,6 +81,9 @@ func (l *Loader) SetSoftwireMTU(mtu int) error {
 	}
 
 	val.FragUnit = softwireFragUnit(mtu)
+	if l.mssClampAuto {
+		val.MssClamp = autoTCPMSSClamp(mtu)
+	}
 
 	if err := l.objs.B4ConfigMap.Put(&key, &val); err != nil {
 		return fmt.Errorf("setting softwire MTU %d: %w", mtu, err)

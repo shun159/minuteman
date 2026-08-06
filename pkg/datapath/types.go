@@ -33,6 +33,14 @@ type B4Config struct {
 	// can carry a clone of); larger packets fall back to the kernel ip6tnl.
 	// Zero disables in-XDP fragmentation like a zero WANMTU does.
 	FragMaxInner int
+
+	// TCPMSSClamp bounds the MSS a TCP SYN crossing the softwire may
+	// advertise, in either direction (see clamp_tcp_mss in
+	// bpf/datapath_helpers.h). TCPMSSClampAuto derives it from the softwire
+	// MTU and keeps it in step with a learned path MTU; a positive value
+	// pins it; zero turns clamping off, leaving oversized segments to path
+	// MTU discovery and the fragmenter.
+	TCPMSSClamp int
 }
 
 // LANConfig is the per-LAN-interface configuration keyed by interface index.
@@ -120,4 +128,9 @@ type Stats struct {
 	TunnelICMPPass  uint64
 	TunnelICMPDrop  uint64
 	TunnelPMTU      uint64
+
+	// MSSClamped counts TCP SYNs whose advertised MSS the datapath actually
+	// lowered, in either direction (a SYN already advertising a small enough
+	// MSS is left alone and not counted). See TCPMSSClamp above.
+	MSSClamped uint64
 }

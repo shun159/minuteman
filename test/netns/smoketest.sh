@@ -7,7 +7,10 @@
 # the HB46PP TXT-record + provisioning-server fallback. And spot-checks LAN
 # IPv6 reachability in whichever WAN model setup.sh built the rig for (see
 # its MM_WAN_MODEL notes): DHCPv6-PD SLAAC from a delegated prefix, or
-# RFC 4389 NDProxy extending the WAN's own SLAAC prefix onto the LAN. If
+# RFC 4389 NDProxy extending the WAN's own SLAAC prefix onto the LAN. TCP MSS
+# clamping is checked unconditionally (it is on by default and needs no rig
+# topology of its own): both directions of a SYN exchange are captured and the
+# advertised MSS compared against what the rig's WAN MTU implies. If
 # setup.sh was run with MM_DNS_PROXY=1, also spot-checks minuteman's DNS
 # proxy (RFC 6333's B4 SHOULD); if with MM_DHCPV4=1, has mm-host acquire its
 # IPv4 lease from minuteman's DHCPv4 server (RFC 2131) and checks it; if with
@@ -432,6 +435,60 @@ check "LAN client can reach a TCP service on the simulated internet host" \
 wait "$nc_pid" 2>/dev/null
 
 if [[ $started_minuteman -eq 1 ]]; then
+    echo "== TCP MSS clamping: neither end offers segments the softwire would have to fragment =="
+
+    # Both directions are asserted because the MSS option announces what its
+    # *sender* will receive: the LAN client's SYN bounds what arrives through
+    # the softwire, the remote's SYN-ACK bounds what the LAN client sends into
+    # it, and the two are clamped by different programs (encap and decap).
+    #
+    # The expected value is derived, not hardcoded, so it stays right if the rig's
+    # WAN MTU changes: minuteman's automatic clamp is the softwire MTU less the
+    # 40-byte outer IPv6 header and the 40 bytes of option-free IPv4 + TCP header
+    # an MSS excludes (see pkg/datapath's autoTCPMSSClamp).
+    mss_clamped0="$(read_stat MSSClamped)"
+    mss_wan_mtu="$(ip netns exec "$NETNS_CPE" cat "/sys/class/net/$VETH_CPE_ISP/mtu")"
+    expected_mss=$((mss_wan_mtu - 80))
+    mss_syn_pcap="$RUNDIR/mss-clamp-outbound.log"
+    mss_synack_pcap="$RUNDIR/mss-clamp-inbound.log"
+
+    # The outbound SYN as the AFTR sees it once decapsulated, and the inbound
+    # SYN-ACK as the LAN client sees it. Port 8081 rather than the 8080 used
+    # above so neither capture can be consumed by a retransmit of that
+    # connection; -c 1 on the AFTR side is safe because the SYN is by definition
+    # the first packet of the connection to reach it.
+    ip netns exec "$NETNS_AFTR" timeout 8 tcpdump -i "$AFTR_TUN" -n -vv -c 1 \
+        "tcp port 8081" >"$mss_syn_pcap" 2>/dev/null &
+    mss_syn_td=$!
+    ip netns exec "$NETNS_HOST" timeout 8 tcpdump -i "$VETH_HOST_CPE" -n -vv -c 1 \
+        "tcp port 8081 and tcp[tcpflags] & (tcp-syn|tcp-ack) == (tcp-syn|tcp-ack)" \
+        >"$mss_synack_pcap" 2>/dev/null &
+    mss_synack_td=$!
+    sleep 1
+
+    ip netns exec "$NETNS_INET" bash -c \
+        "printf 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok' | timeout 5 nc -l -p 8081 -q1" &
+    nc_pid=$!
+    sleep 0.3
+    # A completed request is also the checksum assertion: XDP has no
+    # bpf_l4_csum_replace, so the rewrite fixes up the TCP checksum by hand
+    # (csum_replace16), and getting that wrong drops the SYN at the far end.
+    check "a TCP connection still completes end-to-end with the MSS rewritten" \
+        ip netns exec "$NETNS_HOST" curl -sf --max-time 4 "http://${PUBLIC_INET_ADDR%/*}:8081/"
+    wait "$nc_pid" 2>/dev/null
+    wait "$mss_syn_td" 2>/dev/null
+    wait "$mss_synack_td" 2>/dev/null
+
+    mss_clamped="$(read_stat MSSClamped)"
+    check "the LAN client's SYN reaches the AFTR advertising mss $expected_mss (encap side)" \
+        grep -q "mss $expected_mss" "$mss_syn_pcap"
+    check "the remote's SYN-ACK reaches the LAN client advertising mss $expected_mss (decap side)" \
+        grep -q "mss $expected_mss" "$mss_synack_pcap"
+    check "the datapath counted a clamp in each direction (MSSClamped +$((mss_clamped - mss_clamped0)))" \
+        test "$((mss_clamped - mss_clamped0))" -ge 2
+fi
+
+if [[ $started_minuteman -eq 1 ]]; then
     echo "== Tunnel-originated ICMPv4 (RFC 1812 §5.3.1, RFC 6333 §5.7): B4 replies through the softwire =="
 
     # Runs after the checks above on purpose: the decap only answers Time
@@ -832,6 +889,27 @@ if [[ $tunnel_icmp_enabled -eq 1 && $started_minuteman -eq 1 ]]; then
     frag_xdp="$(read_stat EncapFragXDP)"
     check "those packets were outer-fragmented in XDP, not handed to the kernel (EncapFragXDP +$((frag_xdp - frag_xdp0)))" \
         test "$frag_xdp" -gt "$frag_xdp0"
+
+    # The third consumer of a learned path MTU, alongside the fragmenter and the
+    # ip6tnl above: the automatic TCP MSS clamp tracks it too, so connections
+    # opened after the narrowing offer segments the narrowed path can carry.
+    # Only new connections, by nature -- an MSS is negotiated once, in the SYN.
+    narrow_mss=$((CORE_NARROW_MTU - 80))
+    narrow_mss_pcap="$RUNDIR/mss-clamp-narrowed.log"
+    ip netns exec "$NETNS_AFTR" timeout 8 tcpdump -i "$AFTR_TUN" -n -vv -c 1 \
+        "tcp port 8082" >"$narrow_mss_pcap" 2>/dev/null &
+    narrow_mss_td=$!
+    sleep 1
+    ip netns exec "$NETNS_INET" bash -c \
+        "printf 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok' | timeout 5 nc -l -p 8082 -q1" &
+    narrow_mss_nc=$!
+    sleep 0.3
+    ip netns exec "$NETNS_HOST" curl -sf --max-time 4 \
+        "http://${PUBLIC_INET_ADDR%/*}:8082/" >/dev/null
+    wait "$narrow_mss_nc" 2>/dev/null
+    wait "$narrow_mss_td" 2>/dev/null
+    check "the TCP MSS clamp followed the learned path MTU too (mss $narrow_mss)" \
+        grep -q "mss $narrow_mss" "$narrow_mss_pcap"
 
     # Restore the core link. The learned MTU stays in force for its own expiry
     # (10 minutes), which only means smaller fragments than necessary until then.

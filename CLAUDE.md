@@ -70,6 +70,16 @@ further down — this is just the index of what exists and which flag turns it o
   fragmenter's two halves read `frag_unit` at different moments and a value that changed in between would
   produce an unreassemblable fragment set. A Packet Too Big about a *non-DF* packet is consumed rather than
   relayed: the answer there is to fragment at the learned MTU, not to push the problem back.
+- **TCP MSS clamping** (`-tcp-mss-clamp`, default `auto`) — a TCP SYN crossing the softwire has its
+  advertised MSS lowered in XDP (`clamp_tcp_mss`) to what the softwire can carry, so TCP never offers
+  segments the fragmenter would have to carve up. Not an RFC requirement — it's the middlebox workaround
+  RFC 4459 §3 lists among the four tunnel-MTU strategies, and it rewrites forwarded traffic — but it earns
+  its keep twice: PMTUD fails outright wherever the ICMP it depends on is filtered, and TCP is the bulk of
+  what would otherwise land on the comparatively expensive clone-and-trim fragmenter. Applied on **both**
+  paths, since the MSS option announces what its own *sender* will receive: encap clamps the LAN client's
+  SYN (bounding what arrives through the softwire) and decap clamps the remote's SYN-ACK (bounding what the
+  LAN client sends into it). Only ever lowers a value, never raises one. `auto` derives the clamp from the
+  softwire MTU and tracks a learned path MTU; an explicit MSS pins it; `off` disables it.
 - **Tunnel-originated ICMPv4** (always on; RFC 1812 §5.3.1 + §4.3.2.7, RFC 6333 §5.7 / RFC 7335) — the
   ICMPv4 errors the B4 itself originates back through the softwire (Fragmentation Needed on the decap
   path, and now Time Exceeded for an inner TTL that expires *inbound*, `STAT_ICMP_TIME_EXCEEDED`) are
@@ -201,8 +211,11 @@ orphaned the running kernel's module directory — reboot to fix that).
     fragments the *inner* IPv4 — reachability only; see `internal/slowpath`) for the cases the fragmenter
     can't take. An in-MTU packet is instead wrapped in an outer
     Ethernet+IPv6(nexthdr=`IPPROTO_IPIP`) header and redirects it out the WAN ifindex via the `tx_ports`
-    `DEVMAP_HASH`. Native IPv6 arriving here (a LAN client's IPv6 transit traffic) is *not* IPv4, so instead
-    of being encapsulated it takes the native-IPv6 forwarding fastpath (`handle_ipv6_forward`, see below).
+    `DEVMAP_HASH`. A TCP SYN gets its advertised MSS clamped (`clamp_tcp_mss`) on the way past, *before* the
+    fragmentation branch — a SYN is never itself oversized, and clamping it is what keeps the rest of that
+    connection out of the fragmenter. Native IPv6 arriving here (a LAN client's IPv6 transit traffic) is
+    *not* IPv4, so instead of being encapsulated it takes the native-IPv6 forwarding fastpath
+    (`handle_ipv6_forward`, see below).
   - `encap_fragment_outer` + `emit_softwire_fragment`/`xdp_softwire_frag0..3` (`SEC("xdp")`) — in-XDP
     softwire fragmentation (RFC 6333 §5.3). XDP emits exactly one frame per input frame, so the fragments
     are made by cloning: `encap_fragment_outer` encapsulates the oversized inner IPv4 once behind outer
@@ -235,7 +248,10 @@ orphaned the running kernel's module directory — reboot to fix that).
     small — replies with an ICMPv4 Fragmentation-Needed re-encapsulated back through the softwire for a DF
     inner packet (`send_dslite_icmp_frag_needed`, since the original IPv4 sender is only reachable via the
     AFTR), or `XDP_PASS`es the still-encapsulated non-DF packet to the companion ip6tnl to decap and
-    IPv4-fragment toward the LAN (`STAT_DECAP_FRAG_SLOW`). An inner packet whose TTL expires here is
+    IPv4-fragment toward the LAN (`STAT_DECAP_FRAG_SLOW`). A TCP SYN is MSS-clamped here too
+    (`clamp_tcp_mss`), on the still-encapsulated packet so the slow paths get it as well — the *encap*
+    direction is what that clamp protects, since the SYN-ACK arriving from the AFTR announces what the
+    remote will receive and so bounds what the LAN client sends into the softwire. An inner packet whose TTL expires here is
     answered the same way, with a softwire-encapsulated ICMPv4 Time Exceeded
     (`send_dslite_icmp_time_exceeded`, `STAT_ICMP_TIME_EXCEEDED`, RFC 1812 §5.3.1). Both of these ICMPv4
     errors are sourced from the well-known B4 address `192.0.0.2` (RFC 6333 §5.7 / RFC 7335), are
@@ -322,7 +338,12 @@ orphaned the running kernel's module directory — reboot to fix that).
     (`write_icmpv6_pkt_too_big`, whose `icmpv6_checksum` covers the IPv6 pseudo-header, unlike ICMPv4's).
     `icmp_error_eligible` is the shared RFC 1812 §4.3.2.7 gate every originated ICMPv4 error runs through
     (non-initial fragment / ICMP error / non-unicast source → don't answer), distinct from
-    `icmp_error_allowed()`'s rate limiting in `datapath.bpf.c`.
+    `icmp_error_allowed()`'s rate limiting in `datapath.bpf.c`. Also `clamp_tcp_mss` (the TCP MSS clamp both
+    the encap and decap paths call) and the `csum_replace16` it needs — XDP has no `bpf_l4_csum_replace`
+    (that's a `__sk_buff` helper), so an L4-covered field rewritten here fixes up the TCP checksum by hand
+    (RFC 1624 eqn. 3). Its option walk is a real bounded loop, not `#pragma unroll`: clang declines to
+    unroll it, and the verifier's bounded-loop support carries it since the trip count is constant and every
+    packet access inside is bounds-checked.
   - **`bpf/uapi/linux/*.h`** — vendored kernel UAPI headers providing `#define` constants (`ETH_P_*`, `IP_DF`,
     `ICMP_*`) that the BTF-derived `bpf/vmlinux.h` (struct/union/enum definitions only, no macros) doesn't
     carry. `vmlinux.h` and these uapi headers are complementary: struct/type layouts come from BTF, numeric
@@ -346,7 +367,17 @@ orphaned the running kernel's module directory — reboot to fix that).
   - `config.go` — `SetB4Config(B4Config)`, `SetLANConfig(ifindex uint32, LANConfig)`; also registers each
     attached ifindex as a valid `bpf_redirect_map()` target in `tx_ports` (self-mapped ifindex → ifindex).
     `SetB4Config` derives the softwire fragmenter's `frag_unit` from `B4Config.WANMTU` (`softwireFragUnit`
-    in `frag.go`: largest multiple of 8 ≤ WAN MTU − 48) and passes `FragMaxInner` through.
+    in `frag.go`: largest multiple of 8 ≤ WAN MTU − 48) and passes `FragMaxInner` through, and resolves
+    `B4Config.TCPMSSClamp` into `b4_config.mss_clamp` (`mss.go`).
+  - `mss.go` — the TCP MSS clamp policy: `TCPMSSClampAuto` derives the clamp from the softwire MTU
+    (`autoTCPMSSClamp`: MTU − 40 outer IPv6 − 40 option-free IPv4+TCP, per RFC 6691's rule that options
+    aren't deducted; below `minTCPMSSClamp` = 536 it disables itself rather than push peers under RFC 1122
+    §4.2.2.6's floor), a positive value pins it, zero disables it. `resolveMSSClamp` records which of those
+    the caller chose on the `Loader`, so `SetSoftwireMTU` knows whether a newly learned path MTU may move
+    it. Deliberately derived in Go rather than from encap's own per-packet effective MTU, even though encap
+    has that figure: an MSS only affects connections that haven't sent their SYN yet, so a poll interval of
+    lag costs nothing, and one value keeps both directions clamping alike — the decap side has no local MTU
+    to derive one from.
   - `frag.go` — `EnableSoftwireFrag(redirectIfindexes, fwdIfaces)` wires the in-XDP softwire fragmenter to
     the companion veth pairs `internal/fragpath` created: attaches `xdp_softwire_frag<i>` to pair *i*'s B
     end (which also activates the pair's NAPI), then points `frag_ports[i]` at the pair's A end —
@@ -356,8 +387,9 @@ orphaned the running kernel's module directory — reboot to fix that).
   - `pmtu.go` — `TunnelPMTU()` reads the smallest not-yet-aged-out softwire path MTU across the
     `tunnel_pmtus` slots (aged on the same `CLOCK_MONOTONIC` the datapath stamps with, `TunnelPMTUExpiry`
     mirroring the C `TUNNEL_PMTU_EXPIRY_NS`), and `SetSoftwireMTU(mtu)` re-derives `b4_config.frag_unit`
-    from it — the only field of `b4_config` written after startup, and the reason the derivation lives in
-    Go rather than in the datapath (see the `handle_tunnel_icmpv6` bullet).
+    from it (plus `mss_clamp`, when the clamp is automatic) — the only fields of `b4_config` written after
+    startup, and the reason the `frag_unit` derivation lives in Go rather than in the datapath (see the
+    `handle_tunnel_icmpv6` bullet).
   - `ipv6_rss.go` — `EnableIPv6SoftwareRSS([]uint32)` turns on the native-IPv6 software-RSS cpumap stage
     across the given CPU ids: it populates `cpu_map_v6` with `bpfBpfCpumapVal{Qsize, prog: XdpIpv6FwdCpu.FD()}`
     per CPU, fills `ipv6_rss_cpus` (slot → cpu), and sets `ipv6_rss_config{Enabled, CpuCount}`. Off unless
@@ -617,6 +649,8 @@ orphaned the running kernel's module directory — reboot to fix that).
   validated in `run()` before anything else happens), `-dns-proxy` (opt-in DNS proxy, orthogonal to both
   IPv6-provisioning flags) with repeatable `-dns-server` to override its upstreams, `-dhcpv4` (opt-in DHCPv4
   server, orthogonal to everything else) with `-dhcpv4-lease` and repeatable `-dhcpv4-dns`,
+  `-tcp-mss-clamp` (`auto` by default — track the softwire MTU; `off`, or an explicit MSS in bytes; parsed
+  by `internal/cliconfig.ParseMSSClamp` into the `datapath.B4Config.TCPMSSClamp` policy),
   `-ipv6-sw-rss` (opt-in native-IPv6 software-RSS cpumap fanout — off by default, for NICs whose hardware
   RSS can't spread flows; when set, `run()` calls `dp.EnableIPv6SoftwareRSS(onlineCPUs())` after WAN/LAN
   attach, once every egress ifindex is registered in `tx_ports`),
@@ -689,7 +723,8 @@ orphaned the running kernel's module directory — reboot to fix that).
 - **`internal/cliconfig`** — parses `minuteman`'s flag values (`LANSpec` — now also carrying the optional
   DHCPv4 `Subnet` from the `-lan` value's `/prefixlen` — `ParseLANSpec`, `LANSpecList`
   implementing `flag.Value`, `AddrList` implementing `flag.Value` for a repeatable plain IP-address flag
-  like `-dns-server`/`-dhcpv4-dns`, `ParseMAC`) into typed values for `main.go` to hand to `pkg/datapath`. Thin
+  like `-dns-server`/`-dhcpv4-dns`, `ParseMAC`, `ParseMSSClamp` for `-tcp-mss-clamp`'s
+  `auto`/`off`/explicit-MSS values) into typed values for `main.go` to hand to `pkg/datapath`. Thin
   CLI-flag glue only, not a home for protocol logic (that's `pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/
   `pkg/prefixdelegation`).
 - **`internal/lanprefix`** — the DHCPv6-PD *policy* layer: what to do with a delegated prefix, as opposed to

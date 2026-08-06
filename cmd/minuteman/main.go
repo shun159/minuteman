@@ -146,6 +146,7 @@ func run() error {
 		dnsProxyOn     = flag.Bool("dns-proxy", false, "run a DNS proxy (RFC 6333's B4 SHOULD) on every -lan interface's gateway IP, port 53/UDP+TCP, forwarding queries directly over IPv6 to -dns-server (or the DHCPv6-learned DNS servers, if -dns-server is omitted) instead of through the DS-Lite softwire")
 		dhcpv4On       = flag.Bool("dhcpv4", false, "run a DHCPv4 server (RFC 2131) on every -lan interface, handing LAN clients an address from that interface's subnet (see -lan's optional /prefixlen, default /24), with the gateway IP as router and DNS (pair with -dns-proxy) and a DS-Lite-adjusted MTU")
 		dhcpv4Lease    = flag.Duration("dhcpv4-lease", 12*time.Hour, "DHCPv4 lease duration handed to LAN clients (with -dhcpv4)")
+		mssClamp       = flag.String("tcp-mss-clamp", "auto", "bound the MSS a TCP SYN crossing the softwire may advertise, so TCP never offers segments the softwire would have to fragment: \"auto\" tracks the softwire MTU (including a learned path MTU), \"off\" disables clamping, or give an explicit MSS in bytes")
 		ipv6SwRSS      = flag.Bool("ipv6-sw-rss", false, "spread native-IPv6 forwarding-fastpath work across CPUs with a cpumap software-RSS stage; leave off when the NIC's hardware RSS already distributes flows (e.g. mlx4)")
 		hb46ppVendorID = flag.String("hb46pp-vendor-id", defaultHB46PPVendorID, "HB46PP vendorid query parameter sent during provisioning discovery fallback (vendor OUI, optionally -suffix)")
 		hb46ppProduct  = flag.String("hb46pp-product", defaultHB46PPProduct, "HB46PP product query parameter sent during provisioning discovery fallback")
@@ -184,6 +185,10 @@ func run() error {
 	dstMAC, err := cliconfig.ParseMAC(*wanDstMAC)
 	if err != nil {
 		return fmt.Errorf("parsing -wan-dst-mac: %w", err)
+	}
+	mssClampPolicy, err := cliconfig.ParseMSSClamp(*mssClamp)
+	if err != nil {
+		return fmt.Errorf("parsing -tcp-mss-clamp: %w", err)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -292,6 +297,7 @@ func run() error {
 		WANIfindex:   wanIfindex,
 		WANMTU:       wanNetIface.MTU,
 		FragMaxInner: fragpath.MaxInnerLen,
+		TCPMSSClamp:  mssClampPolicy,
 	}); err != nil {
 		return fmt.Errorf("setting B4 config: %w", err)
 	}
