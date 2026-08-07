@@ -72,6 +72,7 @@ func tryRenew(ctx context.Context, ifaceName string, lease *Lease) (*Lease, erro
 	reply, err := dhcpv6.Renew(renewCtx, ifaceName, dhcpv6.Options{
 		{Code: dhcpv6.OptionServerID, Data: lease.ServerID},
 		lease.iaPDOption(),
+		requestedOptions,
 	})
 	if err != nil {
 		return nil, err
@@ -89,7 +90,7 @@ func tryRebind(ctx context.Context, ifaceName string, lease *Lease) (*Lease, err
 	rebindCtx, cancel := context.WithDeadline(ctx, lease.AcquiredAt.Add(lease.shortestValidLifetime()))
 	defer cancel()
 
-	reply, err := dhcpv6.Rebind(rebindCtx, ifaceName, dhcpv6.Options{lease.iaPDOption()})
+	reply, err := dhcpv6.Rebind(rebindCtx, ifaceName, dhcpv6.Options{lease.iaPDOption(), requestedOptions})
 	if err != nil {
 		return nil, err
 	}
@@ -100,6 +101,13 @@ func tryRebind(ctx context.Context, ifaceName string, lease *Lease) (*Lease, err
 // builds the resulting Lease. serverID is the one to keep using for future
 // Renews; pass nil (as tryRebind does) to take whatever the Reply itself
 // carries.
+//
+// The renewed Lease takes its DNS servers from this Reply, so a server that
+// changes them mid-lease is followed. A Reply carrying none leaves
+// Lease.DNSServers nil rather than inheriting the previous lease's: the
+// renewal exchanges carry the same ORO as the original Acquire, so silence
+// here is the server declining to answer a question it was asked, not a
+// question that went unasked.
 func leaseFromReply(serverID dhcpv6.DUID, reply *dhcpv6.Message) (*Lease, error) {
 	granted, replyServerID, err := usableIAPD(reply)
 	if err != nil {
@@ -108,7 +116,11 @@ func leaseFromReply(serverID dhcpv6.DUID, reply *dhcpv6.Message) (*Lease, error)
 	if serverID == nil {
 		serverID = replyServerID
 	}
-	return newLease(serverID, granted), nil
+	dnsServers, _, err := reply.Options.DNSServers()
+	if err != nil {
+		dnsServers = nil
+	}
+	return newLease(serverID, granted, dnsServers), nil
 }
 
 // releaseLease sends a best-effort Release for lease (RFC 3315 §18.1.6): a

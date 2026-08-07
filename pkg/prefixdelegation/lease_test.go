@@ -56,7 +56,7 @@ func TestNewLeaseResolvesTimers(t *testing.T) {
 	lease := newLease(serverID, &IAPD{
 		IAID:     clientIAID,
 		Prefixes: []IAPrefix{prefixWithLifetimes(time.Hour, 2*time.Hour)},
-	})
+	}, nil)
 
 	if lease.T1 != 30*time.Minute || lease.T2 != 48*time.Minute {
 		t.Errorf("T1/T2 = %v/%v, want 30m0s/48m0s", lease.T1, lease.T2)

@@ -3,17 +3,27 @@
 minuteman works as a DS-Lite B4 (verified end-to-end against the netns rig — see
 `test/netns/README.md`), but measured strictly against the base RFC 7084 (IPv6 CE Router Requirements)
 and RFC 6333, these gaps remain. Ordered by real-world impact, highest first. Last checked against the
-codebase 2026-07-27. (RFC 7084's own updates — RFC 9096 renumbering reaction and RFC 9818 LAN-side
-prefix delegation — are not targeted; see the RFC 9096 item in §3 and `docs/supported-rfcs.md`.)
+codebase 2026-08-07. (RFC 7084's own updates — RFC 9096 renumbering reaction and RFC 9818 LAN-side
+prefix delegation — are not targeted; see the RFC 9096 item in §4 and `docs/supported-rfcs.md`.)
 
-Two §3 items come from a carrier spec rather than an RFC: NTT East's *IP通信網サービスのインタフェース
-－フレッツシリーズ－* 第三分冊 (<https://flets.com/pdf/ip-int-3.pdf>), §2.4.2.1 "IPv6(IPoE)通信における
-IPv6仕様" (printed p. 62, PDF p. 76) — the IPoE access spec minuteman's own target deployment runs on. It
-states what the network's WAN-side RA may carry, which is what makes those two gaps concrete rather than
-hypothetical. Its other requirements in that section are already met: DHCPv6 yields no 128-bit address
-(minuteman requests IA_PD only), the client DUID must be DUID-LL from a MAC and as stable as possible
-(`pkg/dhcpv6/duid.go`, a pure function of the WAN MAC), and a delegation is a /48 or /56
-(`lanprefix.SubnetFor` carves a /64 out of any delegation up to /64).
+§3 and two §4 items come from a carrier spec rather than an RFC: NTT East's *IP通信網サービスの
+インタフェース－フレッツシリーズ－* 第三分冊, 第46版 (dated 2026-04-30,
+<https://flets.com/pdf/ip-int-3.pdf>) — the IPoE access spec minuteman's own target deployment runs on.
+That edition covers three access tiers in separate 編 (volumes) whose IPv6 provisioning rules differ, and
+those differences are what make the gaps concrete rather than hypothetical:
+
+| 編 | section | LAN prefix source | RA M/O flags | Information-Request |
+|---|---|---|---|---|
+| フレッツ 光ネクスト | §2.4.2.1.2 (printed p. 62, PDF p. 76) | the RA's 64-bit prefix **or** DHCPv6-PD's 48/56-bit one — the spec lists both as the only usable sources | 「1が設定される場合があります」; on M=1, DHCPv6-PD is 推奨 (recommended); Preferred Lifetime may be 0 | 推奨 on O=1, so the network answers it |
+| フレッツ 光クロス | §4.4.2.1.2 (printed p. 23, PDF p. 37) | DHCPv6-PD /56 only (推奨) | 「1を設定される場合があります」, with no stated meaning | 「IP通信網はInformation-Requestには対応しておりません」 |
+| フレッツ 光25G | §2.4.1.1.2 (printed p. 6, PDF p. 20) | DHCPv6-PD /56 only (「委譲を受けるものとします」) | not mentioned; the RA is stated to be for routing/control information, 「IPv6アドレスの自動設定を目的とするものではありません」 | 「IP通信網はInformation-Requestには対応しておりません」 |
+
+So the RA's M flag discriminates minuteman's two LAN provisioning models (`-dhcpv6-pd` vs `-ndproxy`)
+only on 光ネクスト; the other two tiers are PD-only, and on them the DHCPv6 exchange minuteman opens with
+is one the network states it does not answer (§3). Requirements of those sections that minuteman already
+meets: DHCPv6 yields no 128-bit address (minuteman requests IA_PD only), the client DUID must be DUID-LL
+from a MAC and as stable as possible (`pkg/dhcpv6/duid.go`, a pure function of the WAN MAC), and a
+delegation is a /48 or /56 (`lanprefix.SubnetFor` carves a /64 out of any delegation up to /64).
 
 Softwire fragmentation (RFC 6333 §5.3) is now addressed on both halves: reassembly by the
 `internal/slowpath` companion `ip6tnl` (kernel reassembles before decapsulation), fragmentation by the
@@ -34,7 +44,7 @@ interval. Cancellation still emits it, for actual shutdowns. Verified in the rig
 the renewal drew one immediate RA carrying the refreshed prefix lifetimes with RouterLifetime still
 1800s, and the only RouterLifetime=0 in the whole capture was the one minuteman sent on shutdown. What
 this does *not* do is deprecate a superseded prefix when a renewal actually changes it (advertising the
-old one with PreferredLifetime=0) — that's the RFC 9096 item in §3, and the restart it replaced didn't
+old one with PreferredLifetime=0) — that's the RFC 9096 item in §4, and the restart it replaced didn't
 do it either.
 
 ## 1. ~~Softwire fragmentation is inner-IPv4, not RFC-canonical outer-IPv6~~ — RESOLVED (in-XDP outer-IPv6 fragmentation); residual fallback cases remain
@@ -112,7 +122,57 @@ right ICMPv4 type and source, an error quoting someone else's softwire ignored, 
 core link narrowed to 1400 while the CPE's WAN stays at 1500 — the learned MTU applied to both the
 fragmenter and the companion ip6tnl, after which oversized DF *and* non-DF traffic crosses at 0% loss.
 
-## 3. Minor / acceptable for a home CPE
+## 3. ~~AFTR discovery blocks forever on a network that doesn't answer Information-Request~~ — RESOLVED (bounded Information-Request + PD-sourced resolvers for the HB46PP fallback)
+
+Both the 光クロス and 光25G 編 of the carrier spec above state
+「IP通信網はInformation-Requestには対応しておりません」(§4.4.2.1.2 / §2.4.1.1.2), and transix has offered
+DS-Lite over 光クロス since 2020-04-01 (<https://www.mfeed.ad.jp/ja/2020/2020-03-26/>) — so a network that
+never answers minuteman's opening DHCPv6 message is a real target deployment, not a hypothetical. It used
+to hang startup outright: `dhcpv6.InformationRequest` follows RFC 3315 §18.1.5, which sets no maximum
+retransmission count and no maximum duration, so it retried forever (backoff merely capped at `InfMaxRT`,
+3600s) and `aftrdiscovery.Discover` never returned. `resolveAFTR`'s retry loop only turns when
+`discoverAFTROnce` *returns*, so it never turned, and the HB46PP fallback — which exists for exactly these
+deployments — was never reached, since `discoverAFTROnce` entered it only on
+`aftrdiscovery.ErrNoAFTRName`, which by construction requires a Reply.
+
+Three changes, because bounding the wait alone would only have converted the hang into a fallback with no
+resolvers to work with:
+
+- **`aftrdiscovery.Discover` takes a `replyTimeout`** bounding the Information-Request phase only (not the
+  AFTR-name DNS resolution that follows, so a timeout unambiguously means "nothing answered") and reports
+  the new `ErrNoReply` sentinel when it expires. Zero or negative keeps the RFC-correct unbounded
+  behavior; `cmd/minuteman` passes `informationRequestTimeout`, 30s, about five retransmissions at
+  §18.1.5's 1s-and-doubling schedule. `discoverAFTROnce` now has two routes into HB46PP —
+  `ErrNoAFTRName` (resolvers from the partial Reply) and `ErrNoReply` (resolvers from the PD lease).
+- **The PD exchange asks for DNS servers.** `pkg/prefixdelegation`'s Solicit/Request/Renew/Rebind carry an
+  `OPTION_ORO` for `OPTION_DNS_SERVERS` (`requestedOptions` in `acquire.go`) and the granting Reply's
+  servers land on `Lease.DNSServers`. The spec says DNS servers are obtainable over DHCPv6 on those tiers
+  (§4.4.2.1.3 / §2.4.1.1.3) — just not via Information-Request, so the stateful exchange is the only
+  source. The RFC 3646 decoding moved to `dhcpv6.Options.DNSServers()` rather than being duplicated, since
+  `pkg/aftrdiscovery` reads the same option.
+- **`run()` acquires the PD lease before AFTR discovery**, and hands its servers to `resolveAFTR`,
+  `runAFTRRediscovery`, and (behind `-dns-server` and the discovery-learned set) `-dns-proxy`'s upstreams.
+  Only the `Acquire` call moved; `runPrefixDelegation` now takes the already-acquired lease and does the
+  LAN assignment, RA workers and `Maintain` in its old position. Both exchanges bind the same WAN DHCPv6
+  socket and are serialized by `pkg/dhcpv6`'s per-interface lock, so their concurrency is unchanged.
+
+One judgement call worth recording: a failure reached *through* `ErrNoReply` has its retry delay capped at
+`noReplyRetryCap` (5 min) by `retryDelayFor`, rather than taking `hb46pp.RetryDelay`'s verdict as-is. That
+verdict can be 1–3 hours for `ErrNotProvisioned`, and having heard nothing at all from DHCPv6 there is no
+evidence the network is HB46PP-unprovisioned rather than merely slow to come up — hours of no IPv4 is a
+steep price for a guess made on no data. Attempts that did draw a Reply keep the spec's full backoff.
+
+Verified end-to-end in the netns rig by reproducing the carrier-spec shape directly: with the rig in
+`MM_AFTR_DISCOVERY=hb46pp` mode and an nftables rule in mm-isp dropping *only* DHCPv6 message type 11
+(`udp dport 547 @th,64,8 11 drop`, so the PD exchange still completes), minuteman acquired the delegation
+first (DNS servers `fd00:1::1`, carried by the new ORO), retransmitted the Information-Request five times
+into the blackhole, gave up at exactly 30s, fell forward to HB46PP with the lease's servers, and brought
+the whole datapath up 1s later. The unmodified rig (`MM_AFTR_DISCOVERY=dhcpv6`, `MM_WAN_MODEL=dhcpv6-pd`)
+still passes its full smoketest with the reordered startup. What is *not* observed is the original hang
+against a real line — minuteman has never run against one — but it follows from the retransmission
+constants above rather than from inference about the network.
+
+## 4. Minor / acceptable for a home CPE
 
 - During an AFTR graceful migration's drain window the softwire slow-path companion ip6tnl is repointed at
   the *new* AFTR at cutover. A *draining* flow's XDP-fragmented packets are unaffected (the in-XDP
@@ -151,7 +211,7 @@ fragmenter and the companion ip6tnl, after which oversized DF *and* non-DF traff
   lifetimes (30 days valid / 7 days preferred, `ra.go`'s `validLifetime`/`preferredLifetime`) because
   `DiscoverPrefix`/`WatchChanges` read the prefix back from the kernel's address list, and
   `pkg/netlink`'s `parseIfAddrMsg` doesn't decode `IFA_CACHEINFO` — so the WAN RA's actual remaining
-  lifetimes are unknown to it. The NTT East IPoE spec (§2.4.2.1.2) says the network's RA *may* carry
+  lifetimes are unknown to it. The NTT East IPoE spec's 光ネクスト 編 (§2.4.2.1.2) says the network's RA *may* carry
   Preferred Lifetime = 0, so this is reachable in the target deployment, not just in theory: minuteman
   would advertise a 7-day preferred lifetime for a prefix the network has already deprecated, telling LAN
   clients to keep sourcing from an address the network no longer prefers (RFC 4862 §5.5.4 makes
@@ -161,12 +221,17 @@ fragmenter and the companion ip6tnl, after which oversized DF *and* non-DF traff
 - The WAN-side RA's M/O flags (RFC 4861 §4.2) are never consulted: `pkg/routeradvert`'s codec is
   Marshal-only (it only detects that a Router Solicitation *arrived*, `isRouterSolicitation`), inbound
   RAs are left entirely to the kernel, and which LAN provisioning model runs is the operator's
-  `-dhcpv6-pd`-vs-`-ndproxy` choice. No protocol requirement is broken — the O flag's
-  Information-Request is sent unconditionally by `pkg/aftrdiscovery` anyway, and the NTT East IPoE spec
-  (§2.4.2.1.2) only 推奨s (recommends) DHCPv6-PD on M=1, which `-dhcpv6-pd` does — but the network
-  signals the model minuteman currently has to be told, so this is the one piece of per-deployment
-  configuration that AFTR discovery's own design goal (no per-VNE config) would say should be derived.
-  Deriving it means decoding inbound RAs on the WAN, which nothing does today.
+  `-dhcpv6-pd`-vs-`-ndproxy` choice. No protocol requirement is broken, but the network signals the model
+  minuteman currently has to be told, so this is the one piece of per-deployment configuration that AFTR
+  discovery's own design goal (no per-VNE config) would say should be derived. The carrier spec's
+  光ネクスト 編 (§2.4.2.1.2) makes the mapping explicit — on M=1 it 推奨s (recommends) DHCPv6-PD, and it
+  names the RA's own 64-bit prefix as the *alternative* source of a usable address, which is precisely
+  minuteman's `-ndproxy` model. So on that tier M discriminates the two, and deriving the model would
+  remove the flag. Scope, though: the 光クロス and 光25G 編 are PD-only, so there the flag has nothing to
+  choose between, and §3's Information-Request problem has to be settled first — on those tiers minuteman
+  doesn't get far enough to care what an RA said. Deriving anything from an RA means decoding inbound RAs
+  on the WAN, which nothing does today; the same receiver would supply the PIO lifetimes the
+  `internal/wanextend` item above needs, so the two share the plumbing.
 - RA MTU option (RFC 4861 §4.6.4) isn't advertised.
 - MLD (RFC 3810) is left entirely to the kernel — minuteman forwards no IPv6 multicast of its own. Fine
   for a home gateway; would need revisiting for a router expected to do multicast routing.

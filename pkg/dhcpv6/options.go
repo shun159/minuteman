@@ -3,6 +3,7 @@ package dhcpv6
 import (
 	"encoding/binary"
 	"fmt"
+	"net/netip"
 	"time"
 )
 
@@ -139,6 +140,37 @@ func (o Options) ServerID() (DUID, bool) {
 		return nil, false
 	}
 	return DUID(opt.Data), true
+}
+
+// DNSServers extracts OPTION_DNS_SERVERS (RFC 3646 §3: a flat list of
+// 16-byte IPv6 addresses). Returns false if the option is absent, and an
+// error if it is present but malformed -- a caller that only needs "the
+// servers, if any are usable" can treat both alike, but the distinction
+// exists because an option the server did send and this client couldn't
+// parse is worth logging, where an absent one is routine.
+//
+// Unlike the option codes this package leaves for consuming packages to
+// decode (OPTION_IA_PD, OPTION_AFTR_NAME), DNS servers are generic DHCPv6
+// with more than one consumer here -- AFTR discovery and prefix delegation
+// both read them -- so the decoding lives alongside InformationRefreshTime
+// rather than being duplicated per consumer.
+func (o Options) DNSServers() ([]netip.Addr, bool, error) {
+	opt, ok := o.Get(OptionDNSServers)
+	if !ok {
+		return nil, false, nil
+	}
+	if len(opt.Data)%16 != 0 {
+		return nil, true, fmt.Errorf("dhcpv6: DNS servers option length %d is not a multiple of 16", len(opt.Data))
+	}
+	servers := make([]netip.Addr, 0, len(opt.Data)/16)
+	for i := 0; i < len(opt.Data); i += 16 {
+		addr, addrOK := netip.AddrFromSlice(opt.Data[i : i+16])
+		if !addrOK {
+			return nil, true, fmt.Errorf("dhcpv6: malformed DNS server address at offset %d", i)
+		}
+		servers = append(servers, addr)
+	}
+	return servers, true, nil
 }
 
 // InformationRefreshTime extracts OPTION_INFORMATION_REFRESH_TIME (RFC 4242

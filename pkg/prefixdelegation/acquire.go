@@ -56,6 +56,15 @@ func usableIAPD(msg *dhcpv6.Message) (*IAPD, dhcpv6.DUID, error) {
 	return iapd, serverID, nil
 }
 
+// requestedOptions is the OPTION_ORO this client sends with its Solicit and
+// Request (RFC 3315 §21.7). An IA_PD is carried as its own option and needs
+// no ORO entry; what does is OPTION_DNS_SERVERS, because on a network that
+// doesn't answer Information-Request the stateful exchange is the only place
+// a resolver can be learned from DHCPv6 at all -- and minuteman's HB46PP
+// discovery fallback needs one to look anything up. Asking costs a handful of
+// bytes on two messages and a server free to ignore it.
+var requestedOptions = dhcpv6.NewORO(dhcpv6.OptionDNSServers)
+
 // Acquire performs a full Solicit/Advertise/Request/Reply exchange (RFC
 // 3315 §17-18, RFC 3633) on ifaceName to obtain a delegated prefix, and
 // returns the resulting Lease.
@@ -67,7 +76,8 @@ func usableIAPD(msg *dhcpv6.Message) (*IAPD, dhcpv6.DUID, error) {
 // Lease.Prefixes; callers that only use one should use Prefixes[0].
 func Acquire(ctx context.Context, ifaceName string) (*Lease, error) {
 	for {
-		advertise, err := dhcpv6.Solicit(ctx, ifaceName, dhcpv6.Options{NewIAPDOption(clientIAID)})
+		solOptions := dhcpv6.Options{NewIAPDOption(clientIAID), requestedOptions}
+		advertise, err := dhcpv6.Solicit(ctx, ifaceName, solOptions)
 		if err != nil {
 			return nil, fmt.Errorf("prefixdelegation: soliciting on %s: %w", ifaceName, err)
 		}
@@ -83,6 +93,7 @@ func Acquire(ctx context.Context, ifaceName string) (*Lease, error) {
 		reqOptions := dhcpv6.Options{
 			{Code: dhcpv6.OptionServerID, Data: serverID},
 			IAPDOption(*offered),
+			requestedOptions,
 		}
 		reply, err := dhcpv6.Request(ctx, ifaceName, reqOptions)
 		if err != nil {
@@ -100,6 +111,14 @@ func Acquire(ctx context.Context, ifaceName string) (*Lease, error) {
 			continue
 		}
 
-		return newLease(serverID, granted), nil
+		// A DNS servers option this client asked for but can't parse is
+		// dropped, not fatal: it has no bearing on the delegation itself,
+		// which is what the exchange is for.
+		dnsServers, _, err := reply.Options.DNSServers()
+		if err != nil {
+			dnsServers = nil
+		}
+
+		return newLease(serverID, granted, dnsServers), nil
 	}
 }

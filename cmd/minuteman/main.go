@@ -83,6 +83,33 @@ const (
 	dnsProxyBindRetryInterval = time.Second
 )
 
+// informationRequestTimeout bounds how long AFTR discovery waits for a reply
+// to its DHCPv6 Information-Request before falling forward to HB46PP.
+// RFC 3315 §18.1.5 sets no maximum retransmission count or duration for this
+// exchange, so pkg/dhcpv6 retries it indefinitely -- correct against a
+// network that answers eventually, an indefinite startup hang against one
+// that never will. Two access tiers of the NTT East FLET'S IPoE spec state
+// outright that the network does not answer it (光クロス §4.4.2.1.2, 光25G
+// §2.4.1.1.2), and those are exactly the deployments HB46PP exists to serve,
+// so a bound is what lets the fallback ever run.
+//
+// 30s covers roughly five retransmissions at RFC 3315's 1s/doubling schedule
+// -- generous against a slow or briefly-unready server, while keeping startup
+// on a network that will never answer down to half a minute. Timing out is
+// not a permanent verdict: resolveAFTR's loop re-runs the whole chain,
+// Information-Request included, on every retry.
+const informationRequestTimeout = 30 * time.Second
+
+// noReplyRetryCap bounds the backoff after an attempt in which the DHCPv6
+// Information-Request went unanswered *and* the HB46PP fallback then failed.
+// The delay would otherwise come from hb46pp.RetryDelay's verdict on the
+// HB46PP error alone -- up to 1-3 hours for ErrNotProvisioned -- but having
+// heard nothing from DHCPv6 we have no evidence the network is
+// HB46PP-unprovisioned rather than merely slow to come up, and a wrong guess
+// there costs hours of no IPv4. Attempts that did draw a DHCPv6 Reply keep
+// the spec's full backoff, since there the HB46PP verdict rests on something.
+const noReplyRetryCap = 5 * time.Minute
+
 // Default HB46PP client identity sent as provisioning query parameters,
 // overridable via -hb46pp-vendor-id/-hb46pp-product/-hb46pp-version.
 // "acde48" is the AC-DE-48 OUI conventionally used in documentation and
@@ -190,25 +217,12 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("parsing -tcp-mss-clamp: %w", err)
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	identity := hb46ppIdentity{vendorID: *hb46ppVendorID, product: *hb46ppProduct, version: *hb46ppVersion}
-	disc, err := resolveAFTR(ctx, *aftrAddr, *wanIface, identity)
-	if err != nil {
-		return err
-	}
-	aftr := disc.aftr
-	discoveredDNSServers := disc.dnsServers
-
-	dnsServers := discoveredDNSServers
-	if len(dnsServersFlag) > 0 {
-		dnsServers = dnsServersFlag
-	}
-	if *dnsProxyOn && len(dnsServers) == 0 {
-		return errors.New("-dns-proxy needs at least one DNS server: none were learned via DHCPv6 (likely because -aftr was given directly, skipping DHCPv6 discovery) and none were given via -dns-server")
-	}
+	// Every -dhcpv4 flag check that needs nothing but the flags themselves
+	// belongs here, with the rest of the pure-flag validation, and not further
+	// down next to the code that consumes them: everything below this point
+	// can block indefinitely on the network (the DHCPv6-PD acquire and AFTR
+	// discovery both retry until they succeed or ctx is cancelled), and a
+	// misspelled flag must not be reported only after the network cooperates.
 	for _, a := range dhcpv4DNSFlag {
 		if !a.Is4() {
 			return fmt.Errorf("-dhcpv4-dns %s must be an IPv4 address (DHCPv4 option 6 carries only IPv4 DNS servers)", a)
@@ -218,6 +232,54 @@ func run() error {
 		return fmt.Errorf("-dhcpv4-lease must be at least %v (shorter leases don't yield valid T1/T2 renewal timers)", minDHCPv4Lease)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// The DHCPv6-PD lease is acquired before AFTR discovery, not with the rest
+	// of the prefix-delegation setup further down, because on a network that
+	// doesn't answer Information-Request this stateful exchange is the only
+	// source of DNS servers -- and AFTR discovery's HB46PP fallback needs a
+	// resolver to look anything up with (see discoverAFTROnce and §3 of
+	// docs/rfc-compliance-backlog.md). Both exchanges bind the same WAN
+	// DHCPv6 socket, serialized by pkg/dhcpv6's own per-interface lock, so
+	// only their order changes here, not their concurrency. Acquire blocks
+	// until it succeeds or ctx is cancelled, exactly as it did when it ran
+	// later; -dhcpv6-pd is an assertion that this network delegates a prefix,
+	// so there is no useful CPE to bring up without one either way.
+	var pdLease *prefixdelegation.Lease
+	if *requestPD {
+		pdLease, err = prefixdelegation.Acquire(ctx, *wanIface)
+		if err != nil {
+			return fmt.Errorf("acquiring delegated prefix via DHCPv6-PD: %w", err)
+		}
+		// The prefix itself is logged by runPrefixDelegation further down,
+		// along with the renewal timers; what's worth a line here is that the
+		// delegation landed before AFTR discovery and what resolvers it can
+		// lend it.
+		log.Printf("DHCPv6-PD: delegation acquired on %s ahead of AFTR discovery (DNS servers: %v)", *wanIface, pdLease.DNSServers)
+	}
+
+	identity := hb46ppIdentity{vendorID: *hb46ppVendorID, product: *hb46ppProduct, version: *hb46ppVersion}
+	disc, err := resolveAFTR(ctx, *aftrAddr, *wanIface, identity, pdDNSServers(pdLease))
+	if err != nil {
+		return err
+	}
+	aftr := disc.aftr
+	discoveredDNSServers := disc.dnsServers
+
+	// Upstreams for -dns-proxy, most specific first: an explicit -dns-server
+	// always wins; otherwise whatever AFTR discovery learned; otherwise the
+	// PD lease's, which is all there is on a network with no stateless DHCPv6.
+	dnsServers := discoveredDNSServers
+	if len(dnsServers) == 0 {
+		dnsServers = pdDNSServers(pdLease)
+	}
+	if len(dnsServersFlag) > 0 {
+		dnsServers = dnsServersFlag
+	}
+	if *dnsProxyOn && len(dnsServers) == 0 {
+		return errors.New("-dns-proxy needs at least one DNS server: none were learned via DHCPv6 (likely because -aftr was given directly, skipping DHCPv6 discovery, and -dhcpv6-pd is off or its server sent none) and none were given via -dns-server")
+	}
 	dp, err := datapath.Load()
 	if err != nil {
 		return fmt.Errorf("loading datapath: %w", err)
@@ -350,7 +412,7 @@ func run() error {
 		}
 	}
 	if *requestPD {
-		if err := runPrefixDelegation(ctx, *wanIface, lans, rdnssByIface, &bgWG); err != nil {
+		if err := runPrefixDelegation(ctx, *wanIface, pdLease, lans, rdnssByIface, &bgWG); err != nil {
 			return err
 		}
 	}
@@ -372,7 +434,7 @@ func run() error {
 	// skipped.
 	aftrDynamic := *aftrAddr == ""
 	if aftrDynamic || dynamicB4 {
-		runAFTRRediscovery(ctx, dp, tun, b4, dynamicB4, aftrDynamic, *wanIface, wanIfindex, identity, disc, &bgWG)
+		runAFTRRediscovery(ctx, dp, tun, b4, dynamicB4, aftrDynamic, *wanIface, wanIfindex, identity, disc, pdDNSServers(pdLease), &bgWG)
 	}
 	// Follows the softwire path MTU the datapath learns from ICMPv6 Packet Too
 	// Big messages about its own tunnel packets, applying it to the fragment
@@ -395,22 +457,30 @@ func run() error {
 	return nil
 }
 
-// runPrefixDelegation acquires a delegated IPv6 prefix via DHCPv6-PD on
-// wanIface, assigns the LAN addresses it carves from it and starts
-// advertising each carved /64 to LAN clients via Router Advertisements (see
-// reconcileAndLog), and starts the background lease-maintenance goroutine
-// that keeps renewing it, registering that goroutine on wg so callers can
-// wait for its shutdown-triggered Release (and every RA worker's
-// shutdown-triggered final RouterLifetime=0 advertisement) to finish before
-// exiting. rdnssByIface is forwarded to lanprefix.NewRAManager (see its own
-// doc) -- it's the map of link-local addresses startDNSProxy actually bound,
-// so RDNSS is advertised only where a DNS proxy is really listening.
-func runPrefixDelegation(ctx context.Context, wanIface string, lans cliconfig.LANSpecList, rdnssByIface map[string]netip.Addr, wg *sync.WaitGroup) error {
-	lease, err := prefixdelegation.Acquire(ctx, wanIface)
-	if err != nil {
-		return fmt.Errorf("acquiring delegated prefix via DHCPv6-PD: %w", err)
+// pdDNSServers returns the DNS servers a DHCPv6-PD lease carried, or nil
+// when -dhcpv6-pd is off (lease == nil) or the delegating server sent none.
+// It exists so callers can pass "whatever PD learned, if anything" without
+// each of them nil-checking the lease.
+func pdDNSServers(lease *prefixdelegation.Lease) []netip.Addr {
+	if lease == nil {
+		return nil
 	}
+	return lease.DNSServers
+}
 
+// runPrefixDelegation takes the already-acquired lease (run() acquires it
+// early, before AFTR discovery, so its DNS servers can feed the HB46PP
+// fallback -- see the call site), assigns the LAN addresses it carves from
+// it and starts advertising each carved /64 to LAN clients via Router
+// Advertisements (see reconcileAndLog), and starts the background
+// lease-maintenance goroutine that keeps renewing it, registering that
+// goroutine on wg so callers can wait for its shutdown-triggered Release
+// (and every RA worker's shutdown-triggered final RouterLifetime=0
+// advertisement) to finish before exiting. rdnssByIface is forwarded to
+// lanprefix.NewRAManager (see its own doc) -- it's the map of link-local
+// addresses startDNSProxy actually bound, so RDNSS is advertised only where
+// a DNS proxy is really listening.
+func runPrefixDelegation(ctx context.Context, wanIface string, lease *prefixdelegation.Lease, lans cliconfig.LANSpecList, rdnssByIface map[string]netip.Addr, wg *sync.WaitGroup) error {
 	lanIfaces := make([]string, len(lans))
 	for i, spec := range lans {
 		lanIfaces[i] = spec.Iface
@@ -960,7 +1030,12 @@ func migrateAFTR(ctx context.Context, dp *datapath.Loader, tun *slowpath.Tunnel,
 // exiting. Only ctx cancellation ends the loop. This is deliberately more
 // tolerant than exiting on a hard error would be -- restarting wouldn't fix an
 // ISP-side misconfiguration, and the visible retry log surfaces it either way.
-func resolveAFTR(ctx context.Context, aftrFlag, wanIface string, identity hb46ppIdentity) (aftrDiscovery, error) {
+//
+// fallbackDNS is the resolver set to hand HB46PP when the Information-Request
+// draws no reply at all and so yields none of its own -- in practice the DNS
+// servers the DHCPv6-PD exchange learned (see run()'s ordering). It may be
+// nil, in which case HB46PP falls back to the system resolver.
+func resolveAFTR(ctx context.Context, aftrFlag, wanIface string, identity hb46ppIdentity, fallbackDNS []netip.Addr) (aftrDiscovery, error) {
 	if aftrFlag != "" {
 		aftr, err := netip.ParseAddr(aftrFlag)
 		if err != nil {
@@ -971,7 +1046,7 @@ func resolveAFTR(ctx context.Context, aftrFlag, wanIface string, identity hb46pp
 
 	log.Printf("no -aftr given, discovering AFTR via DHCPv6 on %s", wanIface)
 	for {
-		disc, err := discoverAFTROnce(ctx, wanIface, identity, "")
+		disc, err := discoverAFTROnce(ctx, wanIface, identity, "", fallbackDNS)
 		if err == nil {
 			return disc, nil
 		}
@@ -979,7 +1054,7 @@ func resolveAFTR(ctx context.Context, aftrFlag, wanIface string, identity hb46pp
 			return aftrDiscovery{}, ctx.Err()
 		}
 
-		delay := hb46pp.RetryDelay(err)
+		delay := retryDelayFor(err)
 		log.Printf("AFTR discovery failed: %v (retrying in %v)", err, delay.Round(time.Second))
 		select {
 		case <-ctx.Done():
@@ -989,31 +1064,66 @@ func resolveAFTR(ctx context.Context, aftrFlag, wanIface string, identity hb46pp
 	}
 }
 
+// retryDelayFor is hb46pp.RetryDelay with one local exception: an attempt
+// whose Information-Request went unanswered (aftrdiscovery.ErrNoReply in the
+// chain, put there by discoverAFTROnce) is capped at noReplyRetryCap, because
+// the HB46PP verdict that produced the delay was reached without any evidence
+// from DHCPv6 about what kind of network this is.
+func retryDelayFor(err error) time.Duration {
+	delay := hb46pp.RetryDelay(err)
+	if errors.Is(err, aftrdiscovery.ErrNoReply) && delay > noReplyRetryCap {
+		return noReplyRetryCap
+	}
+	return delay
+}
+
 // discoverAFTROnce runs one DHCPv6-then-HB46PP discovery attempt on wanIface
 // (RFC 3736 Information-Request + RFC 6334 OPTION_AFTR_NAME, resolved via
-// DNS; falling back to HB46PP provisioning of the dslite capability when the
-// Reply carries no AFTR-Name, using the DNS servers that Reply did carry).
-// prevToken, if set, is echoed on the HB46PP request (v6mig-1 §3.3). The
-// DHCPv6 exchange itself blocks (retrying per RFC 3315) until it gets a
-// Reply or ctx is cancelled.
-func discoverAFTROnce(ctx context.Context, wanIface string, identity hb46ppIdentity, prevToken string) (aftrDiscovery, error) {
-	result, err := aftrdiscovery.Discover(ctx, wanIface)
-	if err == nil {
+// DNS; falling back to HB46PP provisioning of the dslite capability).
+// prevToken, if set, is echoed on the HB46PP request (v6mig-1 §3.3).
+//
+// There are two distinct routes to the HB46PP fallback, and they differ in
+// where its resolvers come from:
+//
+//   - The Reply carried no AFTR-Name (aftrdiscovery.ErrNoAFTRName): the ISP
+//     speaks stateless DHCPv6 but names no AFTR through it, so HB46PP gets the
+//     DNS servers that same Reply carried.
+//   - Nothing answered within informationRequestTimeout
+//     (aftrdiscovery.ErrNoReply): the network most likely doesn't implement
+//     stateless DHCPv6 at all, and nothing was learned -- so HB46PP gets
+//     fallbackDNS, which run() sources from the DHCPv6-PD exchange. That error
+//     is kept in the chain of whatever HB46PP then returns, for retryDelayFor.
+func discoverAFTROnce(ctx context.Context, wanIface string, identity hb46ppIdentity, prevToken string, fallbackDNS []netip.Addr) (aftrDiscovery, error) {
+	result, err := aftrdiscovery.Discover(ctx, wanIface, informationRequestTimeout)
+	switch {
+	case err == nil:
 		log.Printf("discovered AFTR %s -> %s (DNS servers: %v)", result.AFTRName, result.AFTRAddr, result.DNSServers)
 		return aftrDiscovery{
 			aftr:       result.AFTRAddr,
 			dnsServers: result.DNSServers,
 			refresh:    result.RefreshInterval,
 		}, nil
-	}
-	if !errors.Is(err, aftrdiscovery.ErrNoAFTRName) {
+
+	case errors.Is(err, aftrdiscovery.ErrNoAFTRName):
+		// result is aftrdiscovery's documented partial result here: the Reply
+		// had DNS servers but no AFTR-Name.
+		log.Printf("DHCPv6 Reply carried no AFTR-Name, trying HB46PP provisioning (DNS servers: %v)", result.DNSServers)
+		return discoverViaHB46PP(ctx, result.DNSServers, identity, prevToken)
+
+	case errors.Is(err, aftrdiscovery.ErrNoReply):
+		// No result at all here -- not even DNS servers -- so fallbackDNS is
+		// the only resolver set HB46PP can be given.
+		log.Printf("no reply to the DHCPv6 information-request on %s within %v, trying HB46PP provisioning (DNS servers: %v)",
+			wanIface, informationRequestTimeout, fallbackDNS)
+		disc, hbErr := discoverViaHB46PP(ctx, fallbackDNS, identity, prevToken)
+		if hbErr != nil {
+			return aftrDiscovery{}, fmt.Errorf("%w (reached because %w)", hbErr, err)
+		}
+		return disc, nil
+
+	default:
 		return aftrDiscovery{}, fmt.Errorf("discovering AFTR: %w", err)
 	}
-
-	// result is aftrdiscovery's documented partial result here: the Reply had
-	// DNS servers but no AFTR-Name.
-	log.Printf("DHCPv6 Reply carried no AFTR-Name, trying HB46PP provisioning (DNS servers: %v)", result.DNSServers)
-	return discoverViaHB46PP(ctx, result.DNSServers, identity, prevToken)
 }
 
 // discoverViaHB46PP runs one HB46PP provisioning exchange advertising the
@@ -1064,6 +1174,12 @@ type rediscovery struct {
 	identity    hb46ppIdentity   // HB46PP client identity for re-discovery
 	aftrDynamic bool             // AFTR was discovered (has refresh semantics), vs. a static -aftr
 	wanChange   <-chan struct{}  // WAN-address change signal from watchB4; nil for a static B4
+	// fallbackDNS is the resolver set to hand HB46PP on a re-discovery whose
+	// Information-Request goes unanswered, mirroring startup (see
+	// discoverAFTROnce). It's the DHCPv6-PD lease's servers as of startup and
+	// is not refreshed from later renewals -- the same startup-set-wins
+	// simplification the -dns-proxy limitation noted on runAFTRRediscovery has.
+	fallbackDNS []netip.Addr
 
 	current   aftrDiscovery // the AFTR in use plus its refresh pacing/token
 	currentB4 netip.Addr    // the B4 source in use (this goroutine's working copy)
@@ -1098,7 +1214,7 @@ type rediscovery struct {
 //   - If a re-discovery's DNS servers differ from the startup ones, a running
 //     -dns-proxy keeps forwarding to the startup set (it isn't reconfigured
 //     here).
-func runAFTRRediscovery(ctx context.Context, dp *datapath.Loader, tun *slowpath.Tunnel, b4 netip.Addr, dynamicB4, aftrDynamic bool, wanIface string, wanIfindex uint32, identity hb46ppIdentity, initial aftrDiscovery, wg *sync.WaitGroup) {
+func runAFTRRediscovery(ctx context.Context, dp *datapath.Loader, tun *slowpath.Tunnel, b4 netip.Addr, dynamicB4, aftrDynamic bool, wanIface string, wanIfindex uint32, identity hb46ppIdentity, initial aftrDiscovery, fallbackDNS []netip.Addr, wg *sync.WaitGroup) {
 	var wanChange chan struct{}
 	appliedB4 := &atomic.Pointer[netip.Addr]{}
 	appliedB4.Store(&b4)
@@ -1116,7 +1232,8 @@ func runAFTRRediscovery(ctx context.Context, dp *datapath.Loader, tun *slowpath.
 		r := &rediscovery{
 			dp: dp, tun: tun, wanIface: wanIface, wanIfindex: int(wanIfindex),
 			identity: identity, aftrDynamic: aftrDynamic, wanChange: wanChange,
-			current: initial, currentB4: b4, appliedB4: appliedB4,
+			fallbackDNS: fallbackDNS,
+			current:     initial, currentB4: b4, appliedB4: appliedB4,
 		}
 		if dynamicB4 {
 			// The watcher only signals; this loop re-queries the source itself at
@@ -1202,9 +1319,9 @@ func (r *rediscovery) rediscover(ctx context.Context) (interrupted, migrationPen
 		err  error
 	}
 	resultCh := make(chan result, 1)
-	wanIface, identity, token := r.wanIface, r.identity, r.current.hb46ppToken
+	wanIface, identity, token, fallbackDNS := r.wanIface, r.identity, r.current.hb46ppToken, r.fallbackDNS
 	go func() {
-		next, err := discoverAFTROnce(attemptCtx, wanIface, identity, token)
+		next, err := discoverAFTROnce(attemptCtx, wanIface, identity, token, fallbackDNS)
 		resultCh <- result{next, err}
 	}()
 

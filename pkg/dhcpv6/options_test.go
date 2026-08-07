@@ -2,6 +2,7 @@ package dhcpv6
 
 import (
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 )
@@ -80,5 +81,38 @@ func TestOptionsExtractors(t *testing.T) {
 	refresh, ok := opts.InformationRefreshTime()
 	if !ok || refresh != 3600*time.Second {
 		t.Errorf("InformationRefreshTime() = %v, %v; want 3600s, true", refresh, ok)
+	}
+}
+
+func TestOptionsDNSServers(t *testing.T) {
+	a := netip.MustParseAddr("fd00:1::1")
+	b := netip.MustParseAddr("fd00:1::2")
+	opts := Options{{Code: OptionDNSServers, Data: append(append([]byte{}, a.AsSlice()...), b.AsSlice()...)}}
+
+	got, present, err := opts.DNSServers()
+	if err != nil {
+		t.Fatalf("DNSServers: %v", err)
+	}
+	if !present {
+		t.Fatal("DNSServers() present = false, want true")
+	}
+	if len(got) != 2 || got[0] != a || got[1] != b {
+		t.Fatalf("DNSServers() = %v, want [%v %v]", got, a, b)
+	}
+}
+
+func TestOptionsDNSServersAbsent(t *testing.T) {
+	got, present, err := Options{}.DNSServers()
+	if got != nil || present || err != nil {
+		t.Fatalf("DNSServers() = %v, %v, %v; want nil, false, nil", got, present, err)
+	}
+}
+
+func TestOptionsDNSServersBadLength(t *testing.T) {
+	opts := Options{{Code: OptionDNSServers, Data: make([]byte, 17)}}
+	// Present-but-malformed: reported as present so a caller can tell the
+	// server did send it, with an error rather than a silent empty list.
+	if _, present, err := opts.DNSServers(); err == nil || !present {
+		t.Fatalf("DNSServers() present = %v, err = %v; want true, non-nil", present, err)
 	}
 }
