@@ -7,23 +7,6 @@ import (
 	"net/netip"
 )
 
-// parseDNSServers decodes an OPTION_DNS_SERVERS payload (RFC 3646 §3): a
-// flat list of 16-byte IPv6 addresses.
-func parseDNSServers(data []byte) ([]netip.Addr, error) {
-	if len(data)%16 != 0 {
-		return nil, fmt.Errorf("aftrdiscovery: DNS servers option length %d is not a multiple of 16", len(data))
-	}
-	servers := make([]netip.Addr, 0, len(data)/16)
-	for i := 0; i < len(data); i += 16 {
-		addr, ok := netip.AddrFromSlice(data[i : i+16])
-		if !ok {
-			return nil, fmt.Errorf("aftrdiscovery: malformed address at offset %d", i)
-		}
-		servers = append(servers, addr)
-	}
-	return servers, nil
-}
-
 // resolveAFTR resolves name to an IPv6 address via a DNS AAAA lookup, using
 // dnsServers (as learned from the same DHCPv6 Reply, per RFC 6334) if any
 // were provided, or the system resolver otherwise. If the name resolves to

@@ -17,11 +17,18 @@ further down — this is just the index of what exists and which flag turns it o
 - **DS-Lite B4 datapath** (always on) — attaches/runs against real interfaces; XDP programs load, pass
   the kernel verifier, and have processed live traffic on veth pairs.
 - **AFTR discovery** (automatic unless `-aftr` is given) — an in-process, stdlib-only DHCPv6 client
-  (RFC 3736 + RFC 6334 `OPTION_AFTR_NAME`) with an HB46PP (JAIPA v6mig-1) fallback when the Reply carries
-  no AFTR-Name, so minuteman needs no per-VNE configuration and spawns no external DHCP/DNS daemon.
-  Re-discovery is periodic (RFC 4242 refresh) and, with a dynamic B4 (below), also triggered by a WAN
-  address change (the DS-Lite B4-address change of RFC 7785) — a changed AFTR migrates gracefully
-  (in-flight flows kept on the old AFTR until they drain), a changed B4 hard-switches.
+  (RFC 3736 + RFC 6334 `OPTION_AFTR_NAME`) with an HB46PP (JAIPA v6mig-1) fallback, so minuteman needs no
+  per-VNE configuration and spawns no external DHCP/DNS daemon. There are **two** routes to that fallback,
+  and they differ in where its resolvers come from: a Reply that carries no AFTR-Name hands HB46PP the DNS
+  servers that same Reply carried, while an Information-Request that draws *no reply at all* within
+  `informationRequestTimeout` (30s) hands it the DHCPv6-PD lease's servers instead — which is why `run()`
+  acquires that lease *before* AFTR discovery (see `cmd/minuteman/main.go` below). The bound exists because
+  RFC 3315 §18.1.5 sets no maximum retransmission count or duration, so `pkg/dhcpv6` would otherwise retry
+  forever against a network that never answers — and two access tiers of the NTT East FLET'S IPoE spec
+  state outright that theirs doesn't (光クロス §4.4.2.1.2, 光25G §2.4.1.1.2), which are exactly the
+  deployments HB46PP serves. Re-discovery is periodic (RFC 4242 refresh) and, with a dynamic B4 (below),
+  also triggered by a WAN address change (the DS-Lite B4-address change of RFC 7785) — a changed AFTR
+  migrates gracefully (in-flight flows kept on the old AFTR until they drain), a changed B4 hard-switches.
 - **Dynamic B4** (automatic unless `-b4` is given) — the B4's own softwire source is selected from the
   WAN's kernel-chosen source toward the AFTR (RFC 6724, via an `RTM_GETROUTE`/`RTA_PREFSRC` query) and
   re-selected when the WAN address changes (renumbering/lease/reconnect), so the softwire survives a WAN
@@ -415,7 +422,10 @@ orphaned the running kernel's module directory — reboot to fix that).
   RFC 3315 stateful exchanges a PD client needs. `duid.go` (DUID-LL from a MAC — regenerated fresh each run
   rather than persisted, since it's a pure function of hardware-type+MAC), `message.go`/`options.go` (wire
   codec; option *codes* for options a consuming package decodes itself, e.g. `OptionIAPD`/`OptionIAPrefix`/
-  `OptionAFTRName`, live here as bare constants, but their actual decoding does not), `retransmit.go` (pure
+  `OptionAFTRName`, live here as bare constants, but their actual decoding does not — the exception being
+  options that are generic DHCPv6 *and* have more than one consumer here, which get an `Options` accessor
+  instead of being decoded once per consumer: `InformationRefreshTime()` (RFC 4242) and `DNSServers()`
+  (RFC 3646, read by both `pkg/aftrdiscovery` and `pkg/prefixdelegation`)), `retransmit.go` (pure
   RFC 3315 §5.5/§14 timing for every exchange — initial jitter via `randDelay`, then backoff capped at each
   exchange's MRT with jitter re-applied around the cap forever, *not* clamped to a fixed value; Request/
   Release additionally have a maximum retransmission *count*), `transport.go` (`ListenUDP`, never
@@ -473,7 +483,13 @@ orphaned the running kernel's module directory — reboot to fix that).
   `Lease` holds the delegating server's DUID plus the delegated prefixes and T1/T2; `clientIAID` is a fixed
   (not random or per-run-derived) constant so the server has the best chance of handing back the same
   prefix across a minuteman restart, avoiding LAN renumbering — same rationale as `duid.go`'s stable
-  DUID-LL. `acquire.go`'s `Acquire()` drives the full Solicit→Advertise→Request→Reply exchange (blocks,
+  DUID-LL. `Lease` also carries the Reply's `DNSServers` (RFC 3646), requested via the `requestedOptions`
+  ORO every exchange in this package sends: nothing to do with the delegation itself, but on a network
+  that doesn't answer Information-Request this stateful exchange is the *only* DHCPv6 source of a
+  resolver, and `cmd/minuteman`'s HB46PP fallback needs one — a renewal takes its servers from its own
+  Reply rather than inheriting the previous lease's, since the ORO went out with it too, so silence is
+  the server declining rather than the question going unasked. `acquire.go`'s `Acquire()` drives the full
+  Solicit→Advertise→Request→Reply exchange (blocks,
   retrying, until it succeeds or ctx is cancelled — same rationale as `aftrdiscovery.Discover`).
   `maintain.go`'s `Maintain()` is the part `aftrdiscovery` deliberately leaves as future work for its own
   refresh interval: a lease that's never renewed actually expires and breaks LAN connectivity, so this
@@ -666,16 +682,27 @@ orphaned the running kernel's module directory — reboot to fix that).
   instance from the bpffs-pinned stats map via `datapath.ReadPinnedStats` — text as `Name: value` lines
   (shell-friendly), `-json` as the `Stats` struct (`jq .DecapMartian`); needs the same root/CAP_BPF the
   daemon needs.
+  Startup order is load-bearing in one place: when `-dhcpv6-pd` is set, `run()` calls
+  `prefixdelegation.Acquire` **before** `resolveAFTR`, and hands the lease's DNS servers (via
+  `pdDNSServers`) to AFTR discovery, to `runAFTRRediscovery`, and — as a last fallback behind
+  `-dns-server` and the discovery-learned set — to `-dns-proxy`'s upstreams. The rest of the PD setup
+  (LAN address assignment, RA workers, `Maintain`) still runs in its old position, with `runPrefixDelegation`
+  now taking the already-acquired lease. Both exchanges bind the same WAN DHCPv6 socket and are serialized
+  by `pkg/dhcpv6`'s own per-interface lock, so only their order changed, not their concurrency.
   `resolveAFTR()` returns `-aftr` parsed directly if given (in which case its second return, the DNS
   servers `-dns-proxy` defaults to using, is nil — that path skips the DHCPv6 exchange entirely), otherwise
   blocks on `pkg/aftrdiscovery.Discover`
-  using the same lifecycle context as `SIGINT`/`SIGTERM` handling (no artificial timeout — indefinite
-  RFC 3315 retry is correct here, since there's no working DS-Lite path without an AFTR anyway). On
-  `aftrdiscovery.ErrNoAFTRName` it falls back to `hb46pp.Discover` (capability `dslite` only, DNS servers
-  from the partial DHCPv6 result, client identity from the three `-hb46pp-*` flags bundled into an
-  `hb46ppIdentity`), looping the whole DHCPv6→HB46PP chain with `hb46pp.RetryDelay`-paced sleeps on HB46PP
-  failure — same block-until-success-or-ctx-cancel stance, but at the spec's backoff cadence so a real
-  VNE's provisioning server isn't hammered. The B4 softwire source is `-b4` if given, else resolved
+  using the same lifecycle context as `SIGINT`/`SIGTERM` handling, bounding only the Information-Request
+  phase at `informationRequestTimeout` (the AFTR-name DNS resolution that follows is not bounded, so a
+  timeout unambiguously means "nothing answered"). It falls back to `hb46pp.Discover` (capability `dslite`
+  only, client identity from the three `-hb46pp-*` flags bundled into an `hb46ppIdentity`) on either
+  `aftrdiscovery.ErrNoAFTRName` — DNS servers from the partial DHCPv6 result — or
+  `aftrdiscovery.ErrNoReply`, where there is no partial result at all and the DNS servers are the
+  PD lease's. It loops the whole DHCPv6→HB46PP chain with `retryDelayFor`-paced sleeps on HB46PP
+  failure — same block-until-success-or-ctx-cancel stance, at the spec's backoff cadence so a real
+  VNE's provisioning server isn't hammered, except that a failure reached *through* `ErrNoReply` is capped
+  at `noReplyRetryCap` (5min): `hb46pp.RetryDelay`'s hours-long `ErrNotProvisioned` verdict would there
+  have been reached without any evidence from DHCPv6 about what kind of network this is. The B4 softwire source is `-b4` if given, else resolved
   dynamically by `resolveB4()` — a `pkg/netlink.Socket.SourceForDest` (`RTM_GETROUTE`/`RTA_PREFSRC`) query
   run after `AttachWAN`, retrying until the WAN's RA-learned route to the AFTR is back, so the kernel's
   RFC 6724 logic picks the exact source its own ip6tnl would. `runAFTRRediscovery()` (started whenever the

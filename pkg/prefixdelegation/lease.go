@@ -1,6 +1,7 @@
 package prefixdelegation
 
 import (
+	"net/netip"
 	"time"
 
 	"github.com/shun159/miniteman/pkg/dhcpv6"
@@ -24,21 +25,30 @@ var clientIAID = [4]byte{0, 0, 0, 1}
 // sending 0, in which case effectiveTimers has picked the value (RFC 9915
 // §14.2).
 type Lease struct {
-	ServerID   dhcpv6.DUID
-	Prefixes   []IAPrefix
-	T1, T2     time.Duration
+	ServerID dhcpv6.DUID
+	Prefixes []IAPrefix
+	T1, T2   time.Duration
+
+	// DNSServers is OPTION_DNS_SERVERS from the granting Reply (RFC 3646),
+	// nil if the server sent none. It has nothing to do with the delegation
+	// itself; it's here because this exchange is the only one that learns it
+	// on a network that doesn't answer Information-Request, and a caller
+	// that needs a resolver before it has one has nowhere else to look.
+	DNSServers []netip.Addr
+
 	AcquiredAt time.Time
 }
 
 // newLease builds the Lease a granted IA_PD represents, resolving the
 // renewal timers to run it on through effectiveTimers.
-func newLease(serverID dhcpv6.DUID, iapd *IAPD) *Lease {
+func newLease(serverID dhcpv6.DUID, iapd *IAPD, dnsServers []netip.Addr) *Lease {
 	t1, t2 := effectiveTimers(iapd)
 	return &Lease{
 		ServerID:   serverID,
 		Prefixes:   iapd.Prefixes,
 		T1:         t1,
 		T2:         t2,
+		DNSServers: dnsServers,
 		AcquiredAt: time.Now(),
 	}
 }
