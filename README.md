@@ -72,6 +72,34 @@ The complete option list is also available from:
 bin/minuteman -h
 ```
 
+### Reading statistics
+
+`minuteman stats` reports the datapath counters of a *running* instance, read out-of-band from the
+BPF map it pins at `/sys/fs/bpf/minuteman/stats`. It needs the same root/`CAP_BPF` the daemon does,
+but does not disturb it.
+
+```sh
+sudo bin/minuteman stats            # one `Name: value` line per datapath counter
+sudo bin/minuteman stats -json      # the same counters as a JSON object
+sudo bin/minuteman stats -iface     # also every XDP-bound interface's driver counters
+```
+
+`-iface` adds what `ethtool -S <interface>` would print for each interface the datapath has an XDP
+program attached to — the WAN, every LAN, and the softwire fragmenter's companion veths — labelled
+with the role each plays:
+
+```
+v-cpe-isp (ifindex 4, role wan, xdp prog id 1903):
+  rx_queue_0_xdp_packets: 14
+  rx_queue_0_xdp_redirect: 7
+  ...
+```
+
+The interface list comes from the kernel, not from flags: a link dump reports each device's attached
+XDP program, and the programs belonging to the running instance are the ones sharing its pinned stats
+map. So the list is always exactly what is attached, and `stats` has to be run in the same network
+namespace as the datapath to see them.
+
 ## Examples
 
 DS-Lite with DHCPv6 Prefix Delegation:

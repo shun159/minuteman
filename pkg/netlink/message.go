@@ -180,6 +180,14 @@ func buildIfInfoBody(ifindex int, flags, change uint32) []byte {
 	return body
 }
 
+// buildGetLinkMessage builds an RTM_GETLINK dump request for every network
+// device (`ip link show`). The ifinfomsg is left all-zero -- AF_UNSPEC, no
+// ifindex -- since the kernel's link dump ignores request-side ifindex
+// filtering, and Links wants the whole list anyway.
+func buildGetLinkMessage(seq uint32) []byte {
+	return buildMessage(unix.RTM_GETLINK, unix.NLM_F_REQUEST|unix.NLM_F_DUMP, seq, buildIfInfoBody(0, 0, 0))
+}
+
 // buildIP6TnlLinkInfo builds the IFLA_LINKINFO attribute for an ip6tnl in
 // ipip6 (IPv4-in-IPv6) mode with the given softwire endpoints:
 // {IFLA_INFO_KIND="ip6tnl", IFLA_INFO_DATA{LOCAL, REMOTE, PROTO=IPPROTO_IPIP,
@@ -412,6 +420,82 @@ func parseIfAddrMsg(payload []byte, wantIfindex int) (netip.Prefix, bool) {
 		return netip.Prefix{}, false
 	}
 	return netip.PrefixFrom(addr, int(prefixLen)), true
+}
+
+// Link is one network device as an RTM_GETLINK dump reports it, trimmed to
+// what minuteman's per-interface statistics view needs: the device's identity
+// plus the id of the XDP program attached to it.
+type Link struct {
+	Index int
+	Name  string
+	// XDPProgID is the kernel id of the device's attached XDP program, or 0
+	// when it has none. IFLA_XDP_PROG_ID is the id whatever attach mode is in
+	// use (native/generic/offload), which is what a reader wants -- the
+	// per-mode IFLA_XDP_*_PROG_ID attributes only say which mode it is.
+	XDPProgID uint32
+}
+
+// parseIfInfoMsg parses an RTM_NEWLINK dump entry (ifinfomsg, header
+// stripped). ok is false for a message carrying no ifindex or no IFLA_IFNAME,
+// neither of which a real link dump entry omits.
+func parseIfInfoMsg(payload []byte) (Link, bool) {
+	if len(payload) < unix.SizeofIfInfomsg {
+		return Link{}, false
+	}
+	link := Link{Index: int(binary.NativeEndian.Uint32(payload[4:8]))}
+
+	attrs := payload[unix.SizeofIfInfomsg:]
+	for len(attrs) >= unix.SizeofRtAttr {
+		attrLen := binary.NativeEndian.Uint16(attrs[0:2])
+		attrType := binary.NativeEndian.Uint16(attrs[2:4])
+		if int(attrLen) < unix.SizeofRtAttr || int(attrLen) > len(attrs) {
+			break
+		}
+		value := attrs[unix.SizeofRtAttr:attrLen]
+		switch attrType {
+		case unix.IFLA_IFNAME:
+			if i := bytes.IndexByte(value, 0); i >= 0 {
+				value = value[:i]
+			}
+			link.Name = string(value)
+		case unix.IFLA_XDP:
+			link.XDPProgID = parseXDPProgID(value)
+		}
+
+		next := nlmsgAlign(int(attrLen))
+		if next > len(attrs) {
+			break
+		}
+		attrs = attrs[next:]
+	}
+
+	if link.Index == 0 || link.Name == "" {
+		return Link{}, false
+	}
+	return link, true
+}
+
+// parseXDPProgID walks an IFLA_XDP container attribute's payload (itself a run
+// of plain TLVs, like every nested netlink attribute -- see encodeNestedAttr)
+// for IFLA_XDP_PROG_ID. Returns 0 when the device has no XDP program: the
+// kernel still emits IFLA_XDP, carrying only IFLA_XDP_ATTACHED = none.
+func parseXDPProgID(attrs []byte) uint32 {
+	for len(attrs) >= unix.SizeofRtAttr {
+		attrLen := binary.NativeEndian.Uint16(attrs[0:2])
+		attrType := binary.NativeEndian.Uint16(attrs[2:4])
+		if int(attrLen) < unix.SizeofRtAttr || int(attrLen) > len(attrs) {
+			return 0
+		}
+		if attrType == unix.IFLA_XDP_PROG_ID && int(attrLen) >= unix.SizeofRtAttr+4 {
+			return binary.NativeEndian.Uint32(attrs[unix.SizeofRtAttr : unix.SizeofRtAttr+4])
+		}
+		next := nlmsgAlign(int(attrLen))
+		if next > len(attrs) {
+			return 0
+		}
+		attrs = attrs[next:]
+	}
+	return 0
 }
 
 // parseAckErrno parses a netlink response as an NLMSG_ERROR (rtnetlink(7)'s
