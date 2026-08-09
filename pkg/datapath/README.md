@@ -33,6 +33,7 @@ not a pre-raised memlock limit.
 | `ipv6_rss.go` | `EnableIPv6SoftwareRSS` (the optional native-IPv6 cpumap stage) |
 | `stats.go` | `Stats()`, `ReadPinnedStats()`, the hand-maintained `statID` enum |
 | `pin.go` | pinning the stats map to bpffs |
+| `xdproles.go` | `XDPRoles` — which attached XDP program ids are this instance's, and what each does |
 | `sysctl.go` | the forwarding / `accept_ra` sysctls the FIB lookups need |
 
 ## Attach, and the sysctls that come with it
@@ -186,6 +187,21 @@ bpffs-mount hint; `Close` unpins best-effort.
 > **Running inside a netns:** `ip netns exec` creates a new mount namespace and remounts `/sys`,
 > stranding the pin on a private bpffs. Enter with `nsenter --net=...` instead — the netns rig
 > does exactly that. See `test/netns/README.md`'s "Reading datapath stats".
+
+### Which interfaces is the datapath on? (`xdproles.go`)
+
+`XDPRoles(progIDs)` answers that for an out-of-band observer, given the XDP program ids a link
+dump reports (`pkg/netlink`'s `Link`): it returns an entry only for the ids belonging to the
+**running** instance, labelled `wan` / `lan` / `frag`. `cmd/minuteman`'s `stats -iface` uses it to
+pair each interface with `pkg/ethtool`'s driver counters.
+
+Membership is decided by the program **referencing the same map the pin points at**, not by its
+name. A name proves nothing — an unrelated XDP program can share one, and so can a stale second
+minuteman whose pin has already been replaced — whereas a map id is unique per loaded map. Every
+interface-attached program bumps a stats counter, so this check misses none of them. The name is
+then used only for the role label, comparing both sides truncated to `BPF_OBJ_NAME_LEN-1`: the
+kernel's name field is 15 characters, and `cilium/ebpf` recovers the untruncated name from BTF
+func info only when the object carries it.
 
 ## Optional: native-IPv6 software RSS
 

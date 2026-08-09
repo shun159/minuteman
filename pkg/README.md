@@ -15,14 +15,16 @@ AFTR, what a confirmed neighbor implies for the routing table. That lives in
 | [`routeradvert`](routeradvert/) | RFC 4861: sending RAs on the LAN, RSes on the WAN | — |
 | [`ndproxy`](ndproxy/) | RFC 4389 Neighbor Discovery Proxy, actively verified | — |
 | [`netlink`](netlink/) | hand-rolled `NETLINK_ROUTE` client — the only netlink wire code | — |
+| [`ethtool`](ethtool/) | hand-rolled `SIOCETHTOOL` client: a device's `ethtool -S` driver counters | — |
 | [`dnsproxy`](dnsproxy/) | RFC 6333's B4 SHOULD: an opaque DNS byte relay over native IPv6 | — |
 | [`dhcpv4`](dhcpv4/) | RFC 2131/2132 LAN-side DHCPv4 server | — |
 
 ## Conventions these packages share
 
-**Stdlib and `x/sys/unix` only.** No DHCP library, no netlink library, no `x/net/icmp` — and no
-sidecar processes. Constants the Go ecosystem doesn't export (`ICMP6_FILTER`, `IFLA_IPTUN_*`) are
-vendored locally, the same way `bpf/uapi/linux/*.h` vendors what BTF-derived `vmlinux.h` lacks.
+**Stdlib and `x/sys/unix` only.** No DHCP library, no netlink library, no `x/net/icmp`, no ethtool
+library — and no sidecar processes. Constants the Go ecosystem doesn't export (`ICMP6_FILTER`,
+`IFLA_IPTUN_*`, `ETH_SS_STATS`) are vendored locally, the same way `bpf/uapi/linux/*.h` vendors
+what BTF-derived `vmlinux.h` lacks.
 
 **Pure logic separated from I/O, so it can be unit-tested.** `ndproxy`'s `proxyState`, `dhcpv4`'s
 `Pool` and `handle`, `prefixdelegation`'s `effectiveTimers`, `dhcpv6`'s retransmission formulas —

@@ -9,12 +9,24 @@ import (
 	"github.com/shun159/miniteman/pkg/datapath"
 )
 
+// statsOutput is what `minuteman stats -json` encodes. datapath.Stats is
+// embedded rather than nested so its counters stay top-level JSON fields --
+// `jq .DecapMartian` keeps working, and Interfaces (present only under
+// -iface) is additive.
+type statsOutput struct {
+	datapath.Stats
+	Interfaces []ifaceStats `json:",omitempty"`
+}
+
 // runStats implements the `minuteman stats` subcommand: read the stats map a
 // running minuteman pinned to bpffs and print it, without touching the
 // running process (needs the same root/CAP_BPF the daemon itself needs).
+// With -iface it additionally reports each XDP-attached interface's driver
+// counters, the equivalent of `ethtool -S` (see collectInterfaceStats).
 func runStats(args []string) error {
 	fs := flag.NewFlagSet("stats", flag.ExitOnError)
 	jsonOut := fs.Bool("json", false, "print stats as JSON (field names match pkg/datapath's Stats struct)")
+	withIfaces := fs.Bool("iface", false, "also report driver statistics (the `ethtool -S` counters) for every interface the datapath has XDP attached to")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -27,11 +39,17 @@ func runStats(args []string) error {
 	if err != nil {
 		return err
 	}
+	out := statsOutput{Stats: stats}
+	if *withIfaces {
+		if out.Interfaces, err = collectInterfaceStats(); err != nil {
+			return err
+		}
+	}
 
 	if *jsonOut {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(stats)
+		return enc.Encode(out)
 	}
 
 	// One `Name: value` line per counter, in the Stats struct's (= the C
@@ -81,6 +99,10 @@ func runStats(args []string) error {
 		{"MSSClamped", stats.MSSClamped},
 	} {
 		fmt.Printf("%s: %d\n", c.name, c.value)
+	}
+
+	if *withIfaces {
+		printInterfaceStats(out.Interfaces)
 	}
 	return nil
 }

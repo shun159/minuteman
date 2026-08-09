@@ -100,6 +100,54 @@ func (s *Socket) Addrs(ifindex int) ([]netip.Prefix, error) {
 	}
 }
 
+// Links lists every network device via an RTM_GETLINK dump (`ip link show`),
+// reporting each one's index, name and attached XDP program id -- enough for
+// `minuteman stats` to find the interfaces the datapath is bound to without
+// the daemon having to publish that list anywhere.
+func (s *Socket) Links() ([]Link, error) {
+	s.seq++
+	seq := s.seq
+	if err := unix.Send(s.fd, buildGetLinkMessage(seq), 0); err != nil {
+		return nil, fmt.Errorf("netlink: sending RTM_GETLINK: %w", err)
+	}
+
+	// A link dump entry is far larger than an address one (every device
+	// carries its rtnl_link_stats64 and a pile of per-protocol attributes), so
+	// unlike Addrs this reads into a buffer several pages wide: a Recvfrom
+	// buffer shorter than the kernel's next dump message silently truncates it.
+	var result []Link
+	buf := make([]byte, linkDumpBufSize)
+	for {
+		n, _, err := unix.Recvfrom(s.fd, buf, 0)
+		if err != nil {
+			return nil, fmt.Errorf("netlink: reading RTM_GETLINK dump: %w", err)
+		}
+		msgs, err := walkMessages(buf[:n])
+		if err != nil {
+			return nil, err
+		}
+		for _, m := range msgs {
+			switch m.Type {
+			case unix.NLMSG_DONE:
+				return result, nil
+			case unix.NLMSG_ERROR:
+				if err := parseAckErrno(m.Raw, seq); err != nil {
+					return nil, err
+				}
+			case unix.RTM_NEWLINK:
+				if l, ok := parseIfInfoMsg(m.Raw[unix.SizeofNlMsghdr:]); ok {
+					result = append(result, l)
+				}
+			}
+		}
+	}
+}
+
+// linkDumpBufSize is the Recvfrom buffer Links reads a dump chunk into. The
+// kernel caps a dump skb at 32 KiB unless a single message needs more, so this
+// leaves headroom for the largest entry an unusual device could produce.
+const linkDumpBufSize = 64 * 1024
+
 // SourceForDest asks the kernel which local IPv6 address it would use as the
 // source when sending to dst out ifindex -- an RTM_GETROUTE query (`ip route
 // get <dst> oif <ifindex>`), so the kernel runs its own RFC 6724 source-address

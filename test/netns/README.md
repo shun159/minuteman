@@ -181,6 +181,19 @@ namespace, keeping the host's `/sys/fs/bpf`, so the commands above work from the
 (pins are mount-namespace state, not netns state). `smoketest.sh`'s counter assertions (`read_stat`) are
 before/after deltas over this same subcommand.
 
+`-iface` additionally reports each XDP-bound interface's driver counters (the `ethtool -S` set). Those
+interfaces live in `mm-cpe`, so unlike the commands above it has to be run *inside* the namespace —
+which still works because `nsenter --net` leaves the host's `/sys/fs/bpf` in place:
+
+```sh
+sudo nsenter --net=/var/run/netns/mm-cpe bin/minuteman stats -iface
+```
+
+It's the quickest way to see the softwire fragmenter working under `MM_SOFTWIRE_FRAG=1`: each
+`mm-frag<i>p` companion veth shows `rx_queue_0_xdp_redirect` for the clones it turned into a real
+fragment and `rx_queue_0_xdp_drops` for the ones the packet didn't need, which should add up to the
+`EncapFragSeg`/`EncapFragXDP` counters above.
+
 Two things worth knowing if you touch these scripts:
 - `mm-cpe` needs both `net.ipv4.ip_forward=1` and `net.ipv6.conf.all.forwarding=1`, or `bpf_fib_lookup()` in
   the datapath returns `BPF_FIB_LKUP_RET_FWD_DISABLED` for every packet and nothing gets encapsulated;

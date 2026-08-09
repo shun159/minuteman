@@ -101,7 +101,7 @@ serving), `wanextend` (NDProxy LAN policy, including RA serving and host-route m
 (the DS-Lite companion `ip6tnl` lifecycle for softwire reassembly + fragmentation fallback), and
 `fragpath` (the companion veth pairs the in-XDP softwire fragmenter bounces its clones through);
 `pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/`pkg/prefixdelegation`/`pkg/routeradvert`/`pkg/ndproxy`/
-`pkg/netlink`/`pkg/dnsproxy`/`pkg/dhcpv4` are the reusable protocol packages. Every package under both
+`pkg/netlink`/`pkg/dnsproxy`/`pkg/dhcpv4`/`pkg/ethtool` are the reusable protocol packages. Every package under both
 trees carries its own `README.md` covering its rationale in more depth than the Architecture section
 below, indexed by `internal/README.md` and `pkg/README.md`.
 
@@ -417,6 +417,20 @@ orphaned the running kernel's module directory — reboot to fix that).
     that runs minuteman inside a netns: `ip netns exec` creates a new mount namespace and remounts
     `/sys`, stranding the pin on a private bpffs — enter with `nsenter --net=...` instead (the netns rig
     does; see `test/netns/README.md`'s "Reading datapath stats").
+  - `xdproles.go` — `XDPRoles(progIDs)` classifies the XDP program ids a link dump reported
+    (`pkg/netlink.Socket.Links`), returning an entry only for the ones belonging to the *running*
+    instance and labelling each `wan`/`lan`/`frag`; it's what lets `minuteman stats -iface` name the
+    datapath's interfaces without the daemon publishing a list. Membership is decided by the program
+    referencing the same map the bpffs pin points at (`pinnedStatsMapID` + `ProgramInfo.MapIDs`), *not*
+    by its name: a name is not unique — an unrelated XDP program can share one, so can a stale second
+    minuteman whose pin was already replaced — whereas a map id is unique per loaded map, and every
+    interface-attached program bumps a stats counter so none is missed. The name is used only for the
+    role label, comparing both sides truncated to `BPF_OBJ_NAME_LEN-1` (15) because the kernel's name
+    field is that wide and `cilium/ebpf` un-truncates from BTF func info only when the object carries
+    it — so `xdp_dslite_encap` arrives whole or as `xdp_dslite_enca` depending on the build, and
+    truncating both sides classifies either identically. A program id that can't be opened or inspected
+    is treated as not ours rather than as an error (the dump is a snapshot; a device can lose its
+    program in between).
   - IPv4/IPv6 addresses are exchanged with the BPF maps as `netip.Addr` at the API boundary; internally they're
     converted to the `in6_u.u6_addr8`/big-endian-`uint32` layouts the generated `bpfB4Config`/`bpfLanConfig`
     structs expect (see `config.go`).
@@ -606,7 +620,14 @@ orphaned the running kernel's module directory — reboot to fix that).
   `/0` prefix omits `RTA_DST`; `AddRoute` is `NLM_F_REPLACE`-idempotent too), and
   `AddIP6Tnl`/`SetIP6TnlEndpoints`/`AddVeth`/`SetLinkUp`/`SetLinkMTU`/`DelLink` for the companion device
   lifecycles (`SetLinkMTU` exists for the ip6tnl's MTU, which has to follow a learned softwire path MTU or
-  the fallback keeps fragmenting to a size the path drops).
+  the fallback keeps fragmenting to a size the path drops). `Links` is the one read-only link operation
+  (`buildGetLinkMessage`/`parseIfInfoMsg`/`parseXDPProgID`): an `RTM_GETLINK` dump giving each device's
+  index, name and attached XDP program id (`IFLA_XDP` → `IFLA_XDP_PROG_ID` — the id for whatever attach
+  mode is in use, where the per-mode `IFLA_XDP_*_PROG_ID` attributes only report *which* mode), which is
+  how `minuteman stats -iface` finds the datapath's interfaces without the daemon publishing them. It
+  reads into a 64 KiB buffer rather than `Addrs`' single page: a link dump entry carries the device's
+  whole `rtnl_link_stats64` plus per-protocol attributes, and a `Recvfrom` buffer shorter than the
+  kernel's next dump message silently truncates it.
 - **`pkg/dnsproxy/`** — the DNS proxy RFC 6333 recommends a DS-Lite B4 run (the B4 SHOULD act as a DNS
   proxy for LAN clients): opaque byte-relay only, no DNS message parsing, caching, or rewriting of any
   kind, so it's simple enough to have no unit tests of its own (like `pkg/ndproxy`/`pkg/routeradvert`'s raw
@@ -658,6 +679,28 @@ orphaned the running kernel's module directory — reboot to fix that).
   read error rather than swallowing it (a fake `conn` makes that testable). See the `xdp_dslite_encap`
   `is_non_unicast_dst` bypass above for why the datapath had to change before any of this could receive a
   packet.
+- **`pkg/ethtool/`** — minimal hand-rolled `SIOCETHTOOL` client reading exactly one thing: a device's
+  driver-specific statistics, i.e. what `ethtool -S <iface>` prints, for `minuteman stats -iface`. Three
+  ioctls in the sequence `ethtool(8)` itself uses — `ETHTOOL_GSSET_INFO` (how many `ETH_SS_STATS`
+  counters), `ETHTOOL_GSTRINGS` (their names, fixed 32-byte NUL-padded fields), `ETHTOOL_GSTATS` (their
+  `__u64` values) — with the `ifreq`+`ifr_data` layout and the constants `x/sys/unix` doesn't export
+  (`ETH_SS_STATS`, `ETH_GSTRING_LEN`) vendored locally, same rationale as `pkg/netlink`'s `IFLA_IPTUN_*`.
+  Two non-obvious details: request buffers come from `alignedBuf` (allocating `[]uint64` and viewing it
+  as bytes) because `struct ethtool_stats`' trailing `__u64` array needs 8-byte alignment that
+  `make([]byte, n)` doesn't promise; and "no statistics" is not always an errno — the kernel *clears*
+  `sset_mask`'s bit for a string set the driver doesn't implement and returns success, while older
+  drivers return `EOPNOTSUPP`/`EINVAL`, so all three become the `ErrNotSupported` sentinel a caller can
+  report per interface without failing the others. Returns a slice, not a map, to preserve the driver's
+  own grouping (per queue, per XDP action) that alphabetising would scatter. The newer ethtool *netlink*
+  interface is **not an alternative** here, despite looking like the modern one: its own documentation
+  says `ETHTOOL_MSG_STATS_GET` "is not a re-implementation of `ETHTOOL_GSTATS` which exposed
+  driver-defined stats" — it returns the standardised `eth-phy`/`eth-mac`/`eth-ctrl`/`rmon`/`phy`
+  groups, while the driver-defined set (where every `xdp_packets`/`xdp_redirect`/`xdp_drops` counter
+  lives) has no netlink equivalent and `ethtool -S` itself still uses these ioctls for it. Those
+  standard groups could be *added* later — they'd need a generic-netlink client `pkg/netlink`
+  (`NETLINK_ROUTE` only) doesn't have, and a veth exposes none of them, so the netns rig couldn't cover
+  it. No unit tests — pure syscall wrappers, exercised by the netns rig like
+  `pkg/ndproxy`'s and `pkg/routeradvert`'s socket I/O.
 - **`cmd/minuteman/main.go`** — thin CLI entrypoint. Flags: `-wan`, `-b4` (optional — omitted means the
   softwire source is tracked dynamically; see `resolveB4`/`watchB4`/`runAFTRRediscovery` below), `-aftr`
   (optional — see below),
@@ -680,10 +723,22 @@ orphaned the running kernel's module directory — reboot to fix that).
   `docs/minuteman.service.example`, the systemd way to run minuteman in production). Flag-value
   parsing (`LANSpec`/`LANSpecList`, `AddrList`, MAC parsing) lives in `internal/cliconfig`, not in `main.go` itself.
   Besides the default flag-driven run, `main()` dispatches one subcommand before `flag.Parse`:
-  `minuteman stats [-json]` (`stats.go`'s `runStats`) prints the datapath counters of the *running*
-  instance from the bpffs-pinned stats map via `datapath.ReadPinnedStats` — text as `Name: value` lines
-  (shell-friendly), `-json` as the `Stats` struct (`jq .DecapMartian`); needs the same root/CAP_BPF the
-  daemon needs.
+  `minuteman stats [-json] [-iface]` (`stats.go`'s `runStats`) prints the datapath counters of the
+  *running* instance from the bpffs-pinned stats map via `datapath.ReadPinnedStats` — text as
+  `Name: value` lines (shell-friendly), `-json` as the `Stats` struct (`jq .DecapMartian`); needs the
+  same root/CAP_BPF the daemon needs. `-iface` (`ifstats.go`'s `collectInterfaceStats`) adds each
+  XDP-bound interface's driver counters — the `ethtool -S` set, read via `pkg/ethtool` — labelled
+  `wan`/`lan`/`frag`, which is what tells apart "the datapath didn't handle it" from "the packet never
+  arrived" (and makes the fragmenter's clone-and-trim visible per companion veth: `xdp_redirect` on the
+  pairs a packet needed, `xdp_drops` on the ones it didn't). The interface list is derived from the
+  *kernel*, not from the daemon or from `-wan`/`-lan`: `pkg/netlink.Socket.Links` (an `RTM_GETLINK`
+  dump) reports each device's attached XDP program id and `datapath.XDPRoles` says which of those ids
+  belong to this instance — by the program *referencing the pinned stats map*, not by name, since a
+  name is not unique but a map id is. So the list can't drift from what's really attached, covers the
+  companion veths no flag names, and needs nothing published beyond the pin — but `stats -iface` must
+  run in the datapath's own netns to see the interfaces (the pin itself is on the host bpffs; see
+  `pkg/datapath/pin.go`'s `nsenter --net` note). JSON embeds `Stats` rather than nesting it, so the
+  counters stay top-level fields and `Interfaces` is purely additive.
   Startup order is load-bearing in one place: when `-dhcpv6-pd` is set, `run()` calls
   `prefixdelegation.Acquire` **before** `resolveAFTR`, and hands the lease's DNS servers (via
   `pdDNSServers`) to AFTR discovery, to `runAFTRRediscovery`, and — as a last fallback behind
@@ -851,9 +906,11 @@ When implementing new functionality, follow this split: per-packet fast-path log
 `bpf/datapath.bpf.c`; anything that needs `cilium/ebpf` or knows about BPF map layouts goes in
 `pkg/datapath`; generic protocol/wire-format code goes in its own `pkg/` package the way
 `pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/`pkg/prefixdelegation`/`pkg/routeradvert`/`pkg/ndproxy`/
-`pkg/netlink`/`pkg/dnsproxy`/`pkg/dhcpv4` do; CLI-specific glue and policy decisions belong in `internal/` or `cmd/` (e.g.
-`internal/lanprefix`'s delegated-prefix-to-LAN-address and delegated-prefix-to-RA policy, or
-`internal/wanextend`'s WAN-prefix-discovery-to-RA and confirmed-target-to-host-route policy), calling into
+`pkg/netlink`/`pkg/dnsproxy`/`pkg/dhcpv4`/`pkg/ethtool` do; CLI-specific glue and policy decisions belong in `internal/` or `cmd/` (e.g.
+`internal/lanprefix`'s delegated-prefix-to-LAN-address and delegated-prefix-to-RA policy,
+`internal/wanextend`'s WAN-prefix-discovery-to-RA and confirmed-target-to-host-route policy, or
+`cmd/minuteman/ifstats.go` joining a netlink link dump, `pkg/datapath`'s program classification and
+`pkg/ethtool`'s counters into one report), calling into
 the `pkg/` packages rather than duplicating their logic.
 
 ## Design reference: gregw's XDP datapath
