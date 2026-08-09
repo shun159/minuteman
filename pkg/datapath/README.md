@@ -179,7 +179,7 @@ a stored map value type in the BTF (only as inlined integer constants), so `-typ
 nothing. New counters are appended before `STAT_MAX`.
 
 `pin.go` pins **only** the stats map, to `/sys/fs/bpf/minuteman/stats`, so it stays readable
-out-of-band while minuteman runs (`minuteman stats [-json]` via `ReadPinnedStats`, or `bpftool
+out-of-band while minuteman runs (`minuteman stats [--json]` via `ReadPinnedStats`, or `bpftool
 map dump pinned ...`). A stale pin from a crashed run is removed first (unpin-then-repin, the
 same stance `internal/slowpath` takes on stale devices); pin failure is fail-fast with a
 bpffs-mount hint; `Close` unpins best-effort.
@@ -192,7 +192,7 @@ bpffs-mount hint; `Close` unpins best-effort.
 
 `XDPRoles(progIDs)` answers that for an out-of-band observer, given the XDP program ids a link
 dump reports (`pkg/netlink`'s `Link`): it returns an entry only for the ids belonging to the
-**running** instance, labelled `wan` / `lan` / `frag`. `cmd/minuteman`'s `stats -iface` uses it to
+**running** instance, labelled `wan` / `lan` / `frag`. `cmd/minuteman`'s `stats interfaces` uses it to
 pair each interface with `pkg/ethtool`'s driver counters.
 
 Membership is decided by the program **referencing the same map the pin points at**, not by its

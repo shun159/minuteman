@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 
 	"github.com/shun159/miniteman/pkg/datapath"
@@ -38,7 +39,7 @@ type ifaceStats struct {
 // The interface list is derived from the kernel, not from the daemon: a link
 // dump gives each device's attached XDP program id, and pkg/datapath says which
 // of those ids belong to the instance owning the pinned stats map. So `stats
-// -iface` needs no cooperation from the running process beyond the pin it
+// interfaces` needs no cooperation from the running process beyond the pin it
 // already publishes, and can't drift out of sync with what's actually attached
 // (including the fragmenter's companion veths, which no flag names).
 func collectInterfaceStats() ([]ifaceStats, error) {
@@ -96,22 +97,34 @@ func collectInterfaceStats() ([]ifaceStats, error) {
 	return out, nil
 }
 
-// printInterfaceStats writes the per-interface section of `minuteman stats
-// -iface`'s text output, indented under a header line per interface the way
-// `ethtool -S` prints its own.
-func printInterfaceStats(ifaces []ifaceStats) {
+// printInterfaceStats writes `minuteman stats interfaces`' text output:
+// counters indented under a header line per interface, the way `ethtool -S`
+// prints its own, with a blank line between interfaces.
+func printInterfaceStats(w io.Writer, ifaces []ifaceStats) error {
 	if len(ifaces) == 0 {
-		fmt.Println("\nNo interfaces have minuteman XDP programs attached.")
-		return
+		_, err := fmt.Fprintln(w, "No interfaces have minuteman XDP programs attached.")
+		return err
 	}
-	for _, i := range ifaces {
-		fmt.Printf("\n%s (ifindex %d, role %s, xdp prog id %d):\n", i.Name, i.Ifindex, i.Role, i.XDPProgID)
+	for n, i := range ifaces {
+		if n > 0 {
+			if _, err := fmt.Fprintln(w); err != nil {
+				return err
+			}
+		}
+		if _, err := fmt.Fprintf(w, "%s (ifindex %d, role %s, xdp prog id %d):\n", i.Name, i.Ifindex, i.Role, i.XDPProgID); err != nil {
+			return err
+		}
 		if i.Note != "" {
-			fmt.Printf("  %s\n", i.Note)
+			if _, err := fmt.Fprintf(w, "  %s\n", i.Note); err != nil {
+				return err
+			}
 			continue
 		}
 		for _, s := range i.ordered {
-			fmt.Printf("  %s: %d\n", s.Name, s.Value)
+			if _, err := fmt.Fprintf(w, "  %s: %d\n", s.Name, s.Value); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }

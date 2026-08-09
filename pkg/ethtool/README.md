@@ -3,11 +3,11 @@
 A minimal, hand-rolled `SIOCETHTOOL` client that reads one thing: a network device's
 driver-specific statistics — the counters `ethtool -S <interface>` prints.
 
-It exists so `minuteman stats -iface` can show, in the same output as the datapath's own counters,
-what the drivers underneath the XDP programs see: a veth's `rx_queue_N_xdp_packets` /
-`xdp_redirect` / `xdp_drops`, a real NIC's per-queue and per-XDP-action counters. Those are the
-numbers that distinguish "the datapath didn't handle it" from "the packet never arrived", and
-having them beside the datapath counters removes a manual correlation step between two tools.
+It exists so `minuteman stats interfaces` can show what the drivers underneath the XDP programs see:
+a veth's `rx_queue_N_xdp_packets` / `xdp_redirect` / `xdp_drops`, a real NIC's per-queue and
+per-XDP-action counters. Those are the numbers that distinguish "the datapath didn't handle it"
+from "the packet never arrived", and having them a sibling subcommand away from the datapath's own
+counters removes a manual correlation step between two tools.
 
 No `ethtool` exec and no ethtool library — the same no-sidecar stance as `pkg/netlink`
 (hand-rolled rtnetlink) and `pkg/datapath/sysctl.go` (writes `/proc/sys` rather than exec'ing

@@ -28,7 +28,9 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"regexp"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -135,10 +137,15 @@ type hb46ppIdentity struct {
 }
 
 func main() {
-	// Subcommand dispatch, before flag.Parse so the flag-only invocation
-	// stays the default (backward-compatible) run behavior.
-	if len(os.Args) > 1 && os.Args[1] == "stats" {
-		if err := runStats(os.Args[2:]); err != nil {
+	// Subcommand dispatch, before flag.Parse so the flag-only invocation --
+	// the gateway itself -- stays the default run behavior. A first argument
+	// that isn't a flag is a subcommand, and cobra owns the whole tree from
+	// there (see newRootCmd), including rejecting a mistyped one; run()'s own
+	// flags are still the stdlib flag package's.
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+		root := newRootCmd()
+		root.SetArgs(normalizeLegacyArgs(os.Args[1:]))
+		if err := root.Execute(); err != nil {
 			log.Fatal(err)
 		}
 		return
@@ -146,6 +153,39 @@ func main() {
 	if err := run(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// legacyLongFlag matches a Go-flag-style long option: a single dash, a name of
+// more than one character, optionally =value. It deliberately does not match a
+// one-character name (a real pflag shorthand, e.g. -h) or something that only
+// looks flag-like (-5).
+var legacyLongFlag = regexp.MustCompile(`^-[A-Za-z][-_A-Za-z0-9]+(=.*)?$`)
+
+// normalizeLegacyArgs rewrites Go-flag-style single-dash long options into the
+// double-dash form pflag requires: -json becomes --json.
+//
+// This binary necessarily speaks both dialects. The gateway's own flags are
+// still the stdlib flag package's, where -wan and --wan are the same thing, so
+// leaving `stats -json` to fail with pflag's "unknown shorthand flag: 'j'"
+// (a single dash being a cluster of shorthands there) would put two
+// incompatible conventions in one command line -- and would break the form the
+// stats subcommand documented before it moved to cobra. Every previously
+// documented invocation keeps working instead.
+//
+// Rewriting stops at a bare "--", which both packages treat as the
+// end-of-flags terminator.
+func normalizeLegacyArgs(args []string) []string {
+	out := make([]string, len(args))
+	copy(out, args)
+	for i, a := range out {
+		if a == "--" {
+			break
+		}
+		if legacyLongFlag.MatchString(a) {
+			out[i] = "-" + a
+		}
+	}
+	return out
 }
 
 // onlineCPUs returns the CPU ids to fan native-IPv6 forwarding across when

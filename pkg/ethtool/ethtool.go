@@ -1,9 +1,9 @@
 // Package ethtool is a minimal, hand-rolled SIOCETHTOOL client covering
 // exactly one thing: reading a network device's driver-specific statistics --
 // the counters `ethtool -S <iface>` prints. minuteman uses it to report, from
-// its own `stats` subcommand, what the drivers underneath the XDP datapath
-// see (a veth's xdp_packets/xdp_drops, a real NIC's per-queue and per-XDP
-// counters), so an operator needn't correlate two tools' output by hand.
+// its own `stats interfaces` subcommand, what the drivers underneath the XDP
+// datapath see (a veth's xdp_packets/xdp_drops, a real NIC's per-queue and
+// per-XDP counters), so an operator needn't correlate two tools' output by hand.
 //
 // No ethtool library dependency and no `ethtool` exec, matching this project's
 // no-sidecar, no-external-process ethos (pkg/netlink hand-rolls rtnetlink the

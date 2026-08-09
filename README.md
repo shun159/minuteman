@@ -79,13 +79,14 @@ BPF map it pins at `/sys/fs/bpf/minuteman/stats`. It needs the same root/`CAP_BP
 but does not disturb it.
 
 ```sh
-sudo bin/minuteman stats            # one `Name: value` line per datapath counter
-sudo bin/minuteman stats -json      # the same counters as a JSON object
-sudo bin/minuteman stats -iface     # also every XDP-bound interface's driver counters
+sudo bin/minuteman stats                    # one `Name: value` line per datapath counter
+sudo bin/minuteman stats --json             # the same counters as a JSON object
+sudo bin/minuteman stats interfaces         # every XDP-bound interface's driver counters
+sudo bin/minuteman stats interfaces --json  # the same, as a JSON array
 ```
 
-`-iface` adds what `ethtool -S <interface>` would print for each interface the datapath has an XDP
-program attached to — the WAN, every LAN, and the softwire fragmenter's companion veths — labelled
+`stats interfaces` prints what `ethtool -S <interface>` would, for each interface the datapath has an
+XDP program attached to — the WAN, every LAN, and the softwire fragmenter's companion veths — labelled
 with the role each plays:
 
 ```
@@ -97,8 +98,8 @@ v-cpe-isp (ifindex 4, role wan, xdp prog id 1903):
 
 The interface list comes from the kernel, not from flags: a link dump reports each device's attached
 XDP program, and the programs belonging to the running instance are the ones sharing its pinned stats
-map. So the list is always exactly what is attached, and `stats` has to be run in the same network
-namespace as the datapath to see them.
+map. So the list is always exactly what is attached, and `stats interfaces` has to be run in the same
+network namespace as the datapath to see them.
 
 ## Examples
 

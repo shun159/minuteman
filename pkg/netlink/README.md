@@ -20,7 +20,7 @@ package was originally private to `internal/lanprefix` and was split out once
 | `internal/wanextend` | `Addrs` (WAN prefix discovery), `AddRoute` / `DelRoute` (`/128` host routes) |
 | `internal/slowpath` | `AddIP6Tnl`, `SetIP6TnlEndpoints`, `SetLinkMTU`, `SetLinkUp`, `DelLink`, `AddRoute` |
 | `internal/fragpath` | `AddVeth`, `SetLinkUp`, `DelLink` |
-| `cmd/minuteman` | `SourceForDest` (dynamic B4 selection), `Links` (`stats -iface`) |
+| `cmd/minuteman` | `SourceForDest` (dynamic B4 selection), `Links` (`stats interfaces`) |
 
 ## `Socket`
 
@@ -79,7 +79,7 @@ surface that rather than degrading silently.
 
 `Links()` is the read side: an `RTM_GETLINK` dump (`ip link show`) reporting each device's index,
 name and attached XDP program id (`IFLA_XDP` → `IFLA_XDP_PROG_ID`, the id whatever attach mode is
-in use — the per-mode attributes only say *which* mode). `minuteman stats -iface` uses it to find
+in use — the per-mode attributes only say *which* mode). `minuteman stats interfaces` uses it to find
 the interfaces the datapath is bound to, so that list is derived from the kernel rather than
 published by the daemon. Unlike `Addrs`, it reads into a 64 KiB buffer: a link dump entry carries
 every device's `rtnl_link_stats64` and per-protocol attributes, and a `Recvfrom` buffer shorter

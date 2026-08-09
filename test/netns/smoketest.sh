@@ -133,6 +133,19 @@ read_stat() {
     echo "${v:-0}"
 }
 
+# iface_stats runs `minuteman stats interfaces` (passing along any extra args,
+# e.g. --json), which reports the driver counters -- the `ethtool -S` set -- of
+# every interface the datapath has XDP attached to, labelled with its role.
+#
+# Unlike read_stat this has to run *inside* mm-cpe: the interfaces live there,
+# while the bpffs pin the subcommand identifies the instance's programs by lives
+# on the host. nsenter --net enters only the network namespace and so satisfies
+# both at once -- `ip netns exec` would remount /sys and hide the pin, the same
+# reason minuteman itself is started with nsenter below.
+iface_stats() {
+    nsenter --net="/var/run/netns/$NETNS_CPE" "$MINUTEMAN_BIN" stats interfaces "$@" 2>/dev/null
+}
+
 wan_model=dhcpv6-pd
 if [[ -f "$WAN_MODEL_FILE" ]]; then
     wan_model="$(cat "$WAN_MODEL_FILE")"
@@ -434,6 +447,47 @@ check "LAN client can reach a TCP service on the simulated internet host" \
     ip netns exec "$NETNS_HOST" curl -sf --max-time 3 "http://${PUBLIC_INET_ADDR%/*}:8080/"
 wait "$nc_pid" 2>/dev/null
 
+echo "== stats subcommands: datapath counters and every XDP-bound interface's driver counters =="
+
+# The interface list is derived from the kernel (a link dump plus the pinned
+# stats map), not from the flags minuteman was started with, so this asserts
+# that derivation end-to-end: the WAN and LAN veths must come back with the
+# right roles, and so must all four of the softwire fragmenter's companion
+# veths -- which no flag names at all.
+iface_report="$RUNDIR/stats-interfaces.log"
+iface_stats >"$iface_report"
+check "\`stats interfaces\` reports the WAN veth $VETH_CPE_ISP with role wan" \
+    grep -q "^$VETH_CPE_ISP (ifindex .*role wan" "$iface_report"
+check "\`stats interfaces\` reports the LAN veth $VETH_CPE_HOST with role lan" \
+    grep -q "^$VETH_CPE_HOST (ifindex .*role lan" "$iface_report"
+# 4 = datapath.MaxSoftwireFrags = fragpath.NumPairs, the companion veth pairs
+# the in-XDP fragmenter bounces its clones through.
+check "\`stats interfaces\` reports all 4 fragmenter companion veths with role frag" \
+    test "$(grep -c 'role frag' "$iface_report")" -eq 4
+
+# Both JSON views must stay directly walkable: `stats --json` is the counter
+# object itself, `stats interfaces --json` the per-interface array. Checked
+# with python3 (already needed by send-softwire-fragments.py) rather than jq,
+# which the rig doesn't otherwise depend on.
+stats_json_is_counter_object() {
+    "$MINUTEMAN_BIN" stats --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+sys.exit(0 if isinstance(d, dict) and "DecapMartian" in d else 1)
+'
+}
+iface_json_is_array() {
+    iface_stats --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+sys.exit(0 if isinstance(d, list) and d and all("Role" in i for i in d) else 1)
+'
+}
+check "\`stats --json\` decodes as an object of datapath counters" \
+    stats_json_is_counter_object
+check "\`stats interfaces --json\` decodes as an array of per-interface entries" \
+    iface_json_is_array
+
 if [[ $started_minuteman -eq 1 ]]; then
     echo "== TCP MSS clamping: neither end offers segments the softwire would have to fragment =="
 
@@ -603,6 +657,20 @@ if [[ $softwire_frag_enabled -eq 1 && $started_minuteman -eq 1 ]]; then
         test "$reasm_pass" -gt "$reasm_pass0"
     check "the off-LAN decapped packet was dropped in XDP (datapath DecapMartian +$((martian - martian0)))" \
         test "$martian" -gt "$martian0"
+
+    # The same fragmentation seen from underneath the XDP programs: the counters
+    # above say the fragmenter ran, `stats interfaces` says the clones really
+    # left through the companion veths. Summed by substring match over every
+    # frag-role interface, because a veth reports these per rx queue
+    # (rx_queue_0_xdp_redirect) and the queue count is not ours to assume.
+    frag_redirects="$(iface_stats --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print(sum(v for i in d if i.get("Role") == "frag"
+          for k, v in (i.get("Stats") or {}).items() if "xdp_redirect" in k))
+')"
+    check "the companion veths redirected the fragment clones (xdp_redirect ${frag_redirects:-0} across the frag-role interfaces)" \
+        test "${frag_redirects:-0}" -gt 0
 
     # --- Encap fallback (backlog §1 residual): a packet the in-XDP fragmenter
     # can't take must fall to the kernel ip6tnl (EncapFragSlow) -- and crucially
