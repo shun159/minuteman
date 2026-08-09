@@ -101,7 +101,9 @@ serving), `wanextend` (NDProxy LAN policy, including RA serving and host-route m
 (the DS-Lite companion `ip6tnl` lifecycle for softwire reassembly + fragmentation fallback), and
 `fragpath` (the companion veth pairs the in-XDP softwire fragmenter bounces its clones through);
 `pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/`pkg/prefixdelegation`/`pkg/routeradvert`/`pkg/ndproxy`/
-`pkg/netlink`/`pkg/dnsproxy`/`pkg/dhcpv4` are the reusable protocol packages.
+`pkg/netlink`/`pkg/dnsproxy`/`pkg/dhcpv4` are the reusable protocol packages. Every package under both
+trees carries its own `README.md` covering its rationale in more depth than the Architecture section
+below, indexed by `internal/README.md` and `pkg/README.md`.
 
 Not yet implemented:
 - The migration technologies other than DS-Lite that an HB46PP response can describe (`map_e`/`map_t`/
