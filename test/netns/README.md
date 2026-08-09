@@ -170,7 +170,7 @@ pins to bpffs — no `-stats-interval` logging or ownership of its stdout needed
 
 ```sh
 sudo bin/minuteman stats            # one `Name: value` line per counter
-sudo bin/minuteman stats -json      # e.g. ... | jq .DecapMartian
+sudo bin/minuteman stats --json     # e.g. ... | jq .DecapMartian
 sudo bpftool map dump pinned /sys/fs/bpf/minuteman/stats
 ```
 
@@ -181,18 +181,25 @@ namespace, keeping the host's `/sys/fs/bpf`, so the commands above work from the
 (pins are mount-namespace state, not netns state). `smoketest.sh`'s counter assertions (`read_stat`) are
 before/after deltas over this same subcommand.
 
-`-iface` additionally reports each XDP-bound interface's driver counters (the `ethtool -S` set). Those
-interfaces live in `mm-cpe`, so unlike the commands above it has to be run *inside* the namespace —
-which still works because `nsenter --net` leaves the host's `/sys/fs/bpf` in place:
+`stats interfaces` reports each XDP-bound interface's driver counters (the `ethtool -S` set) instead.
+Those interfaces live in `mm-cpe`, so unlike the commands above it has to be run *inside* the namespace
+— which still works because `nsenter --net` leaves the host's `/sys/fs/bpf` in place:
 
 ```sh
-sudo nsenter --net=/var/run/netns/mm-cpe bin/minuteman stats -iface
+sudo nsenter --net=/var/run/netns/mm-cpe bin/minuteman stats interfaces
 ```
 
 It's the quickest way to see the softwire fragmenter working under `MM_SOFTWIRE_FRAG=1`: each
 `mm-frag<i>p` companion veth shows `rx_queue_0_xdp_redirect` for the clones it turned into a real
 fragment and `rx_queue_0_xdp_drops` for the ones the packet didn't need, which should add up to the
 `EncapFragSeg`/`EncapFragXDP` counters above.
+
+`smoketest.sh` asserts both subcommands on every run (its `iface_stats` helper): that the interface
+list the kernel-derived role classification produces really is the WAN, the LAN and all four
+fragmenter companion veths, and that `stats --json` / `stats interfaces --json` decode as the object
+and the array their consumers walk. With `MM_SOFTWIRE_FRAG=1` it also checks the frag-role interfaces
+report a non-zero `xdp_redirect`, tying the datapath's own `EncapFragSeg` to the clones the companion
+veths actually forwarded.
 
 Two things worth knowing if you touch these scripts:
 - `mm-cpe` needs both `net.ipv4.ip_forward=1` and `net.ipv6.conf.all.forwarding=1`, or `bpf_fib_lookup()` in
@@ -238,7 +245,11 @@ verified passing from a fresh setup for:
   M flags, and a shared ID per packet), a hand-crafted fragmented
   softwire packet reassembled and delivered to the LAN client (with `DecapReasmPass` advancing), and the
   encap ip6tnl *fallback* forced by a runtime WAN-MTU shrink: a DF oversized packet takes the fallback
-  (`EncapFragSlow` advancing, `EncapFragXDP` untouched) and draws an ICMPv4 Fragmentation-Needed on the LAN
+  (`EncapFragSlow` advancing, `EncapFragXDP` untouched) and draws an ICMPv4 Fragmentation-Needed on the LAN.
+  Re-run 2026-08-09 after the `stats` / `stats interfaces` subcommand split (33/33 checks), which is also
+  where the new unconditional stats assertions were verified — both JSON shapes decoding, the roles
+  reported for the WAN veth, the LAN veth and all four companion veths — along with `xdp_redirect` summing
+  to 8 across the frag-role interfaces, i.e. the two fragments each of the four oversized pings needed
 - `MM_TUNNEL_ICMP=1` (against `dhcpv6` AFTR discovery + `dhcpv6-pd`, alongside `MM_SOFTWIRE_FRAG=1`): all
   three injected error types relayed with the right ICMPv4 type and the `192.0.0.2` source, a bogus quote
   ignored, and the narrowed-core-link half end-to-end — the learned path MTU applied to both the

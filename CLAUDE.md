@@ -177,7 +177,7 @@ need loaded up front.
 `run-cpe.sh` and `smoketest.sh` deliberately omit `-aftr` so minuteman discovers it live against the rig —
 pass `-aftr <addr>` as an extra argument to either script to override with a static address instead.
 
-Datapath counters are read out-of-band via `minuteman stats [-json]` against the bpffs-pinned stats map
+Datapath counters are read out-of-band via `minuteman stats [--json]` against the bpffs-pinned stats map
 (`smoketest.sh`'s assertions do this as before/after deltas through its `read_stat` helper); both scripts
 launch minuteman via `nsenter --net`, *not* `ip netns exec`, because the latter's `/sys` remount would
 strand that pin on an invisible bpffs — see the README's "Reading datapath stats" before changing how
@@ -410,7 +410,7 @@ orphaned the running kernel's module directory — reboot to fix that).
     source — bpf2go can't export a Go enum here because `enum stat_id` never appears as a stored map value
     type in the BTF (only as inlined integer constants), so `-type stat_id` finds nothing.
   - `pin.go` — `Load()` pins the `stats` map to bpffs (`/sys/fs/bpf/minuteman/stats`) so it stays
-    readable out-of-band while minuteman runs (`minuteman stats [-json]` via `ReadPinnedStats()` in
+    readable out-of-band while minuteman runs (`minuteman stats [--json]` via `ReadPinnedStats()` in
     `stats.go`, or `bpftool map dump pinned ...`): a stale pin from a crashed previous run is removed
     first (unpin-then-repin, `internal/slowpath`'s stale-device stance), pin failure is fail-fast with a
     bpffs-mount hint, and `Loader.Close` unpins best-effort. Only `stats` is pinned. NB for anything
@@ -419,7 +419,7 @@ orphaned the running kernel's module directory — reboot to fix that).
     does; see `test/netns/README.md`'s "Reading datapath stats").
   - `xdproles.go` — `XDPRoles(progIDs)` classifies the XDP program ids a link dump reported
     (`pkg/netlink.Socket.Links`), returning an entry only for the ones belonging to the *running*
-    instance and labelling each `wan`/`lan`/`frag`; it's what lets `minuteman stats -iface` name the
+    instance and labelling each `wan`/`lan`/`frag`; it's what lets `minuteman stats interfaces` name the
     datapath's interfaces without the daemon publishing a list. Membership is decided by the program
     referencing the same map the bpffs pin points at (`pinnedStatsMapID` + `ProgramInfo.MapIDs`), *not*
     by its name: a name is not unique — an unrelated XDP program can share one, so can a stale second
@@ -624,7 +624,7 @@ orphaned the running kernel's module directory — reboot to fix that).
   (`buildGetLinkMessage`/`parseIfInfoMsg`/`parseXDPProgID`): an `RTM_GETLINK` dump giving each device's
   index, name and attached XDP program id (`IFLA_XDP` → `IFLA_XDP_PROG_ID` — the id for whatever attach
   mode is in use, where the per-mode `IFLA_XDP_*_PROG_ID` attributes only report *which* mode), which is
-  how `minuteman stats -iface` finds the datapath's interfaces without the daemon publishing them. It
+  how `minuteman stats interfaces` finds the datapath's interfaces without the daemon publishing them. It
   reads into a 64 KiB buffer rather than `Addrs`' single page: a link dump entry carries the device's
   whole `rtnl_link_stats64` plus per-protocol attributes, and a `Recvfrom` buffer shorter than the
   kernel's next dump message silently truncates it.
@@ -680,7 +680,7 @@ orphaned the running kernel's module directory — reboot to fix that).
   `is_non_unicast_dst` bypass above for why the datapath had to change before any of this could receive a
   packet.
 - **`pkg/ethtool/`** — minimal hand-rolled `SIOCETHTOOL` client reading exactly one thing: a device's
-  driver-specific statistics, i.e. what `ethtool -S <iface>` prints, for `minuteman stats -iface`. Three
+  driver-specific statistics, i.e. what `ethtool -S <iface>` prints, for `minuteman stats interfaces`. Three
   ioctls in the sequence `ethtool(8)` itself uses — `ETHTOOL_GSSET_INFO` (how many `ETH_SS_STATS`
   counters), `ETHTOOL_GSTRINGS` (their names, fixed 32-byte NUL-padded fields), `ETHTOOL_GSTATS` (their
   `__u64` values) — with the `ifreq`+`ifr_data` layout and the constants `x/sys/unix` doesn't export
@@ -722,11 +722,23 @@ orphaned the running kernel's module directory — reboot to fix that).
   "up", removed on graceful exit — for a supervisor or the test rig; see also
   `docs/minuteman.service.example`, the systemd way to run minuteman in production). Flag-value
   parsing (`LANSpec`/`LANSpecList`, `AddrList`, MAC parsing) lives in `internal/cliconfig`, not in `main.go` itself.
-  Besides the default flag-driven run, `main()` dispatches one subcommand before `flag.Parse`:
-  `minuteman stats [-json] [-iface]` (`stats.go`'s `runStats`) prints the datapath counters of the
+  Besides the default flag-driven run, `main()` dispatches to a **cobra** command tree
+  (`stats.go`'s `newRootCmd`) whenever the first argument isn't a flag — before `flag.Parse`, so the
+  flag-only invocation stays the daemon and only the subcommands are cobra's (the daemon's own flags
+  are still the stdlib `flag` package's, deliberately: converting them would break every `-wan`-style
+  invocation, since pflag reads a single dash as a shorthand cluster). The tree's root carries no
+  `Run`; it exists to give subcommands their `minuteman <cmd>` usage paths and to reject a mistyped
+  one with a suggestion. Its default `completion` command is disabled — the daemon half isn't in the
+  tree, so a generated script would silently complete nothing for it. Because the two halves parse
+  flags differently, `normalizeLegacyArgs` rewrites Go-flag-style single-dash long options into
+  pflag's double-dash form before `Execute` (`-json` → `--json`, stopping at `--`, never touching a
+  one-character shorthand like `-h`): without it one command line would carry two incompatible
+  conventions, and `stats -json` would fail with pflag's "unknown shorthand flag: 'j'".
+  `minuteman stats [--json]` (`stats.go`'s `runStats`) prints the datapath counters of the
   *running* instance from the bpffs-pinned stats map via `datapath.ReadPinnedStats` — text as
-  `Name: value` lines (shell-friendly), `-json` as the `Stats` struct (`jq .DecapMartian`); needs the
-  same root/CAP_BPF the daemon needs. `-iface` (`ifstats.go`'s `collectInterfaceStats`) adds each
+  `Name: value` lines (shell-friendly), `--json` as the `Stats` struct (`jq .DecapMartian`); needs the
+  same root/CAP_BPF the daemon needs. `minuteman stats interfaces` (aliases `iface`/`ifaces`;
+  `ifstats.go`'s `collectInterfaceStats`) reports each
   XDP-bound interface's driver counters — the `ethtool -S` set, read via `pkg/ethtool` — labelled
   `wan`/`lan`/`frag`, which is what tells apart "the datapath didn't handle it" from "the packet never
   arrived" (and makes the fragmenter's clone-and-trim visible per companion veth: `xdp_redirect` on the
@@ -735,10 +747,15 @@ orphaned the running kernel's module directory — reboot to fix that).
   dump) reports each device's attached XDP program id and `datapath.XDPRoles` says which of those ids
   belong to this instance — by the program *referencing the pinned stats map*, not by name, since a
   name is not unique but a map id is. So the list can't drift from what's really attached, covers the
-  companion veths no flag names, and needs nothing published beyond the pin — but `stats -iface` must
-  run in the datapath's own netns to see the interfaces (the pin itself is on the host bpffs; see
-  `pkg/datapath/pin.go`'s `nsenter --net` note). JSON embeds `Stats` rather than nesting it, so the
-  counters stay top-level fields and `Interfaces` is purely additive.
+  companion veths no flag names, and needs nothing published beyond the pin — but `stats interfaces`
+  must run in the datapath's own netns to see the interfaces (the pin itself is on the host bpffs; see
+  `pkg/datapath/pin.go`'s `nsenter --net` note). Being a subcommand rather than a flag on `stats` is
+  what keeps each view's JSON directly walkable: `stats --json` is the `Stats` struct itself,
+  `stats interfaces --json` the per-interface array (`jq '.[0].Stats.xdp_packets'`). `--json` is
+  declared once, persistently, on `stats`, and inherited. The flag this subcommand replaced survives
+  as a hidden, deprecated `stats --iface`, printing exactly what it used to (counters, then
+  interfaces; under `--json` the one object with `Interfaces` embedded, `legacyStatsOutput`) so a
+  script written against it isn't silently handed a different shape.
   Startup order is load-bearing in one place: when `-dhcpv6-pd` is set, `run()` calls
   `prefixdelegation.Acquire` **before** `resolveAFTR`, and hands the lease's DNS servers (via
   `pdDNSServers`) to AFTR discovery, to `runAFTRRediscovery`, and — as a last fallback behind

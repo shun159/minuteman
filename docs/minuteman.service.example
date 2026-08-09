@@ -34,7 +34,8 @@ Restart=on-failure
 RestartSec=5
 
 # Datapath stats stay readable out-of-band while the service runs:
-#   minuteman stats [-json]
+#   minuteman stats [--json]              # the datapath's own counters
+#   minuteman stats interfaces [--json]   # each XDP-bound interface's driver counters
 # (reads the map pinned at /sys/fs/bpf/minuteman/stats).
 
 [Install]
