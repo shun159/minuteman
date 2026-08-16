@@ -32,7 +32,7 @@ not a pre-raised memlock limit.
 | `pmtu.go` | `TunnelPMTU`, `SetSoftwireMTU`, `TunnelPMTUExpiry` |
 | `ipv6_rss.go` | `EnableIPv6SoftwareRSS` (the optional native-IPv6 cpumap stage) |
 | `stats.go` | `Stats()`, `ReadPinnedStats()`, the hand-maintained `statID` enum |
-| `pin.go` | pinning the stats map to bpffs |
+| `pin.go` | pinning the stats map and the xdpcap capture hooks to bpffs |
 | `xdproles.go` | `XDPRoles` — which attached XDP program ids are this instance's, and what each does |
 | `sysctl.go` | the forwarding / `accept_ra` sysctls the FIB lookups need |
 
@@ -178,11 +178,15 @@ stat_id` by hand** — bpf2go can't export a Go enum here, because `enum stat_id
 a stored map value type in the BTF (only as inlined integer constants), so `-type stat_id` finds
 nothing. New counters are appended before `STAT_MAX`.
 
-`pin.go` pins **only** the stats map, to `/sys/fs/bpf/minuteman/stats`, so it stays readable
-out-of-band while minuteman runs (`minuteman stats [--json]` via `ReadPinnedStats`, or `bpftool
-map dump pinned ...`). A stale pin from a crashed run is removed first (unpin-then-repin, the
-same stance `internal/slowpath` takes on stale devices); pin failure is fail-fast with a
-bpffs-mount hint; `Close` unpins best-effort.
+`pin.go` pins the maps an out-of-band observer reaches minuteman through, and nothing else:
+`stats` (`/sys/fs/bpf/minuteman/stats`), so counters stay readable while minuteman runs
+(`minuteman stats [--json]` via `ReadPinnedStats`, or `bpftool map dump pinned ...`), and the two
+xdpcap capture hooks (`xdpcap_hook`, `xdpcap_hook_cpu`), so a packet capture can be installed into
+the running datapath — see the hook comment in `bpf/datapath.bpf.c` and
+`docs/operability-backlog.md` §3. A stale pin from a crashed run is removed first
+(unpin-then-repin, the same stance `internal/slowpath` takes on stale devices); pin failure is
+fail-fast with a bpffs-mount hint, unpinning whatever it had already pinned so a failed start
+never leaves a pin advertising a datapath that isn't there; `Close` unpins best-effort.
 
 > **Running inside a netns:** `ip netns exec` creates a new mount namespace and remounts `/sys`,
 > stranding the pin on a private bpffs. Enter with `nsenter --net=...` instead — the netns rig

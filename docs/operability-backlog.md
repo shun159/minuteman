@@ -3,7 +3,7 @@
 Separate from `docs/rfc-compliance-backlog.md` (which tracks protocol correctness): this file tracks
 operational and test-ergonomics improvements — how minuteman is run, observed, and driven under test —
 that don't change datapath behavior but make the system easier to operate and to verify. Ordered by
-leverage, highest first. Last checked against the codebase 2026-08-09.
+leverage, highest first. Last checked against the codebase 2026-08-16.
 
 ## 1. Query datapath stats out-of-band via a pinned BPF map + a `stats` subcommand — **DONE**
 
@@ -76,3 +76,53 @@ Still open, in priority order:
   it under `systemd-run --scope` (or a detached session) would let an instance outlive its launcher for
   multi-step manual workflows. #1 removed most of the practical pain (stats no longer need the
   process's stdout), so this is low priority.
+
+## 3. Capture individual packets out of the datapath — **PARTIAL** (hooks in place; no in-tree client)
+
+The counters from #1 say how many packets took each path but never *which* ones, and tcpdump can't
+fill the gap: XDP_REDIRECT and XDP_DROP never reach the AF_PACKET tap, and encap, decap, the
+fragmenter's clones and the cpumap stages all end in a redirect. Practically nothing minuteman does
+is visible to a packet sniffer today.
+
+Done: the datapath carries xdpcap-compatible capture hooks
+([cloudflare/xdpcap](https://github.com/cloudflare/xdpcap)) — a `PROG_ARRAY` indexed by XDP action
+that each entry program tail-calls on its way out (`xdpcap_exit` in `bpf/datapath.bpf.c`; every entry
+program is now a thin wrapper around an inlined `do_*` body so one hook covers its dozens of
+returns). Empty while nothing is capturing, so the cost is one prog-array lookup miss per packet.
+`pkg/datapath/pin.go` pins the arrays next to the stats map (`/sys/fs/bpf/minuteman/xdpcap_hook`,
+`xdpcap_hook_cpu`), so a capture attaches to a running minuteman the same out-of-band way `minuteman
+stats` reads counters.
+
+Two arrays because the kernel's prog-array compatibility check
+(`__bpf_prog_map_compatible` in `kernel/bpf/core.c`) requires a program's `expected_attach_type` to
+equal the array owner's: the cpumap-attached second stages (`xdp_dslite_decap_cpu`,
+`xdp_ipv6_fwd_cpu`) claim their own array, and a filter program for it must be loaded with
+`BPF_XDP_CPUMAP`. Sharing one array would have made the hook on the path *every* packet takes
+unusable, to instrument two stages that are off by default.
+
+That same check is why **stock `xdpcap` cannot attach yet**: it builds its filter programs with
+`ebpf.ProgramSpec{Type: ebpf.XDP}` and no `AttachType`, i.e. `expected_attach_type == 0`, while both
+libbpf and cilium/ebpf load a `SEC("xdp")` program with `BPF_XDP` — so the map update comes back
+EINVAL. Adding `AttachType: ebpf.AttachXDP` to that one spec fixes it (worth upstreaming).
+
+Verified 2026-08-16 against the default rig, with a locally patched `xdpcap` carrying exactly that
+one-line change: filter programs install into all five action slots, forwarding is unaffected while
+a capture is attached, and packets no sniffer could otherwise see come out —
+`icmp` captured the decapped inner echo replies, and `ip6` captured the encap direction, including
+the fragmenter's whole clone-and-trim (the untrimmed clone at `encap_fragment_outer`'s redirect,
+`frag (0|1448)` and `frag (1448|52)` from the two `xdp_softwire_frag<i>` programs that trimmed one,
+and the untrimmed clone again at the drop hook of the two that didn't need to).
+
+Still open:
+- An in-tree `minuteman monitor traffic interface <iface>` (JunOS-flavored, a sibling of the `stats`
+  subcommand tree). It needs its own filter programs rather than xdpcap's, for two reasons: the hook
+  is shared by every interface an entry program is attached to, so per-interface selection needs
+  `ctx->ingress_ifindex` in the perf record's metadata, which xdpcap's format doesn't carry; and the
+  filter-expression compiler would otherwise pull in `gopacket/pcap` — libpcap via cgo — against a
+  `CGO_ENABLED=0` build. Compiling the expression by shelling out to `tcpdump -ddd` and running the
+  resulting cBPF through `cloudflare/cbpfc` (pure Go) keeps the build as it is.
+- A hook fires on the way *out* of an entry program, so a capture sees the packet as the datapath
+  left it — on the encap path the finished outer IPv6 frame, not the inner IPv4 that arrived (which
+  is why `icmp` matches nothing there and `ip6` matches everything). Capturing the pre-encap packet
+  would need a second hook at the entry programs' start.
+- Nothing in the netns rig asserts any of this yet.

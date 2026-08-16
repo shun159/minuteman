@@ -453,6 +453,68 @@ struct {
 } icmp_error_rate SEC(".maps");
 
 /*
+ * Packet-capture hook points, ABI-compatible with xdpcap
+ * (github.com/cloudflare/xdpcap).
+ *
+ * Almost nothing this datapath does is visible to tcpdump: XDP_REDIRECT and
+ * XDP_DROP never reach the AF_PACKET tap, and encap, decap, the fragmenter's
+ * clones and the cpumap stages all end in a redirect. The stats counters say
+ * how many packets took each path but never which ones, so the hooks below
+ * are what makes an individual packet observable.
+ *
+ * The mechanism is xdpcap's: a PROG_ARRAY indexed by XDP action, empty while
+ * nothing is capturing (so the tail call below misses and the entry program's
+ * own return value stands). An observer pins-map-loads the array, generates
+ * one filter program per action it wants -- match the packet, copy it to a
+ * perf ring, return the action it was tail-called for -- and installs them.
+ * The array is pinned to bpffs by pkg/datapath (see pin.go), the same
+ * out-of-band route the stats map takes, which is what lets a capture attach
+ * to a running minuteman without it having to serve anything itself.
+ *
+ * Note that a hook fires on the way *out* of the entry program, so what a
+ * capture sees is the packet as the datapath left it: on the encap path the
+ * finished outer-IPv6 frame, not the inner IPv4 that arrived.
+ *
+ * Two arrays, not one: the cpumap-attached programs (xdp_dslite_decap_cpu,
+ * xdp_ipv6_fwd_cpu) get their own, because a prog array binds to the flavor
+ * of program that claims it and an ordinary rx-XDP program cannot be
+ * inserted into one the cpumap stages claimed (measured: the map update is
+ * rejected with EINVAL; the filter program has to be loaded with the same
+ * BPF_XDP_CPUMAP expected attach type). Sharing one array would therefore
+ * have made the hook on the path *every* packet takes unusable to an
+ * off-the-shelf xdpcap, to instrument two stages that are off by default.
+ */
+#define XDPCAP_HOOK_ENTRIES 5 /* XDP_ABORTED..XDP_REDIRECT */
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u32));
+    __uint(max_entries, XDPCAP_HOOK_ENTRIES);
+} xdpcap_hook SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u32));
+    __uint(max_entries, XDPCAP_HOOK_ENTRIES);
+} xdpcap_hook_cpu SEC(".maps");
+
+/*
+ * Hand the packet to whatever is capturing for this action, then return the
+ * action. With no capture installed the tail call misses and falls through,
+ * costing one prog-array lookup per packet; when one is installed the
+ * tail-called program returns `action` on this program's behalf and control
+ * never comes back here.
+ */
+static __always_inline int
+xdpcap_exit(struct xdp_md *ctx, void *hook, int action)
+{
+    bpf_tail_call(ctx, hook, action);
+    return action;
+}
+
+/*
  * Takes one token from this CPU's ICMP-error bucket, refilling it first
  * from the time elapsed since the last refill. Returns false when the
  * bucket is empty -- the caller must then drop the offending packet
@@ -1261,9 +1323,8 @@ maybe_redirect_ipv6_to_cpu(struct xdp_md *ctx, const struct ipv6hdr *ip6h, void 
     return bpf_redirect_map(&cpu_map_v6, *cpu, 0);
 }
 
-SEC("xdp")
-int
-xdp_dslite_encap(struct xdp_md *ctx)
+static __always_inline int
+do_xdp_dslite_encap(struct xdp_md *ctx)
 {
     __u8 *data = (__u8 *)(long)ctx->data;
     __u8 *data_end = (__u8 *)(long)ctx->data_end;
@@ -1409,6 +1470,18 @@ xdp_dslite_encap(struct xdp_md *ctx)
 
     increase_stats_count(STAT_ENCAP);
     return redirect_to_ifindex(cfg->wan_ifindex, STAT_REDIRECT_WAN);
+}
+
+/*
+ * Every entry program is a thin wrapper around its inlined body so that the
+ * capture hook has a single exit to sit on, rather than the body's dozens of
+ * returns each needing one (see xdpcap_exit).
+ */
+SEC("xdp")
+int
+xdp_dslite_encap(struct xdp_md *ctx)
+{
+    return xdpcap_exit(ctx, &xdpcap_hook, do_xdp_dslite_encap(ctx));
 }
 
 static __always_inline int
@@ -2175,12 +2248,11 @@ SEC("xdp/cpumap")
 int
 xdp_dslite_decap_cpu(struct xdp_md *ctx)
 {
-    return handle_xdp_dslite_decap(ctx);
+    return xdpcap_exit(ctx, &xdpcap_hook_cpu, handle_xdp_dslite_decap(ctx));
 }
 
-SEC("xdp")
-int
-xdp_dslite_decap(struct xdp_md *ctx)
+static __always_inline int
+do_xdp_dslite_decap(struct xdp_md *ctx)
 {
     __u8 *data = (__u8 *)(long)ctx->data;
     __u8 *data_end = (__u8 *)(long)ctx->data_end;
@@ -2264,6 +2336,13 @@ xdp_dslite_decap(struct xdp_md *ctx)
     return handle_xdp_dslite_decap(ctx);
 }
 
+SEC("xdp")
+int
+xdp_dslite_decap(struct xdp_md *ctx)
+{
+    return xdpcap_exit(ctx, &xdpcap_hook, do_xdp_dslite_decap(ctx));
+}
+
 /*
  * Software-RSS second stage for native IPv6: runs on the CPU maybe_redirect_
  * ipv6_to_cpu fanned the packet out to (via cpu_map_v6), re-parses the frame,
@@ -2271,9 +2350,8 @@ xdp_dslite_decap(struct xdp_md *ctx)
  * preserved across the cpumap redirect, so the FIB lookup and egress/ingress
  * checks behave exactly as they would on the inline path.
  */
-SEC("xdp/cpumap")
-int
-xdp_ipv6_fwd_cpu(struct xdp_md *ctx)
+static __always_inline int
+do_xdp_ipv6_fwd_cpu(struct xdp_md *ctx)
 {
     __u8 *data = (__u8 *)(long)ctx->data;
     __u8 *data_end = (__u8 *)(long)ctx->data_end;
@@ -2294,6 +2372,13 @@ xdp_ipv6_fwd_cpu(struct xdp_md *ctx)
     return handle_ipv6_forward(ctx, l2_len, ip6h, &cfg);
 }
 
+SEC("xdp/cpumap")
+int
+xdp_ipv6_fwd_cpu(struct xdp_md *ctx)
+{
+    return xdpcap_exit(ctx, &xdpcap_hook_cpu, do_xdp_ipv6_fwd_cpu(ctx));
+}
+
 /*
  * The rx XDP programs of the softwire-fragmentation companion veth pairs'
  * B ends: pair i's program turns the broadcast clone arriving there into
@@ -2308,7 +2393,7 @@ xdp_ipv6_fwd_cpu(struct xdp_md *ctx)
     SEC("xdp")                                                                           \
     int xdp_softwire_frag##i(struct xdp_md *ctx)                                         \
     {                                                                                    \
-        return emit_softwire_fragment(ctx, i);                                           \
+        return xdpcap_exit(ctx, &xdpcap_hook, emit_softwire_fragment(ctx, i));           \
     }
 
 SOFTWIRE_FRAG_PROG(0)
