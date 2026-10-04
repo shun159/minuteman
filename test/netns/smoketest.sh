@@ -580,6 +580,29 @@ fi
 if [[ $softwire_frag_enabled -eq 1 && $started_minuteman -eq 1 ]]; then
     echo "== Softwire fragmentation (RFC 6333 §5.3): XDP fragments the outer IPv6 outbound, the kernel ip6tnl reassembles inbound =="
 
+    # Force the FIB FRAG_NEEDED branch on decap and assert an XDP-originated
+    # DF error, then verify oversized off-LAN traffic is still rejected.
+    wan_mac="$(ip netns exec "$NETNS_CPE" cat "/sys/class/net/$VETH_CPE_ISP/address")"
+    isp_mac="$(ip netns exec "$NETNS_ISP" cat "/sys/class/net/$VETH_ISP_CPE/address")"
+    lan_mtu_orig="$(ip netns exec "$NETNS_CPE" cat "/sys/class/net/$VETH_CPE_HOST/mtu")"
+    ip netns exec "$NETNS_CPE" ip link set "$VETH_CPE_HOST" mtu 1280
+    frag_needed0="$(read_stat ICMPFragNeeded)"
+    ip netns exec "$NETNS_ISP" python3 "$PWD/send-softwire-fragments.py" \
+        "$wan_mac" "$isp_mac" "$VETH_ISP_CPE" "${CORE_AFTR_ADDR%/*}" "${WAN_CPE_ADDR%/*}" oversized 192.168.1.2
+    sleep 1
+    check "decap FIB MTU overflow originates an XDP ICMPv4 DF error" \
+        test "$(read_stat ICMPFragNeeded)" -gt "$frag_needed0"
+    ip netns exec "$NETNS_CPE" ip link set "$VETH_CPE_HOST" mtu "$lan_mtu_orig"
+    tunnel_mtu_orig="$(ip netns exec "$NETNS_CPE" cat /sys/class/net/mm-dslite0/mtu)"
+    ip netns exec "$NETNS_CPE" ip link set mm-dslite0 mtu 1280
+    oversized_martian0="$(read_stat DecapMartian)"
+    ip netns exec "$NETNS_ISP" python3 "$PWD/send-softwire-fragments.py" \
+        "$wan_mac" "$isp_mac" "$VETH_ISP_CPE" "${CORE_AFTR_ADDR%/*}" "${WAN_CPE_ADDR%/*}" oversized 8.8.8.8
+    sleep 1
+    check "oversized off-LAN decap is classified as martian" \
+        test "$(read_stat DecapMartian)" -gt "$oversized_martian0"
+    ip netns exec "$NETNS_CPE" ip link set mm-dslite0 mtu "$tunnel_mtu_orig"
+
     # Snapshot the fragmentation counters before generating any traffic, so the
     # assertions below are deltas -- immune to whatever an earlier check (or a
     # reused instance) already accumulated.
@@ -818,6 +841,19 @@ if [[ $dualstack_enabled -eq 1 ]]; then
             test "${DSLITE_PKTS:-0}" -eq 0
     fi
 
+    # The reply must work from the CPUMAP stage too (XDP_TX is unsupported).
+    wan_mtu_orig="$(ip netns exec "$NETNS_CPE" cat "/sys/class/net/$VETH_CPE_ISP/mtu")"
+    ip netns exec "$NETNS_CPE" ip link set "$VETH_CPE_ISP" mtu 1280
+    ip netns exec "$NETNS_HOST" timeout 5 tcpdump -i "$VETH_HOST_CPE" -n -c 1 \
+        'icmp6 and ip6[40] == 2' >"$RUNDIR/native-ptb.log" 2>/dev/null &
+    native_ptb_pid=$!
+    sleep 1
+    ip netns exec "$NETNS_HOST" ping -6 -M do -s 1352 -c 1 -W 2 "${PUBLIC6_INET_ADDR%/*}" >/dev/null 2>&1 || true
+    wait "$native_ptb_pid" 2>/dev/null
+    check "native IPv6 MTU overflow returns Packet Too Big, including software RSS" \
+        grep -q 'packet too big' "$RUNDIR/native-ptb.log"
+    ip netns exec "$NETNS_CPE" ip link set "$VETH_CPE_ISP" mtu "$wan_mtu_orig"
+
     # Prove that native IPv6 was carried by minuteman's XDP forwarding fastpath
     # -- not the kernel slow path. The reachability/dslite0 checks above hold
     # for either, so here we read the datapath's own IPv6-forward counter from
@@ -856,10 +892,19 @@ if [[ $tunnel_icmp_enabled -eq 1 && $started_minuteman -eq 1 ]]; then
             >"$tunnel_icmp_pcap" 2>/dev/null &
         local td=$!
         sleep 1
-        ip netns exec "$NETNS_ISP" python3 "$PWD/send-softwire-fragments.py" \
+        ip netns exec "$NETNS_ISP" env MM_QUOTED_SRC="${MM_QUOTED_SRC:-192.168.1.2}" python3 "$PWD/send-softwire-fragments.py" \
             "$wan_mac" "$isp_mac" "$VETH_ISP_CPE" "${CORE_AFTR_ADDR%/*}" "${WAN_CPE_ADDR%/*}" "$@"
         wait "$td" 2>/dev/null
     }
+
+    # Correct softwire endpoints do not authorize a non-LAN quoted source.
+    # Neither DF nor non-DF may poison the PMTU map.
+    untrusted_pmtu0="$(read_stat TunnelPMTU)"
+    for quote_df in df nodf; do
+        MM_QUOTED_SRC=198.51.100.123 inject_tunnel_icmp "nonlan-$quote_df" icmp6ptb 1280 "$quote_df"
+    done
+    check "non-LAN quoted sources cannot update softwire PMTU" \
+        test "$(read_stat TunnelPMTU)" -eq "$untrusted_pmtu0"
 
     relay0="$(read_stat TunnelICMPRelay)"
     pmtu0="$(read_stat TunnelPMTU)"

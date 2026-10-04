@@ -1010,6 +1010,11 @@ encap_fragment_outer(struct xdp_md *ctx, __u64 l2_len, struct iphdr *inner_iph,
     write_outer_eth6(outer_eth, cfg, &fib, true);
     write_outer_ipv6(outer_iph, &cfg->b4_addr, &cfg->aftr_addr, IPPROTO_FRAGMENT,
                      (__u16)(inner_len + sizeof(struct frag_hdr)));
+    /* Private clone transport: snapshot the unit in the flow label so every
+     * companion program uses the same slicing boundaries across PMTU updates.
+     * emit_softwire_fragment clears it before transmitting on the WAN. */
+    outer_iph->flow_lbl[1] = (__u8)(unit >> 8);
+    outer_iph->flow_lbl[2] = (__u8)unit;
     fh->nexthdr = IPPROTO_IPIP;
     fh->reserved = 0;
     fh->frag_off = bpf_htons(1); /* offset 0, M=1 */
@@ -1064,7 +1069,8 @@ emit_softwire_fragment(struct xdp_md *ctx, __u32 idx)
         increase_stats_count(STAT_NO_CONFIG);
         return XDP_DROP;
     }
-    __u32 unit = g->frag_unit & ~7U;
+    __u32 unit = ((__u32)ip6h->flow_lbl[1] << 8) | ip6h->flow_lbl[2];
+    unit &= ~7U;
     if (unit < 8 || unit > 0xffff) {
         increase_stats_count(STAT_ABORT);
         return XDP_ABORTED;
@@ -1111,6 +1117,7 @@ emit_softwire_fragment(struct xdp_md *ctx, __u32 idx)
     }
 
     *eth = eth_copy;
+    __builtin_memset(ip6_copy.flow_lbl, 0, sizeof(ip6_copy.flow_lbl));
     ip6_copy.payload_len = bpf_htons((__u16)(len + sizeof(struct frag_hdr)));
     *out6 = ip6_copy;
     /* start is a multiple of 8, so (start/8) << 3 == start; bit 0 is M. */
@@ -1123,7 +1130,8 @@ emit_softwire_fragment(struct xdp_md *ctx, __u32 idx)
 
 /*
  * Sends an ICMPv6 "Packet Too Big" (RFC 4443 §3.2) reply straight back out the
- * interface the offending packet arrived on. Used from the native-IPv6
+ * interface the offending packet arrived on. Redirect works on both rx XDP
+ * and CPUMAP stages, where XDP_TX is unsupported. Used from the native-IPv6
  * forwarding fastpath when the resolved egress link's MTU is too small: since
  * IPv6 is never softwire-tunneled, the original sender is directly reachable via
  * the ingress interface, so this is a plain (untunneled) reply, unlike
@@ -1195,7 +1203,7 @@ send_icmpv6_pkt_too_big(struct xdp_md *ctx, __u64 l2_len, const struct ipv6hdr *
 
     increase_stats_count(STAT_MTU_DROP);
     increase_stats_count(STAT_ICMP_FRAG_NEEDED);
-    return XDP_TX;
+    return bpf_redirect_map(&tx_ports, ctx->ingress_ifindex, 0);
 }
 
 /*
@@ -1541,7 +1549,15 @@ lookup_lan_nexthop(struct xdp_md *ctx, const struct b4_config *cfg,
     fill_inner_fib_params(fib, inner_iph, inner_len, ctx->ingress_ifindex);
 
     int ret = bpf_fib_lookup(ctx, fib, sizeof(*fib), 0);
-    if (ret == BPF_FIB_LKUP_RET_SUCCESS || ret == BPF_FIB_LKUP_RET_FRAG_NEEDED) {
+    /* FRAG_NEEDED returns before the helper fills the egress ifindex. Resolve
+     * again with a small length, preserving the original MTU decision. */
+    bool too_big = ret == BPF_FIB_LKUP_RET_FRAG_NEEDED;
+    __u16 route_mtu = too_big ? fib->mtu_result : 0;
+    if (too_big) {
+        fill_inner_fib_params(fib, inner_iph, sizeof(struct iphdr), ctx->ingress_ifindex);
+        ret = bpf_fib_lookup(ctx, fib, sizeof(*fib), BPF_FIB_LOOKUP_SKIP_NEIGH);
+    }
+    if (ret == BPF_FIB_LKUP_RET_SUCCESS) {
         if (fib->ifindex == cfg->wan_ifindex) {
             increase_stats_count(STAT_FIB_WRONG_IF);
             return LAN_LOOKUP_FAIL;
@@ -1560,12 +1576,12 @@ lookup_lan_nexthop(struct xdp_md *ctx, const struct b4_config *cfg,
             increase_stats_count(STAT_DECAP_MARTIAN);
             return LAN_LOOKUP_DROP;
         }
-        if (ret == BPF_FIB_LKUP_RET_SUCCESS) {
+        if (!too_big) {
             increase_stats_count(STAT_FIB_SUCCESS);
             return LAN_LOOKUP_OK;
         }
         if (mtu_out)
-            *mtu_out = fib->mtu_result;
+            *mtu_out = route_mtu;
         return LAN_LOOKUP_FRAG_NEEDED;
     }
 
@@ -1915,6 +1931,24 @@ handle_tunnel_icmpv6(struct xdp_md *ctx, __u64 l2_len, const struct ipv6hdr *ip6
     struct ipv4_quote quote = {};
     copy_ipv4_quote(&quote, inner);
 
+    /* Validate the quoted source before learning PMTU, including non-DF
+     * quotes which are consumed without relaying. Neighbor resolution is not
+     * needed to establish that the source belongs to a managed LAN. */
+    struct b4_config *g = get_b4_config();
+    if (!g)
+        return XDP_PASS;
+    struct bpf_fib_lookup source_fib = {};
+    source_fib.family = AF_INET;
+    source_fib.tot_len = sizeof(struct iphdr);
+    source_fib.ipv4_dst = quote.iph.saddr;
+    source_fib.ifindex = ctx->ingress_ifindex;
+    if (bpf_fib_lookup(ctx, &source_fib, sizeof(source_fib), BPF_FIB_LOOKUP_SKIP_NEIGH) !=
+            BPF_FIB_LKUP_RET_SUCCESS ||
+        source_fib.ifindex == g->wan_ifindex || !get_lan_config(source_fib.ifindex)) {
+        increase_stats_count(STAT_TUNNEL_ICMP_DROP);
+        return XDP_DROP;
+    }
+
     __u8 rel_type = 0, rel_code = 0;
     __u32 rel_extra = 0;
     bool relay = false;
@@ -1988,12 +2022,6 @@ handle_tunnel_icmpv6(struct xdp_md *ctx, __u64 l2_len, const struct ipv6hdr *ip6
     if (!icmp_error_eligible(&quote)) {
         increase_stats_count(STAT_TUNNEL_ICMP_DROP);
         return XDP_DROP;
-    }
-
-    struct b4_config *g = get_b4_config();
-    if (!g) {
-        increase_stats_count(STAT_NO_CONFIG);
-        return XDP_PASS;
     }
 
     /*

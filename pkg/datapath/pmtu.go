@@ -69,10 +69,9 @@ func (l *Loader) clearTunnelPMTU(slot uint32) error {
 // reads the struct field by field rather than as a snapshot, so a packet in
 // flight can read a new value beside the old value of another field; that is
 // harmless here because the two that move are read independently of everything
-// else. What it must NOT do is derive frag_unit in the datapath itself:
-// encap_fragment_outer and the xdp_softwire_frag<i> programs read it at
-// different moments for the same packet, and a value that changed in between
-// would produce a fragment set that can never reassemble.
+// else. The encap stage snapshots frag_unit into each clone, so companion
+// stages never read a different unit for the same datagram when this update
+// happens between their executions.
 func (l *Loader) SetSoftwireMTU(mtu int) error {
 	key := uint32(0)
 	var val bpfB4Config

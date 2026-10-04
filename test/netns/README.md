@@ -273,3 +273,13 @@ verified passing from a fresh setup for:
 The uncrossed corners of these independent axes haven't each been re-run, but they are independent code
 paths (AFTR discovery, LAN IPv6 provisioning, DNS forwarding, LAN IPv4 provisioning, native-IPv6
 dual-stack, IPv6 software RSS) with no shared state.
+
+Datapath review regressions are included in the existing modes:
+`MM_SOFTWIRE_FRAG=1` lowers the LAN MTU to exercise decap FIB `FRAG_NEEDED`
+and checks an oversized off-LAN packet is still classified as martian.
+`MM_DUALSTACK=1` lowers WAN MTU and captures the native IPv6 Packet Too Big;
+combine it with `MM_IPV6_SW_RSS=1` to cover the CPUMAP reply path.
+`MM_TUNNEL_ICMP=1` injects correct softwire endpoints with a non-LAN quoted
+source, both DF and non-DF, and checks neither updates the PMTU map.
+The deterministic per-clone PMTU-update test is separate:
+`sudo env MM_BPF_TEST=1 go test ./pkg/datapath -run TestFragmentUnitSnapshot -v`.

@@ -150,8 +150,9 @@ migration or a dynamic-B4 switch doesn't inherit the retired softwire's reading.
 
 Why is `frag_unit` derived in Go at all, when the datapath knows its own MTU? Because the
 fragmenter's two halves read `frag_unit` at different moments, and a value that changed in
-between would produce an unreassemblable fragment set. Userspace changing it on a poll interval
-is the coarse-grained, safe place to do it.
+between would produce an unreassemblable fragment set. Polling alone does not prevent that
+race: encap snapshots the unit in the internal clone's IPv6 flow label, and every companion
+program slices with that snapshot. The flow label is cleared before WAN transmission.
 
 The same reasoning applies to the MSS clamp (`mss.go`), for a different reason: an MSS only
 affects connections that haven't sent their SYN yet, so a poll interval of lag costs nothing, and
@@ -231,3 +232,8 @@ a mismatch there would silently route packets to the wrong AFTR slot, so it is a
 explicitly rather than trusted. `migration_state_test.go` drives the real state machine against
 kernel maps and skips itself when not run as root. Everything about actual packet forwarding is
 exercised by the netns rig (`test/netns/README.md`).
+
+Run the actual fragment-program snapshot regression with
+`sudo env MM_BPF_TEST=1 go test ./pkg/datapath -run TestFragmentUnitSnapshot -v`.
+It changes the live unit between clones and verifies offsets, payload reconstruction,
+and removal of the private flow label.
