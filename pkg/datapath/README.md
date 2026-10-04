@@ -32,7 +32,7 @@ not a pre-raised memlock limit.
 | `pmtu.go` | `TunnelPMTU`, `SetSoftwireMTU`, `TunnelPMTUExpiry` |
 | `ipv6_rss.go` | `EnableIPv6SoftwareRSS` (the optional native-IPv6 cpumap stage) |
 | `stats.go` | `Stats()`, `ReadPinnedStats()`, the hand-maintained `statID` enum |
-| `pin.go` | pinning the stats map to bpffs |
+| `pin.go` | pinning the stats map and the xdpcap capture hooks to bpffs |
 | `xdproles.go` | `XDPRoles` — which attached XDP program ids are this instance's, and what each does |
 | `sysctl.go` | the forwarding / `accept_ra` sysctls the FIB lookups need |
 
@@ -150,8 +150,9 @@ migration or a dynamic-B4 switch doesn't inherit the retired softwire's reading.
 
 Why is `frag_unit` derived in Go at all, when the datapath knows its own MTU? Because the
 fragmenter's two halves read `frag_unit` at different moments, and a value that changed in
-between would produce an unreassemblable fragment set. Userspace changing it on a poll interval
-is the coarse-grained, safe place to do it.
+between would produce an unreassemblable fragment set. Polling alone does not prevent that
+race: encap snapshots the unit in the internal clone's IPv6 flow label, and every companion
+program slices with that snapshot. The flow label is cleared before WAN transmission.
 
 The same reasoning applies to the MSS clamp (`mss.go`), for a different reason: an MSS only
 affects connections that haven't sent their SYN yet, so a poll interval of lag costs nothing, and
@@ -178,11 +179,15 @@ stat_id` by hand** — bpf2go can't export a Go enum here, because `enum stat_id
 a stored map value type in the BTF (only as inlined integer constants), so `-type stat_id` finds
 nothing. New counters are appended before `STAT_MAX`.
 
-`pin.go` pins **only** the stats map, to `/sys/fs/bpf/minuteman/stats`, so it stays readable
-out-of-band while minuteman runs (`minuteman stats [--json]` via `ReadPinnedStats`, or `bpftool
-map dump pinned ...`). A stale pin from a crashed run is removed first (unpin-then-repin, the
-same stance `internal/slowpath` takes on stale devices); pin failure is fail-fast with a
-bpffs-mount hint; `Close` unpins best-effort.
+`pin.go` pins the maps an out-of-band observer reaches minuteman through, and nothing else:
+`stats` (`/sys/fs/bpf/minuteman/stats`), so counters stay readable while minuteman runs
+(`minuteman stats [--json]` via `ReadPinnedStats`, or `bpftool map dump pinned ...`), and the two
+xdpcap capture hooks (`xdpcap_hook`, `xdpcap_hook_cpu`), so a packet capture can be installed into
+the running datapath — see the hook comment in `bpf/datapath.bpf.c` and
+`docs/operability-backlog.md` §3. A stale pin from a crashed run is removed first
+(unpin-then-repin, the same stance `internal/slowpath` takes on stale devices); pin failure is
+fail-fast with a bpffs-mount hint, unpinning whatever it had already pinned so a failed start
+never leaves a pin advertising a datapath that isn't there; `Close` unpins best-effort.
 
 > **Running inside a netns:** `ip netns exec` creates a new mount namespace and remounts `/sys`,
 > stranding the pin on a private bpffs. Enter with `nsenter --net=...` instead — the netns rig
@@ -227,3 +232,8 @@ a mismatch there would silently route packets to the wrong AFTR slot, so it is a
 explicitly rather than trusted. `migration_state_test.go` drives the real state machine against
 kernel maps and skips itself when not run as root. Everything about actual packet forwarding is
 exercised by the netns rig (`test/netns/README.md`).
+
+Run the actual fragment-program snapshot regression with
+`sudo env MM_BPF_TEST=1 go test ./pkg/datapath -run TestFragmentUnitSnapshot -v`.
+It changes the live unit between clones and verifies offsets, payload reconstruction,
+and removal of the private flow label.

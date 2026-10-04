@@ -453,6 +453,68 @@ struct {
 } icmp_error_rate SEC(".maps");
 
 /*
+ * Packet-capture hook points, ABI-compatible with xdpcap
+ * (github.com/cloudflare/xdpcap).
+ *
+ * Almost nothing this datapath does is visible to tcpdump: XDP_REDIRECT and
+ * XDP_DROP never reach the AF_PACKET tap, and encap, decap, the fragmenter's
+ * clones and the cpumap stages all end in a redirect. The stats counters say
+ * how many packets took each path but never which ones, so the hooks below
+ * are what makes an individual packet observable.
+ *
+ * The mechanism is xdpcap's: a PROG_ARRAY indexed by XDP action, empty while
+ * nothing is capturing (so the tail call below misses and the entry program's
+ * own return value stands). An observer pins-map-loads the array, generates
+ * one filter program per action it wants -- match the packet, copy it to a
+ * perf ring, return the action it was tail-called for -- and installs them.
+ * The array is pinned to bpffs by pkg/datapath (see pin.go), the same
+ * out-of-band route the stats map takes, which is what lets a capture attach
+ * to a running minuteman without it having to serve anything itself.
+ *
+ * Note that a hook fires on the way *out* of the entry program, so what a
+ * capture sees is the packet as the datapath left it: on the encap path the
+ * finished outer-IPv6 frame, not the inner IPv4 that arrived.
+ *
+ * Two arrays, not one: the cpumap-attached programs (xdp_dslite_decap_cpu,
+ * xdp_ipv6_fwd_cpu) get their own, because a prog array binds to the flavor
+ * of program that claims it and an ordinary rx-XDP program cannot be
+ * inserted into one the cpumap stages claimed (measured: the map update is
+ * rejected with EINVAL; the filter program has to be loaded with the same
+ * BPF_XDP_CPUMAP expected attach type). Sharing one array would therefore
+ * have made the hook on the path *every* packet takes unusable to an
+ * off-the-shelf xdpcap, to instrument two stages that are off by default.
+ */
+#define XDPCAP_HOOK_ENTRIES 5 /* XDP_ABORTED..XDP_REDIRECT */
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u32));
+    __uint(max_entries, XDPCAP_HOOK_ENTRIES);
+} xdpcap_hook SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(__u32));
+    __uint(max_entries, XDPCAP_HOOK_ENTRIES);
+} xdpcap_hook_cpu SEC(".maps");
+
+/*
+ * Hand the packet to whatever is capturing for this action, then return the
+ * action. With no capture installed the tail call misses and falls through,
+ * costing one prog-array lookup per packet; when one is installed the
+ * tail-called program returns `action` on this program's behalf and control
+ * never comes back here.
+ */
+static __always_inline int
+xdpcap_exit(struct xdp_md *ctx, void *hook, int action)
+{
+    bpf_tail_call(ctx, hook, action);
+    return action;
+}
+
+/*
  * Takes one token from this CPU's ICMP-error bucket, refilling it first
  * from the time elapsed since the last refill. Returns false when the
  * bucket is empty -- the caller must then drop the offending packet
@@ -948,6 +1010,11 @@ encap_fragment_outer(struct xdp_md *ctx, __u64 l2_len, struct iphdr *inner_iph,
     write_outer_eth6(outer_eth, cfg, &fib, true);
     write_outer_ipv6(outer_iph, &cfg->b4_addr, &cfg->aftr_addr, IPPROTO_FRAGMENT,
                      (__u16)(inner_len + sizeof(struct frag_hdr)));
+    /* Private clone transport: snapshot the unit in the flow label so every
+     * companion program uses the same slicing boundaries across PMTU updates.
+     * emit_softwire_fragment clears it before transmitting on the WAN. */
+    outer_iph->flow_lbl[1] = (__u8)(unit >> 8);
+    outer_iph->flow_lbl[2] = (__u8)unit;
     fh->nexthdr = IPPROTO_IPIP;
     fh->reserved = 0;
     fh->frag_off = bpf_htons(1); /* offset 0, M=1 */
@@ -1002,7 +1069,8 @@ emit_softwire_fragment(struct xdp_md *ctx, __u32 idx)
         increase_stats_count(STAT_NO_CONFIG);
         return XDP_DROP;
     }
-    __u32 unit = g->frag_unit & ~7U;
+    __u32 unit = ((__u32)ip6h->flow_lbl[1] << 8) | ip6h->flow_lbl[2];
+    unit &= ~7U;
     if (unit < 8 || unit > 0xffff) {
         increase_stats_count(STAT_ABORT);
         return XDP_ABORTED;
@@ -1049,6 +1117,7 @@ emit_softwire_fragment(struct xdp_md *ctx, __u32 idx)
     }
 
     *eth = eth_copy;
+    __builtin_memset(ip6_copy.flow_lbl, 0, sizeof(ip6_copy.flow_lbl));
     ip6_copy.payload_len = bpf_htons((__u16)(len + sizeof(struct frag_hdr)));
     *out6 = ip6_copy;
     /* start is a multiple of 8, so (start/8) << 3 == start; bit 0 is M. */
@@ -1061,7 +1130,8 @@ emit_softwire_fragment(struct xdp_md *ctx, __u32 idx)
 
 /*
  * Sends an ICMPv6 "Packet Too Big" (RFC 4443 §3.2) reply straight back out the
- * interface the offending packet arrived on. Used from the native-IPv6
+ * interface the offending packet arrived on. Redirect works on both rx XDP
+ * and CPUMAP stages, where XDP_TX is unsupported. Used from the native-IPv6
  * forwarding fastpath when the resolved egress link's MTU is too small: since
  * IPv6 is never softwire-tunneled, the original sender is directly reachable via
  * the ingress interface, so this is a plain (untunneled) reply, unlike
@@ -1133,7 +1203,7 @@ send_icmpv6_pkt_too_big(struct xdp_md *ctx, __u64 l2_len, const struct ipv6hdr *
 
     increase_stats_count(STAT_MTU_DROP);
     increase_stats_count(STAT_ICMP_FRAG_NEEDED);
-    return XDP_TX;
+    return bpf_redirect_map(&tx_ports, ctx->ingress_ifindex, 0);
 }
 
 /*
@@ -1261,9 +1331,8 @@ maybe_redirect_ipv6_to_cpu(struct xdp_md *ctx, const struct ipv6hdr *ip6h, void 
     return bpf_redirect_map(&cpu_map_v6, *cpu, 0);
 }
 
-SEC("xdp")
-int
-xdp_dslite_encap(struct xdp_md *ctx)
+static __always_inline int
+do_xdp_dslite_encap(struct xdp_md *ctx)
 {
     __u8 *data = (__u8 *)(long)ctx->data;
     __u8 *data_end = (__u8 *)(long)ctx->data_end;
@@ -1411,6 +1480,18 @@ xdp_dslite_encap(struct xdp_md *ctx)
     return redirect_to_ifindex(cfg->wan_ifindex, STAT_REDIRECT_WAN);
 }
 
+/*
+ * Every entry program is a thin wrapper around its inlined body so that the
+ * capture hook has a single exit to sit on, rather than the body's dozens of
+ * returns each needing one (see xdpcap_exit).
+ */
+SEC("xdp")
+int
+xdp_dslite_encap(struct xdp_md *ctx)
+{
+    return xdpcap_exit(ctx, &xdpcap_hook, do_xdp_dslite_encap(ctx));
+}
+
 static __always_inline int
 validate_dslite_ipv6(__u8 *data_end, const struct ipv6hdr *outer_iph,
                      struct iphdr **inner_out, __u16 *inner_len_out)
@@ -1468,7 +1549,15 @@ lookup_lan_nexthop(struct xdp_md *ctx, const struct b4_config *cfg,
     fill_inner_fib_params(fib, inner_iph, inner_len, ctx->ingress_ifindex);
 
     int ret = bpf_fib_lookup(ctx, fib, sizeof(*fib), 0);
-    if (ret == BPF_FIB_LKUP_RET_SUCCESS || ret == BPF_FIB_LKUP_RET_FRAG_NEEDED) {
+    /* FRAG_NEEDED returns before the helper fills the egress ifindex. Resolve
+     * again with a small length, preserving the original MTU decision. */
+    bool too_big = ret == BPF_FIB_LKUP_RET_FRAG_NEEDED;
+    __u16 route_mtu = too_big ? fib->mtu_result : 0;
+    if (too_big) {
+        fill_inner_fib_params(fib, inner_iph, sizeof(struct iphdr), ctx->ingress_ifindex);
+        ret = bpf_fib_lookup(ctx, fib, sizeof(*fib), BPF_FIB_LOOKUP_SKIP_NEIGH);
+    }
+    if (ret == BPF_FIB_LKUP_RET_SUCCESS) {
         if (fib->ifindex == cfg->wan_ifindex) {
             increase_stats_count(STAT_FIB_WRONG_IF);
             return LAN_LOOKUP_FAIL;
@@ -1487,12 +1576,12 @@ lookup_lan_nexthop(struct xdp_md *ctx, const struct b4_config *cfg,
             increase_stats_count(STAT_DECAP_MARTIAN);
             return LAN_LOOKUP_DROP;
         }
-        if (ret == BPF_FIB_LKUP_RET_SUCCESS) {
+        if (!too_big) {
             increase_stats_count(STAT_FIB_SUCCESS);
             return LAN_LOOKUP_OK;
         }
         if (mtu_out)
-            *mtu_out = fib->mtu_result;
+            *mtu_out = route_mtu;
         return LAN_LOOKUP_FRAG_NEEDED;
     }
 
@@ -1842,6 +1931,24 @@ handle_tunnel_icmpv6(struct xdp_md *ctx, __u64 l2_len, const struct ipv6hdr *ip6
     struct ipv4_quote quote = {};
     copy_ipv4_quote(&quote, inner);
 
+    /* Validate the quoted source before learning PMTU, including non-DF
+     * quotes which are consumed without relaying. Neighbor resolution is not
+     * needed to establish that the source belongs to a managed LAN. */
+    struct b4_config *g = get_b4_config();
+    if (!g)
+        return XDP_PASS;
+    struct bpf_fib_lookup source_fib = {};
+    source_fib.family = AF_INET;
+    source_fib.tot_len = sizeof(struct iphdr);
+    source_fib.ipv4_dst = quote.iph.saddr;
+    source_fib.ifindex = ctx->ingress_ifindex;
+    if (bpf_fib_lookup(ctx, &source_fib, sizeof(source_fib), BPF_FIB_LOOKUP_SKIP_NEIGH) !=
+            BPF_FIB_LKUP_RET_SUCCESS ||
+        source_fib.ifindex == g->wan_ifindex || !get_lan_config(source_fib.ifindex)) {
+        increase_stats_count(STAT_TUNNEL_ICMP_DROP);
+        return XDP_DROP;
+    }
+
     __u8 rel_type = 0, rel_code = 0;
     __u32 rel_extra = 0;
     bool relay = false;
@@ -1915,12 +2022,6 @@ handle_tunnel_icmpv6(struct xdp_md *ctx, __u64 l2_len, const struct ipv6hdr *ip6
     if (!icmp_error_eligible(&quote)) {
         increase_stats_count(STAT_TUNNEL_ICMP_DROP);
         return XDP_DROP;
-    }
-
-    struct b4_config *g = get_b4_config();
-    if (!g) {
-        increase_stats_count(STAT_NO_CONFIG);
-        return XDP_PASS;
     }
 
     /*
@@ -2175,12 +2276,11 @@ SEC("xdp/cpumap")
 int
 xdp_dslite_decap_cpu(struct xdp_md *ctx)
 {
-    return handle_xdp_dslite_decap(ctx);
+    return xdpcap_exit(ctx, &xdpcap_hook_cpu, handle_xdp_dslite_decap(ctx));
 }
 
-SEC("xdp")
-int
-xdp_dslite_decap(struct xdp_md *ctx)
+static __always_inline int
+do_xdp_dslite_decap(struct xdp_md *ctx)
 {
     __u8 *data = (__u8 *)(long)ctx->data;
     __u8 *data_end = (__u8 *)(long)ctx->data_end;
@@ -2264,6 +2364,13 @@ xdp_dslite_decap(struct xdp_md *ctx)
     return handle_xdp_dslite_decap(ctx);
 }
 
+SEC("xdp")
+int
+xdp_dslite_decap(struct xdp_md *ctx)
+{
+    return xdpcap_exit(ctx, &xdpcap_hook, do_xdp_dslite_decap(ctx));
+}
+
 /*
  * Software-RSS second stage for native IPv6: runs on the CPU maybe_redirect_
  * ipv6_to_cpu fanned the packet out to (via cpu_map_v6), re-parses the frame,
@@ -2271,9 +2378,8 @@ xdp_dslite_decap(struct xdp_md *ctx)
  * preserved across the cpumap redirect, so the FIB lookup and egress/ingress
  * checks behave exactly as they would on the inline path.
  */
-SEC("xdp/cpumap")
-int
-xdp_ipv6_fwd_cpu(struct xdp_md *ctx)
+static __always_inline int
+do_xdp_ipv6_fwd_cpu(struct xdp_md *ctx)
 {
     __u8 *data = (__u8 *)(long)ctx->data;
     __u8 *data_end = (__u8 *)(long)ctx->data_end;
@@ -2294,6 +2400,13 @@ xdp_ipv6_fwd_cpu(struct xdp_md *ctx)
     return handle_ipv6_forward(ctx, l2_len, ip6h, &cfg);
 }
 
+SEC("xdp/cpumap")
+int
+xdp_ipv6_fwd_cpu(struct xdp_md *ctx)
+{
+    return xdpcap_exit(ctx, &xdpcap_hook_cpu, do_xdp_ipv6_fwd_cpu(ctx));
+}
+
 /*
  * The rx XDP programs of the softwire-fragmentation companion veth pairs'
  * B ends: pair i's program turns the broadcast clone arriving there into
@@ -2308,7 +2421,7 @@ xdp_ipv6_fwd_cpu(struct xdp_md *ctx)
     SEC("xdp")                                                                           \
     int xdp_softwire_frag##i(struct xdp_md *ctx)                                         \
     {                                                                                    \
-        return emit_softwire_fragment(ctx, i);                                           \
+        return xdpcap_exit(ctx, &xdpcap_hook, emit_softwire_fragment(ctx, i));           \
     }
 
 SOFTWIRE_FRAG_PROG(0)

@@ -42,16 +42,16 @@ func Load() (*Loader, error) {
 		objs:     objs,
 		lanLinks: make(map[uint32]link.Link),
 	}
-	if err := l.pinStats(); err != nil {
+	if err := l.pinMaps(); err != nil {
 		objs.Close()
 		return nil, err
 	}
 	return l, nil
 }
 
-// Close detaches all XDP programs, removes the stats pin and unloads the
+// Close detaches all XDP programs, removes the bpffs pins and unloads the
 // BPF objects. The unpin is best-effort: a leftover pin is only stale state
-// for the next run's pinStats to sweep, not worth failing shutdown over.
+// for the next run's pinMaps to sweep, not worth failing shutdown over.
 func (l *Loader) Close() error {
 	if l.wanLink != nil {
 		l.wanLink.Close()
@@ -62,7 +62,7 @@ func (l *Loader) Close() error {
 	for _, lk := range l.lanLinks {
 		lk.Close()
 	}
-	l.objs.Stats.Unpin()
+	l.unpinMaps()
 	return l.objs.Close()
 }
 

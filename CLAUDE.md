@@ -118,7 +118,8 @@ Not yet implemented:
   specific code each points at. Non-protocol operability/test-ergonomics improvements are tracked
   separately in `docs/operability-backlog.md` — its #1 (out-of-band stats via a bpffs-pinned map + the
   `minuteman stats` subcommand) is done, #2 (daemon/detach) partially (systemd unit example +
-  `-pidfile`; no `sd_notify`).
+  `-pidfile`; no `sd_notify`), #3 (per-packet capture) partially: the datapath carries the
+  xdpcap-compatible hooks and pins them, but there's no in-tree capture client yet.
 
 ## Build commands
 
@@ -335,6 +336,24 @@ orphaned the running kernel's module directory — reboot to fix that).
     §2.4(f) makes rate-limiting originated ICMPv6 errors a MUST, and these `XDP_TX` replies bypass the
     kernel's own `icmp_ratelimit` sysctls entirely. When the bucket is empty the offending packet is
     dropped without an error (mirroring the kernel's own behavior), counted in `STAT_ICMP_RATE_LIMITED`.
+  - **Capture hooks** (`xdpcap_hook`/`xdpcap_hook_cpu` + `xdpcap_exit`) — ABI-compatible with
+    [cloudflare/xdpcap](https://github.com/cloudflare/xdpcap), because almost nothing this datapath does
+    is visible to tcpdump: XDP_REDIRECT and XDP_DROP never reach the AF_PACKET tap, and encap, decap, the
+    fragmenter's clones and the cpumap stages all end in a redirect, so the stats counters say how many
+    packets took each path but never which ones. A hook is a `PROG_ARRAY` indexed by XDP action that each
+    entry program tail-calls on its way out; empty while nothing is capturing, so the tail call misses and
+    the entry program's own return value stands (cost: one prog-array lookup per packet). Every entry
+    program is therefore a thin wrapper (`xdp_dslite_encap` → `do_xdp_dslite_encap`, and so on for decap,
+    both cpumap stages and the `SOFTWIRE_FRAG_PROG` macro) around an `__always_inline` body, so one hook
+    covers its dozens of returns. The arrays are pinned by `pkg/datapath/pin.go`, the same out-of-band
+    route the stats map takes. Two arrays, not one: the kernel's prog-array compatibility check requires a
+    program's `expected_attach_type` to match the array owner's, so the cpumap-attached stages get their
+    own (`xdpcap_hook_cpu`) — sharing would have made the hook on the path *every* packet takes unusable
+    to a plain rx-XDP filter program, to instrument two stages that are off by default. Note a hook fires
+    on the way *out*, so a capture sees the packet as the datapath left it (on the encap path the finished
+    outer IPv6 frame, not the inner IPv4 that arrived). `docs/operability-backlog.md` §3 has the rest,
+    including why stock `xdpcap` needs a one-line patch to attach and what an in-tree
+    `minuteman monitor` would need.
   - **`bpf/datapath_helpers.h`** — shared low-level helpers (checksum fold/compute, IPv4 TTL decrement with
     incremental checksum update, IPv6 hop-limit decrement (`decrease_ipv6_hoplimit` — no checksum, so
     trivial), L2(+VLAN)/IPv4/IPv6 header parsing with bounds checks, IPv6 address comparison and
@@ -409,11 +428,14 @@ orphaned the running kernel's module directory — reboot to fix that).
     field/index order (`statID` in `stats.go`) must be kept manually in sync with `enum stat_id` in the C
     source — bpf2go can't export a Go enum here because `enum stat_id` never appears as a stored map value
     type in the BTF (only as inlined integer constants), so `-type stat_id` finds nothing.
-  - `pin.go` — `Load()` pins the `stats` map to bpffs (`/sys/fs/bpf/minuteman/stats`) so it stays
-    readable out-of-band while minuteman runs (`minuteman stats [--json]` via `ReadPinnedStats()` in
-    `stats.go`, or `bpftool map dump pinned ...`): a stale pin from a crashed previous run is removed
-    first (unpin-then-repin, `internal/slowpath`'s stale-device stance), pin failure is fail-fast with a
-    bpffs-mount hint, and `Loader.Close` unpins best-effort. Only `stats` is pinned. NB for anything
+  - `pin.go` — `Load()` pins to bpffs the maps an out-of-band observer reaches minuteman through
+    (`pinMaps`, all under `/sys/fs/bpf/minuteman/`): `stats`, so counters stay readable while minuteman
+    runs (`minuteman stats [--json]` via `ReadPinnedStats()` in `stats.go`, or `bpftool map dump
+    pinned ...`), and the two `xdpcap_hook`/`xdpcap_hook_cpu` capture hooks, so a packet capture can be
+    installed into the running datapath (see the hook bullet under `bpf/datapath.bpf.c` above). A stale
+    pin from a crashed previous run is removed first (unpin-then-repin, `internal/slowpath`'s
+    stale-device stance), pin failure is fail-fast with a
+    bpffs-mount hint, and `Loader.Close` unpins best-effort. Nothing else is pinned. NB for anything
     that runs minuteman inside a netns: `ip netns exec` creates a new mount namespace and remounts
     `/sys`, stranding the pin on a private bpffs — enter with `nsenter --net=...` instead (the netns rig
     does; see `test/netns/README.md`'s "Reading datapath stats").

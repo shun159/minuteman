@@ -152,9 +152,9 @@ def main() -> None:
     s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
     s.bind((iface, 0))
 
-    if mode == "martian":
+    if mode in ("martian", "oversized"):
         inner_dst = sys.argv[7] if len(sys.argv) > 7 else "8.8.8.8"
-        inner = build_inner_ipv4("203.0.113.2", inner_dst, 32)
+        inner = build_inner_ipv4("203.0.113.2", inner_dst, 1372 if mode == "oversized" else 32, df=mode == "oversized")
         pkt = ipv6_header(aftr6, b4_6, len(inner), IPPROTO_IPIP) + inner
         s.send(eth + pkt)
         s.close()
@@ -201,7 +201,7 @@ def main() -> None:
         # Packet Too Big (which runs today, before minuteman handles these) does
         # not fire, so a small quote would make this injector test something no
         # real ICMPv6 error looks like.
-        inner = build_inner_ipv4("192.168.1.2", "203.0.113.2", 1372, df=df)
+        inner = build_inner_ipv4(os.environ.get("MM_QUOTED_SRC", "192.168.1.2"), "203.0.113.2", 1372, df=df)
         quoted_b4, quoted_aftr = b4_6, aftr6
         if mode == "icmp6bogus":
             # Quote a softwire between two addresses that are not this B4's:

@@ -29,8 +29,9 @@ const tunnelPMTUPollInterval = 2 * time.Second
 // Deriving the fragment size here rather than in the datapath is deliberate:
 // encap_fragment_outer and the xdp_softwire_frag<i> programs read frag_unit at
 // different moments for the same packet, so a value that changed in between
-// would yield a fragment set that can never reassemble. Recomputing it from one
-// place, on a timer, means the two always read the same figure.
+// would yield a fragment set that can never reassemble. The encap stage now
+// snapshots that configured unit into each clone; companion stages use the
+// snapshot even when this worker updates the configuration in flight.
 //
 // It also handles the widening direction: TunnelPMTU stops reporting an aged-out
 // reading, so the fragment size and the tunnel MTU go back to the WAN device's
