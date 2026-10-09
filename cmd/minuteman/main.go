@@ -771,7 +771,10 @@ const b4WatchInterval = 30 * time.Second
 // answer is available. At startup the WAN's RA-learned route to the AFTR is
 // briefly gone (AttachWAN's forwarding-enable purge; SolicitRouters restores
 // it), so the first few queries return no source -- that's expected, not fatal.
-// Blocks until it resolves or ctx is cancelled.
+// Nor is a source that isn't global (see usableB4): right after AttachWAN
+// bounces the link, the WAN's own global address is DAD-tentative again, and
+// until it is usable the kernel answers with the link-local one, which no AFTR
+// can reach. Blocks until it resolves or ctx is cancelled.
 func resolveB4(ctx context.Context, wanIfindex int, aftr netip.Addr) (netip.Addr, error) {
 	nl, err := netlink.Open()
 	if err != nil {
@@ -779,18 +782,21 @@ func resolveB4(ctx context.Context, wanIfindex int, aftr netip.Addr) (netip.Addr
 	}
 	defer nl.Close()
 
-	logged := false
+	loggedNoRoute, loggedNotGlobal := false, false
 	for {
 		src, ok, err := nl.SourceForDest(wanIfindex, aftr)
 		if err != nil {
 			return netip.Addr{}, fmt.Errorf("selecting B4 source toward %s: %w", aftr, err)
 		}
-		if ok {
+		switch {
+		case ok && usableB4(src):
 			return src, nil
-		}
-		if !logged {
+		case ok && !loggedNotGlobal:
+			log.Printf("dynamic B4: kernel offers %s toward AFTR %s, not a global address; waiting for the WAN's own (likely still DAD-tentative)", src, aftr)
+			loggedNotGlobal = true
+		case !ok && !loggedNoRoute:
 			log.Printf("dynamic B4: waiting for the WAN's route to AFTR %s (RA-learned route not back yet)", aftr)
-			logged = true
+			loggedNoRoute = true
 		}
 		select {
 		case <-ctx.Done():
@@ -806,12 +812,21 @@ func resolveB4(ctx context.Context, wanIfindex int, aftr netip.Addr) (netip.Addr
 // internal/wanextend.nextWatchState. A query that returned no source (ok=false:
 // the WAN route is momentarily gone, e.g. mid-renumbering) or an invalid/
 // unchanged address is *not* a change: keep the current B4 rather than switch
-// to something invalid, so a transient blip never breaks the softwire.
+// to something invalid, so a transient blip never breaks the softwire. Nor is a
+// source that isn't global (see usableB4), e.g. the link-local one the kernel
+// falls back to while a renumbered WAN's new global is still DAD-tentative.
 func nextB4(current, queried netip.Addr, ok bool) (b4 netip.Addr, changed bool) {
-	if !ok || !queried.IsValid() || queried == current {
+	if !ok || !usableB4(queried) || queried == current {
 		return current, false
 	}
 	return queried, true
+}
+
+// usableB4 reports whether a kernel-chosen source can be the B4: the AFTR
+// reaches it across the access network, so it must be a global unicast address
+// (a ULA counts) -- never link-local, loopback, multicast or unspecified.
+func usableB4(addr netip.Addr) bool {
+	return addr.Is6() && addr.IsGlobalUnicast()
 }
 
 // watchB4 polls the kernel's chosen B4 source toward aftr every b4WatchInterval

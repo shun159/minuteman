@@ -766,8 +766,9 @@ if [[ $dynamic_b4_enabled -eq 1 && $started_minuteman -eq 1 ]]; then
     # watchB4 polls every 30s; give it a full interval (plus the new address's
     # DAD) to notice the change and hard-switch. It re-selects whichever source
     # the kernel now prefers among the remaining non-deprecated WAN globals
-    # (WAN_CPE_ADDR2, or the WAN's own SLAAC address) -- parse that from the log
-    # rather than assuming which, then assert it moved off the deprecated one.
+    # (WAN_CPE_ADDR2: setup.sh turns SLAAC off on this link in this mode) --
+    # parse that from the log rather than assuming which, then assert it moved
+    # off the deprecated one.
     check "minuteman re-selected the softwire source after the WAN address change" \
         retry_slow grep -q "switched softwire source to " "$RUNDIR/minuteman.log"
     switched_b4="$(sed -n 's/.*switched softwire source to \([^ ]*\) .*/\1/p' "$RUNDIR/minuteman.log" | tail -n1)"

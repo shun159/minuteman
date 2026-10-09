@@ -325,6 +325,16 @@ netns_exec "$NETNS_ISP" dnsmasq --conf-file="$DNSMASQ_CONF" --pid-file="$DNSMASQ
 # only reports RUNNING/carrier-up once its peer is also admin-up, and Kea's
 # socket-opening check (unlike dnsmasq's) requires RUNNING, so this also
 # needs to happen before Kea starts below.
+#
+# Under MM_DYNAMIC_B4=1, SLAAC is off on this link (autoconf=0; set before the
+# link goes up, so no address is ever formed): minuteman selects whichever
+# usable global the kernel prefers toward the AFTR, and with a SLAAC address
+# beside WAN_CPE_ADDR that depends on which of the two finishes DAD first
+# after AttachWAN bounces the link -- while the AFTR's tunnel below is pinned
+# to WAN_CPE_ADDR. RAs are still accepted (accept_ra) for the default route.
+if [[ "$DYNAMIC_B4" == 1 ]]; then
+    netns_exec "$NETNS_CPE" sysctl -qw net.ipv6.conf."$VETH_CPE_ISP".autoconf=0
+fi
 netns_exec "$NETNS_CPE" ip link set "$VETH_CPE_ISP" up
 # v-isp-cpe's link-local address is tentative (DAD-pending) for a moment
 # right after an interface comes up; Kea's socket-opening code (unlike
