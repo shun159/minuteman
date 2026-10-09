@@ -38,15 +38,9 @@ func (p Phase) String() string {
 	return "unknown"
 }
 
-// Requests to the client, and the reply.
+// The request to the client, and the reply.
 type (
-	exchangeReq struct {
-		ID proc.Ref
-		X  dhcpv6.Exchange
-	}
-	// cancelReq, a cast, abandons the exchange of ID, running or waiting
-	// its turn; its caller gets no reply.
-	cancelReq struct{ ID proc.Ref }
+	exchangeReq struct{ X dhcpv6.Exchange }
 
 	exchangeRep struct {
 		Msg *dhcpv6.Message
@@ -78,14 +72,9 @@ type data struct {
 
 	// The exchange running, outside Idle.
 	cur exchange
-
-	// cancelled holds exchanges abandoned while waiting their turn, to drop
-	// when it comes. Copied when changed.
-	cancelled map[proc.Ref]bool
 }
 
 type exchange struct {
-	id      proc.Ref
 	from    molecule.From
 	x       dhcpv6.Exchange
 	xid     dhcpv6.TransactionID
@@ -105,26 +94,12 @@ func (m machine) HandleEvent(st Phase, d data, ev genstatem.Event) (Phase, data,
 		if !ok {
 			break
 		}
-		if d.cancelled[req.ID] {
-			d.cancelled = without(d.cancelled, req.ID)
-			return st, d, nil
-		}
+		// One at a time: the others wait, postponed. One whose caller
+		// gives up meanwhile is dropped (see molecule.CallAbandoned).
 		if st != Idle {
 			return st, d, molecule.Do(genstatem.Postpone{})
 		}
 		return m.start(d, req, e.From)
-
-	case genstatem.Cast:
-		c, ok := e.Msg.(cancelReq)
-		if !ok {
-			break
-		}
-		if st != Idle && d.cur.id == c.ID {
-			d.cur = exchange{}
-			return Idle, d, nil
-		}
-		d.cancelled = with(d.cancelled, c.ID)
-		return st, d, nil
 
 	case genstatem.StateTimeout:
 		switch e.Msg.(type) {
@@ -142,6 +117,12 @@ func (m machine) HandleEvent(st Phase, d data, ev genstatem.Event) (Phase, data,
 
 	case genstatem.Info:
 		switch msg := e.Msg.(type) {
+		case molecule.CallAbandoned:
+			// The caller of the exchange running gave up: on to the next.
+			if st != Idle && msg.From == d.cur.from {
+				d.cur = exchange{}
+				return Idle, d, nil
+			}
 		case genudp.DataMsg:
 			if st != Waiting {
 				return st, d, nil
@@ -168,7 +149,6 @@ func (m machine) HandleEvent(st Phase, d data, ev genstatem.Event) (Phase, data,
 func (m machine) start(d data, req exchangeReq, from molecule.From) (Phase, data, []molecule.Effect) {
 	r := rand.New(&d.rng)
 	d.cur = exchange{
-		id:   req.ID,
 		from: from,
 		x:    req.X,
 		xid:  dhcpv6.NewTransactionID(r),
@@ -199,23 +179,4 @@ func (m machine) finish(d data, msg *dhcpv6.Message, err error) (Phase, data, []
 	from := d.cur.from
 	d.cur = exchange{}
 	return Idle, d, molecule.Do(molecule.Reply{To: from, Value: exchangeRep{Msg: msg, Err: err}})
-}
-
-func with(m map[proc.Ref]bool, k proc.Ref) map[proc.Ref]bool {
-	c := make(map[proc.Ref]bool, len(m)+1)
-	for x := range m {
-		c[x] = true
-	}
-	c[k] = true
-	return c
-}
-
-func without(m map[proc.Ref]bool, k proc.Ref) map[proc.Ref]bool {
-	c := make(map[proc.Ref]bool, len(m))
-	for x := range m {
-		if x != k {
-			c[x] = true
-		}
-	}
-	return c
 }
