@@ -48,7 +48,7 @@ provides regardless of `MM_AFTR_DISCOVERY`/`MM_WAN_MODEL`, so it composes with e
 `mm-host` `dig` the AFTR-Name `A`/`AAAA` record — the same one `mm-isp` itself answers directly for the
 AFTR-discovery checks above — through minuteman's LAN gateway IP instead, over both UDP and TCP, and
 checks the answer matches; a live run also confirmed via `tcpdump -i dslite0` on `mm-aftr` that zero
-packets cross the softwire during a DNS-proxied query (see `pkg/dnsproxy`'s own entry in CLAUDE.md's
+packets cross the softwire during a DNS-proxied query (see `internal/dnsproxy`'s own entry in CLAUDE.md's
 Architecture for why that's structurally guaranteed, not just empirically true this once).
 
 A fourth, independent toggle, `MM_DHCPV4` (`0` default or `1`), adds `-dhcpv4` and exercises the DHCPv4

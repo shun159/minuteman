@@ -82,7 +82,7 @@ Two smaller rules in `Sync`:
   transient error.
 
 `NewRAManager(rdnssByIface)` takes the map `cmd/minuteman`'s `startDNSProxy` returns: LAN
-interface → the link-local address `pkg/dnsproxy` *actually bound* there. Only those addresses
+interface → the link-local address `internal/dnsproxy` *actually bound* there. Only those addresses
 are advertised as an RFC 8106 RDNSS option (RFC 7084 §L-11), so an IPv6-only SLAAC client is
 never pointed at a DNS server nothing answers on. An interface absent from the map, or a nil
 map, simply gets no RDNSS option.

@@ -107,7 +107,7 @@ A non-nil return means the initial discovery failed or was cancelled. Past that 
 returns nil and leaves its goroutines running until `ctx` is cancelled.
 
 `rdnssByIface` is forwarded to every LAN RA worker and carries the same meaning as in
-`internal/lanprefix`: LAN interface → the link-local address `pkg/dnsproxy` actually bound
+`internal/lanprefix`: LAN interface → the link-local address `internal/dnsproxy` actually bound
 there, so an RDNSS option is only ever advertised for a resolver that really answers.
 
 ## Testing

@@ -28,7 +28,7 @@
 #
 # MM_DNS_PROXY selects whether minuteman is started with -dns-proxy,
 # independently of both of the above ("0"/unset (default) or "1"):
-# exercises pkg/dnsproxy, forwarding LAN clients' DNS queries to mm-isp's
+# exercises internal/dnsproxy, forwarding LAN clients' DNS queries to mm-isp's
 # DNS server directly over IPv6 rather than through the DS-Lite softwire.
 #
 # MM_DHCPV4 selects whether minuteman is started with -dhcpv4 ("0"/unset

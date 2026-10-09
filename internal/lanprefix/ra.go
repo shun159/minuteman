@@ -43,7 +43,7 @@ type RAManager struct {
 // rdnssByIface maps a LAN interface name to the DNS-server address to
 // advertise in its RAs' RDNSS option (RFC 8106) -- it must be an address a
 // DNS proxy actually bound (see routeradvert.Config.RDNSSAddr's own doc), so
-// the caller passes exactly the link-local addresses pkg/dnsproxy reported
+// the caller passes exactly the link-local addresses internal/dnsproxy reported
 // binding. An interface absent from the map (or a nil map) gets no RDNSS.
 func NewRAManager(rdnssByIface map[string]netip.Addr) *RAManager {
 	return &RAManager{workers: make(map[string]*raWorker), rdnssByIface: rdnssByIface}

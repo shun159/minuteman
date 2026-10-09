@@ -458,7 +458,7 @@ if [[ $dns_proxy_enabled -eq 1 ]]; then
     # $NETNS_HOST queries minuteman's LAN gateway IP directly (not mm-isp) --
     # a correct answer proves the proxy actually forwarded the query to
     # mm-isp's DNS server over the CPE's own native IPv6 and relayed the
-    # answer back, both over UDP and over TCP (dnsproxy's Server.Serve runs both).
+    # answer back, both over UDP and over TCP (internal/dnsproxy listens on both).
     check "$NETNS_HOST (LAN client) resolves $AFTR_FQDN via minuteman's DNS proxy (UDP)" \
         bash -c "[[ \$(ip netns exec $NETNS_HOST dig @${LAN_CPE_ADDR%/*} +short AAAA $AFTR_FQDN) == '${CORE_AFTR_ADDR%/*}' ]]"
     check "$NETNS_HOST (LAN client) resolves $AFTR_FQDN via minuteman's DNS proxy (TCP)" \

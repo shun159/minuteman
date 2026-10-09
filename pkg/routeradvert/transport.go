@@ -115,7 +115,7 @@ func LinkLocalAddr(iface string) (netip.Addr, error) {
 			continue
 		}
 		// Zoned: fe80::/10 is only unique per-interface, so a caller binding
-		// a socket to it (pkg/dnsproxy, when -dns-proxy is on) needs the
+		// a socket to it (internal/dnsproxy, when -dns-proxy is on) needs the
 		// zone to disambiguate. The wire encoding this package's own RDNSS
 		// option writes (NewRDNSS's As16()) ignores the zone, as it must --
 		// it's local metadata, never sent on the wire.
