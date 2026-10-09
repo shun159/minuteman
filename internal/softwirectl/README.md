@@ -59,8 +59,8 @@ the endpoints new flows use), and goes on from there; if the AFTR moved since st
 refresh pacing and HB46PP token died with the old controller, so it re-discovers at once.
 
 The supervisor is `rest_for_one`, the controller depending on the softwire server. Past its restart
-intensity it gives up, and `startSoftwireControl` fails the whole of minuteman, for whatever
-supervises minuteman to start it cleanly.
+intensity it gives up, ending its application, a permanent one: `cmd/minuteman` then fails as a
+whole, for whatever supervises minuteman to start it cleanly.
 
 ## Discovery
 

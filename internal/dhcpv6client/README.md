@@ -51,9 +51,10 @@ did: a Renew bounded by T2, an Information-Request by `aftrdiscovery`'s `replyTi
 
 ## Lifetime
 
-`cmd/minuteman` starts the client before DHCPv6-PD and AFTR discovery need it, and stops it last,
-after everything that might still exchange on the way out: the PD maintenance sends its Release
-through it on shutdown. A socket that fails stops the process, and its supervisor binds a new one.
+`cmd/minuteman` starts the client, as the first of its applications, before DHCPv6-PD and AFTR
+discovery need it. The applications stop in reverse order, after everything else of minuteman's,
+so the client stops last, after everything that might still exchange on the way out: the PD
+maintenance sends its Release through it on shutdown. A socket that fails stops the process, and its supervisor binds a new one.
 
 ## Testing
 
