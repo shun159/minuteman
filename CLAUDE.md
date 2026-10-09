@@ -652,11 +652,11 @@ orphaned the running kernel's module directory — reboot to fix that).
   kind. A molecule supervision tree (`Spec(Config)`, one_for_one): per listen address, a UDP listener and a
   `gentcpacceptor` raw TCP listener, each bound before the tree's start returns (so `cmd/minuteman` fails
   fast, and only advertises one of these addresses as an RDNSS DNS server once it's actually bound — see
-  `startDNSProxy`/`routeradvert`). The UDP listener (`udp.go`, a proc process: it starts a process per
-  query) owns a `genudp` socket in `N(maxInFlight)` mode and re-arms it by one as each forwarder exits, so
-  queries in flight are bounded and the rest wait in the kernel; it waits out a link-local address still
-  DAD-tentative (`EADDRNOTAVAIL`, `bindRetries`) before its TCP sibling binds. Each forwarder tries
-  `Config.Upstreams` in order over a fresh one-shot `genudp` socket (deliberately not pooled: a dedicated
+  `startDNSProxy`/`routeradvert`). The UDP listener (`udp.go`, a genserver) owns a `genudp` socket in
+  `N(maxInFlight)` mode, forwards each query in a `molecule.Async`, and re-arms the socket by one as each
+  ends, so queries in flight are bounded and the rest wait in the kernel; its start waits out a link-local
+  address still DAD-tentative (`EADDRNOTAVAIL`, `bindRetries`) before its TCP sibling binds. Each query tries
+  `Config.Upstreams` in order over a fresh one-shot connected UDP socket (deliberately not pooled: a dedicated
   socket means a response can never be confused with a different concurrent query's), bounded by
   `udpQueryTimeout`; every upstream failing just drops the query, relying on the client's own resolver to
   retry. `tcp.go`'s `relay` is a full bidirectional byte-level `io.Copy` relay per accepted connection rather
@@ -802,8 +802,8 @@ orphaned the running kernel's module directory — reboot to fix that).
   recommends the AFTR migrate its NAT state to the new B4, but that can't be relied on, so minuteman cuts
   cleanly) then re-triggers AFTR discovery. A switch can happen in any phase, so a WAN change interrupts
   even a multi-hour drain; it bumps a generation that makes every response still in flight stale. The
-  datapath, tunnel and netlink calls are made by the tree's `softwire` server, discovery by its
-  `aftr-discovery` process; see `internal/softwirectl/README.md`. `watchTunnelPMTU()` (always started, `pmtu.go`) polls the path MTU the datapath learns from inbound
+  datapath, tunnel and netlink calls are made by the tree's `softwire` server, discovery in a
+  `molecule.Async` of the controller's; see `internal/softwirectl/README.md`. `watchTunnelPMTU()` (always started, `pmtu.go`) polls the path MTU the datapath learns from inbound
   ICMPv6 Packet Too Big messages and applies it to the two things userspace owns — the fragmenter's
   `frag_unit` and the companion ip6tnl's MTU — including the widening direction, since a reading that ages
   out simply stops being reported. When `-dhcpv6-pd` is set, `runPrefixDelegation()` similarly blocks

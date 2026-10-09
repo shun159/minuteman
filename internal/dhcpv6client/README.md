@@ -43,16 +43,18 @@ only while an exchange waits.
 
 ## Giving up
 
-`Client.Exchange` gives up when its `ctx` is done: it abandons its request and casts a cancel, and
-the machine drops that exchange -- the one running, which frees the client for the next, or one
-still waiting its turn, which is skipped when it comes. This is how the callers' deadlines work
-as they did: a Renew bounded by T2, an Information-Request by `aftrdiscovery`'s `replyTimeout`.
+`Client.Exchange` is a `molecule.Call` with the caller's `ctx`. When that is done first, the Call
+tells the machine with a `molecule.CallAbandoned`: genstatem drops the exchange if it is still
+waiting its turn, postponed; if it is the one running, the machine gets the `CallAbandoned` and
+drops it, which frees the client for the next. This is how the callers' deadlines work as they
+did: a Renew bounded by T2, an Information-Request by `aftrdiscovery`'s `replyTimeout`.
 
 ## Lifetime
 
-`cmd/minuteman` starts the client before DHCPv6-PD and AFTR discovery need it, and stops it last,
-after everything that might still exchange on the way out: the PD maintenance sends its Release
-through it on shutdown. A socket that fails stops the process, and its supervisor binds a new one.
+`cmd/minuteman` starts the client, as the first of its applications, before DHCPv6-PD and AFTR
+discovery need it. The applications stop in reverse order, after everything else of minuteman's,
+so the client stops last, after everything that might still exchange on the way out: the PD
+maintenance sends its Release through it on shutdown. A socket that fails stops the process, and its supervisor binds a new one.
 
 ## Testing
 

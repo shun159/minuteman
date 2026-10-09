@@ -63,7 +63,7 @@ type Config struct {
 // Spec is the supervision tree of the proxy:
 //
 //	dnsproxy (one_for_one)
-//	├── udp <addr>   the UDP listener, a process per query in flight under it
+//	├── udp <addr>   the UDP listener, an Async per query in flight
 //	├── tcp <addr>   a gentcpacceptor listener relaying each connection
 //	└── ...          the same for each listen address
 //

@@ -177,22 +177,15 @@ func NewClient(node *proc.Node, iface string) Client {
 
 // Exchange runs x, after the exchanges before it, and returns its answer.
 // When ctx is done first, the exchange is abandoned -- running or waiting its
-// turn -- and Exchange returns ctx's error.
+// turn, the client told by molecule.Call -- and Exchange returns ctx's error.
 func (c Client) Exchange(ctx context.Context, x dhcpv6.Exchange) (*dhcpv6.Message, error) {
-	id := c.node.MakeRef()
-	p := molecule.Request[exchangeRep](c.node, c.name, exchangeReq{ID: id, X: x})
-	select {
-	case <-p.Done():
-	case <-ctx.Done():
-		p.Cancel()
-		if _, err := p.Result(); errors.Is(err, molecule.ErrCancelled) {
-			molecule.SendCast(c.node, c.name, cancelReq{ID: id})
+	v, err := molecule.Call(ctx, c.node, c.name, exchangeReq{X: x})
+	if err != nil {
+		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-	}
-	rep, err := p.Result()
-	if err != nil {
 		return nil, fmt.Errorf("dhcpv6 client: %w", err)
 	}
+	rep := v.(exchangeRep)
 	return rep.Msg, rep.Err
 }

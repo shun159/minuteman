@@ -11,11 +11,9 @@ import (
 
 	"github.com/shun159/miniteman/pkg/datapath"
 	"github.com/shun159/molecule"
-	"github.com/shun159/molecule/behaviours/genserver"
 	"github.com/shun159/molecule/behaviours/genstatem"
 	"github.com/shun159/molecule/behaviours/supervisor"
 	"github.com/shun159/molecule/gensim"
-	"github.com/shun159/molecule/proc"
 )
 
 var (
@@ -100,64 +98,20 @@ func (f *fakeRouter) SourceForDest(int, netip.Addr) (netip.Addr, bool, error) {
 	return f.src, f.src.IsValid(), nil
 }
 
-// fakeDiscovery answers discovery attempts with scripted results, each after
-// its delay, and the result before it again when the script runs out.
-type fakeDiscovery struct {
-	script    *[]attempt
-	cancelled *int
-}
-
+// attempt is a discovery attempt's scripted outcome.
 type attempt struct {
-	disc  Discovery
-	err   error
-	delay time.Duration
-}
-
-type discoveryState struct {
-	from genserver.From[discoverRep]
-	rep  discoverRep
-}
-
-type replyNow struct{}
-
-func (fakeDiscovery) Init(proc.PID) (discoveryState, []molecule.Effect, error) {
-	return discoveryState{}, nil, nil
-}
-
-func (f fakeDiscovery) HandleCall(_ discoveryState, _ discoverReq, from genserver.From[discoverRep]) (discoveryState, []molecule.Effect) {
-	a := (*f.script)[0]
-	if len(*f.script) > 1 {
-		*f.script = (*f.script)[1:]
-	}
-	rep := discoverRep{Disc: a.disc, Err: a.err}
-	if a.err != nil {
-		rep.RetryIn = time.Hour
-	}
-	return discoveryState{from, rep}, molecule.Do(molecule.StartTimer{Key: "reply", After: a.delay, Msg: replyNow{}})
-}
-
-func (f fakeDiscovery) HandleCast(st discoveryState, _ cancelDiscovery) (discoveryState, []molecule.Effect) {
-	*f.cancelled++
-	return st, molecule.Do(molecule.CancelTimer{Key: "reply"},
-		st.from.Reply(discoverRep{Err: context.Canceled, RetryIn: time.Hour}))
-}
-
-func (fakeDiscovery) HandleInfo(st discoveryState, msg any) (discoveryState, []molecule.Effect) {
-	if _, ok := msg.(replyNow); ok {
-		return st, molecule.Do(st.from.Reply(st.rep))
-	}
-	return st, nil
+	disc Discovery
+	err  error
 }
 
 // rig is a softwire control tree under simulation.
 type rig struct {
-	t         *testing.T
-	sim       *gensim.Sim
-	dp        *fakeDP
-	tun       *fakeTunnel
-	router    *fakeRouter
-	script    []attempt
-	cancelled int
+	t      *testing.T
+	sim    *gensim.Sim
+	dp     *fakeDP
+	tun    *fakeTunnel
+	router *fakeRouter
+	script []attempt
 }
 
 func newRig(t *testing.T, script ...attempt) *rig {
@@ -176,15 +130,26 @@ func newRig(t *testing.T, script ...attempt) *rig {
 			DynamicAFTR: true,
 			DynamicB4:   true,
 			Initial:     Discovery{AFTR: aftr1, Refresh: day},
+			Discover:    r.discover,
+			RetryDelay:  func(error) time.Duration { return time.Hour },
 			Logf:        t.Logf,
 		},
 	}
-	discovery := genserver.Child(fakeDiscovery{&r.script, &r.cancelled}, molecule.WithName(DiscoveryName))
-	if _, err := gensim.Start(r.sim, supervisor.Child(spec(cfg, discovery))); err != nil {
+	if _, err := gensim.Start(r.sim, supervisor.Child(Spec(cfg))); err != nil {
 		t.Fatal(err)
 	}
 	r.sim.RunUntilIdle()
 	return r
+}
+
+// discover answers discovery attempts with the script, the last outcome
+// again when it runs out. In gensim, the Async running it runs at once.
+func (r *rig) discover(context.Context, string) (Discovery, error) {
+	a := r.script[0]
+	if len(r.script) > 1 {
+		r.script = r.script[1:]
+	}
+	return a.disc, a.err
 }
 
 func (r *rig) controller() (Phase, Data) {
@@ -284,27 +249,33 @@ func TestWANChangeWhileDraining(t *testing.T) {
 	}
 }
 
-// A WAN-address change cancels the discovery in flight, whose late result is
-// dropped.
+// A WAN-address change while discovering cancels the attempt, whose outcome
+// then never arrives, and switches; the switch landing re-discovers at once.
+// Called directly: in gensim the attempt is done before anything can come in
+// between.
 func TestWANChangeWhileDiscovering(t *testing.T) {
-	r := newRig(t,
-		attempt{disc: Discovery{AFTR: aftr2, Refresh: day}, delay: time.Minute},
-		attempt{disc: Discovery{AFTR: aftr1, Refresh: day}},
-	)
-	r.sim.Advance(day)
-	r.wantPhase(Discovering)
-
-	r.router.src = b4B
-	r.sim.Advance(b4PollInterval)
-	d := r.wantPhase(Steady)
-	if r.cancelled != 1 {
-		t.Errorf("%d discoveries cancelled, want 1", r.cancelled)
+	c := Controller{DynamicAFTR: true, DynamicB4: true, Logf: t.Logf}
+	d := Data{B4: b4A, Current: Discovery{AFTR: aftr1, Refresh: day}}
+	st, d, effs := c.HandleEvent(Discovering, d, genstatem.Info{Msg: molecule.Response{
+		Tag: tag{opSource, d.Gen}, Value: sourceRep{Addr: b4B, OK: true},
+	}})
+	if st != Switching {
+		t.Fatalf("on a WAN change while discovering: %v", st)
 	}
-	if d.B4 != b4B || d.Current.AFTR != aftr1 {
-		t.Errorf("on %v -> %v, want %v -> %v", d.B4, d.Current.AFTR, b4B, aftr1)
+	cancelled := false
+	for _, e := range effs {
+		if ca, ok := e.(molecule.CancelAsync); ok && ca.Key == (discoverKey{}) {
+			cancelled = true
+		}
 	}
-	if slices.ContainsFunc(r.dp.calls, func(c string) bool { return c == "begin 2001:db8:b::1 2001:db8:ff::2" }) {
-		t.Errorf("the cancelled discovery's result was acted on: %q", r.dp.calls)
+	if !cancelled {
+		t.Errorf("the discovery attempt was not cancelled: %v", effs)
+	}
+	st, d, _ = c.HandleEvent(st, d, genstatem.Info{Msg: molecule.Response{
+		Tag: tag{opSwitch, d.Gen}, Value: doneRep{},
+	}})
+	if st != Steady || d.B4 != b4B || d.Current.AFTR != aftr1 || d.Wait != 0 {
+		t.Errorf("after the switch: %v on %v -> %v, re-discovery in %v", st, d.B4, d.Current.AFTR, d.Wait)
 	}
 }
 

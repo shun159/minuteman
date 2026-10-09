@@ -28,7 +28,7 @@ It lives in `internal/` rather than `pkg/` because it is nothing but I/O, run as
 
 ```
 dnsproxy (one_for_one)
-├── udp <addr>:53   the UDP listener; a forwarder process per query in flight, linked to it
+├── udp <addr>:53   the UDP listener, a genserver; an Async per query in flight
 ├── tcp <addr>:53   a gentcpacceptor raw listener; a relay process per connection
 └── ...             the same for each listen address
 ```
@@ -51,19 +51,19 @@ once. Any other bind error fails at once.
 
 ## UDP (`udp.go`)
 
-The listener owns a `genudp` socket and hands each query to a **forwarder process** of its own,
-so one slow or unresponsive upstream never holds up the next query. It is a proc process rather
-than a behaviour because it starts a process per query.
+The listener is a genserver owning a `genudp` socket. Each query it forwards in a
+**`molecule.Async`** of its own, so one slow or unresponsive upstream never holds up the next
+query; the answer comes back as the Async's `AsyncResult`, and the listener relays it to the client
+through its socket. The listener itself stays pure: forwarding blocks, and it is the Async's.
 
-The socket's active mode is the flow control: it is armed `N(maxInFlight)` (256), and re-armed by
-one as each forwarder exits. Past that many queries in flight, queries wait in the kernel, which
-drops them when its buffer fills — the client's resolver retries, as for any lost datagram.
-Forwarders are linked to the listener, which traps exits: they end with it, and their exits free
-their slots.
+The socket's active mode is the flow control: it is armed `N(maxInFlight)` (256) once the listener
+owns it, and re-armed by one as each query's Async ends. Past that many queries in flight, queries
+wait in the kernel, which drops them when its buffer fills — the client's resolver retries, as
+for any lost datagram. The listener stopping cancels its Asyncs.
 
-A forwarder tries `Config.Upstreams` in order over a **fresh, one-shot `genudp` socket**, each bounded
-by `udpQueryTimeout` (5s), taking only an answer from the upstream it asked, as a connected socket
-would. The socket is deliberately not pooled: DNS-over-UDP is a single datagram round trip anyway,
+A query tries `Config.Upstreams` in order over a **fresh, one-shot connected UDP socket**, each
+bounded by `udpQueryTimeout` (5s); connected, it takes datagrams from that upstream alone. The
+socket is deliberately not pooled: DNS-over-UDP is a single datagram round trip anyway,
 and a dedicated socket means a response can never be confused with a different concurrent
 query's. If **every** upstream fails, the query is simply dropped — the client's own resolver
 retries per its usual behavior, exactly as if this proxy weren't in the path.

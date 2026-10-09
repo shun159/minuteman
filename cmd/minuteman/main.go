@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/shun159/miniteman/internal/cliconfig"
+	"github.com/shun159/miniteman/internal/dhcpv6client"
 	"github.com/shun159/miniteman/internal/dnsproxy"
 	"github.com/shun159/miniteman/internal/fragpath"
 	"github.com/shun159/miniteman/internal/lanprefix"
@@ -50,6 +51,7 @@ import (
 	"github.com/shun159/miniteman/pkg/netlink"
 	"github.com/shun159/miniteman/pkg/prefixdelegation"
 	"github.com/shun159/miniteman/pkg/routeradvert"
+	"github.com/shun159/molecule/application"
 	"github.com/shun159/molecule/proc"
 )
 
@@ -266,22 +268,27 @@ func run() error {
 	// would, and run returns why.
 	ctx, fail := context.WithCancelCause(ctx)
 	defer fail(nil)
-	// The node the supervision trees run on (see superviseTree).
+	// minuteman's supervision trees, started as applications as each is
+	// needed (see startApps). They are stopped, in reverse order, by the
+	// second deferred stopApps further down: after the rest of run's
+	// goroutines -- the DHCPv6-PD maintenance releases its lease through
+	// the DHCPv6 client on its way out -- and before what they drive is
+	// closed. This one stops them on an earlier return.
 	node := proc.NewNode("")
+	apps, stopApps, err := startApps(ctx, fail, node)
+	if err != nil {
+		return err
+	}
+	defer stopApps()
 
 	// The WAN's DHCPv6 client, which DHCPv6-PD and AFTR discovery exchange
-	// through, when either runs (see startDHCPv6Client).
+	// through, when either runs.
 	var dhcp dhcpv6.Exchanger
 	if *requestPD || *aftrAddr == "" {
-		client, stopDHCP, err := startDHCPv6Client(fail, node, *wanIface)
-		if err != nil {
+		if err := apps.Start(ctx, dhcpv6ClientApp(*wanIface)); err != nil {
 			return err
 		}
-		// Deferred here, before bgWG.Wait is, so that it runs after it: the
-		// DHCPv6-PD maintenance releases its lease through the client on
-		// its way out.
-		defer stopDHCP()
-		dhcp = client
+		dhcp = dhcpv6client.NewClient(node, *wanIface)
 	}
 
 	// The DHCPv6-PD lease is acquired before AFTR discovery, not with the rest
@@ -455,7 +462,7 @@ func run() error {
 	var rdnssByIface map[string]netip.Addr
 	if *dnsProxyOn {
 		var err error
-		rdnssByIface, err = startDNSProxy(ctx, fail, node, lans, dnsServers, &bgWG)
+		rdnssByIface, err = startDNSProxy(ctx, apps, lans, dnsServers)
 		if err != nil {
 			return fmt.Errorf("-dns-proxy: %w", err)
 		}
@@ -483,9 +490,11 @@ func run() error {
 	// given) has nothing to track, so it's skipped.
 	aftrDynamic := *aftrAddr == ""
 	if aftrDynamic || dynamicB4 {
-		if err := startSoftwireControl(ctx, fail, node, dhcp, dp, tun, b4, dynamicB4, aftrDynamic, *wanIface, wanIfindex, identity, disc, pdDNSServers(pdLease), &bgWG); err != nil {
+		closeNL, err := startSoftwireControl(ctx, apps, dhcp, dp, tun, b4, dynamicB4, aftrDynamic, *wanIface, wanIfindex, identity, disc, pdDNSServers(pdLease))
+		if err != nil {
 			return err
 		}
+		defer closeNL() // after the tree using it has stopped: see stopApps
 	}
 	// Follows the softwire path MTU the datapath learns from ICMPv6 Packet Too
 	// Big messages about its own tunnel packets, applying it to the fragment
@@ -493,6 +502,7 @@ func run() error {
 	// link somewhere along the B4<->AFTR path is not a configuration, and
 	// nothing happens at all until one is actually reported.
 	watchTunnelPMTU(ctx, dp, tun, wanNetIface.MTU, &bgWG)
+	defer stopApps() // runs second: see where apps start
 	defer bgWG.Wait()
 
 	// Written only now, after every fail-fast startup step above, so the
@@ -604,7 +614,7 @@ func runNDProxy(ctx context.Context, wanIface string, wanIfindex uint32, lans cl
 // listener itself (see internal/dnsproxy). A -lan interface with no
 // link-local address at all is logged and left out of the map (no RDNSS for
 // it), while its IPv4 listener still starts.
-func startDNSProxy(ctx context.Context, fail context.CancelCauseFunc, node *proc.Node, lans cliconfig.LANSpecList, dnsServers []netip.Addr, wg *sync.WaitGroup) (map[string]netip.Addr, error) {
+func startDNSProxy(ctx context.Context, apps *application.Running, lans cliconfig.LANSpecList, dnsServers []netip.Addr) (map[string]netip.Addr, error) {
 	listenAddrs := make([]netip.Addr, 0, len(lans)*2)
 	rdnssByIface := make(map[string]netip.Addr, len(lans))
 	for _, spec := range lans {
@@ -621,7 +631,7 @@ func startDNSProxy(ctx context.Context, fail context.CancelCauseFunc, node *proc
 	if err != nil {
 		return nil, err
 	}
-	if err := superviseTree(ctx, fail, node, "DNS proxy", spec, wg, nil); err != nil {
+	if err := apps.Start(ctx, app("DNS proxy", spec)); err != nil {
 		return nil, err
 	}
 	log.Printf("DNS proxy: listening on %v, forwarding to %v", listenAddrs, dnsServers)
