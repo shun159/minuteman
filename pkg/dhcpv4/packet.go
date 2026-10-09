@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 
+	"github.com/shun159/miniteman/pkg/internal/pollfd"
 	"golang.org/x/sys/unix"
 )
 
@@ -28,9 +29,10 @@ const (
 // non-DHCP traffic out of userspace.
 
 // packetConn receives and sends DHCPv4 on one interface. Close may be called
-// from another goroutine to unblock a blocked recv.
+// from another goroutine to unblock a blocked recv: the socket goes through
+// the runtime's poller (pkg/internal/pollfd), as close(2) alone would not.
 type packetConn struct {
-	fd      int
+	fd      *pollfd.FD
 	ifindex int
 	srcIP   netip.Addr // the server's own IPv4 on this link, used as the reply source
 }
@@ -58,26 +60,29 @@ func listenPacket(iface string, srcIP netip.Addr) (*packetConn, error) {
 	}
 
 	proto := bits.ReverseBytes16(unix.ETH_P_IP) // network byte order, as AF_PACKET requires
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, int(proto))
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_DGRAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, int(proto))
 	if err != nil {
 		return nil, fmt.Errorf("dhcpv4: opening packet socket: %w", err)
 	}
-	c := &packetConn{fd: fd, ifindex: ifi.Index, srcIP: srcIP}
 
 	// Attach the filter before bind so no unfiltered packet is ever queued.
 	prog := unix.SockFprog{Len: uint16(len(dhcpFilter)), Filter: &dhcpFilter[0]}
 	if err := unix.SetsockoptSockFprog(fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &prog); err != nil {
-		c.Close()
+		unix.Close(fd)
 		return nil, fmt.Errorf("dhcpv4: attaching DHCP filter on %s: %w", iface, err)
 	}
 	if err := unix.Bind(fd, &unix.SockaddrLinklayer{Protocol: proto, Ifindex: ifi.Index}); err != nil {
-		c.Close()
+		unix.Close(fd)
 		return nil, fmt.Errorf("dhcpv4: binding packet socket to %s: %w", iface, err)
 	}
-	return c, nil
+	p, err := pollfd.New(fd, "dhcpv4 "+iface)
+	if err != nil {
+		return nil, fmt.Errorf("dhcpv4: polling packet socket on %s: %w", iface, err)
+	}
+	return &packetConn{fd: p, ifindex: ifi.Index, srcIP: srcIP}, nil
 }
 
-func (c *packetConn) Close() error { return unix.Close(c.fd) }
+func (c *packetConn) Close() error { return c.fd.Close() }
 
 // recv blocks until a well-formed DHCP request arrives (skipping anything
 // that slips through the filter but fails to parse as IPv4/UDP/DHCP) or the
@@ -85,7 +90,7 @@ func (c *packetConn) Close() error { return unix.Close(c.fd) }
 func (c *packetConn) recv() (*Message, error) {
 	buf := make([]byte, 1500)
 	for {
-		n, _, err := unix.Recvfrom(c.fd, buf, 0)
+		n, _, err := c.fd.Recvfrom(buf)
 		if err != nil {
 			return nil, err
 		}
@@ -112,7 +117,7 @@ func (c *packetConn) send(reply *Message, dstIP netip.Addr, dstMAC net.HardwareA
 		Halen:    uint8(len(dstMAC)),
 	}
 	copy(sll.Addr[:], dstMAC)
-	return unix.Sendto(c.fd, frame, 0, sll)
+	return c.fd.Sendto(frame, sll)
 }
 
 // parseUDPToBOOTP extracts the UDP payload of an IPv4/UDP packet destined

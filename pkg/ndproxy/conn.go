@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 
+	"github.com/shun159/miniteman/pkg/internal/pollfd"
 	"golang.org/x/sys/unix"
 )
 
@@ -18,9 +19,10 @@ const icmp6Filter = 1
 // Solicitations (plus an ALLMULTI membership -- see below); each LAN
 // side uses one filtered to Neighbor Advertisements. Not safe for
 // concurrent use except Close, which may be called from another
-// goroutine to unblock a blocked reader.
+// goroutine to unblock a blocked reader: the socket goes through the
+// runtime's poller (pkg/internal/pollfd), as close(2) alone would not.
 type conn struct {
-	fd      int
+	fd      *pollfd.FD
 	ifIndex int
 	mac     net.HardwareAddr
 
@@ -47,22 +49,22 @@ func listen(iface string, icmpType uint8, allMulticast bool) (*conn, error) {
 		return nil, fmt.Errorf("ndproxy: looking up interface %s: %w", iface, err)
 	}
 
-	fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_RAW, unix.IPPROTO_ICMPV6)
+	fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_RAW|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, unix.IPPROTO_ICMPV6)
 	if err != nil {
 		return nil, fmt.Errorf("ndproxy: opening raw ICMPv6 socket: %w", err)
 	}
-	c := &conn{fd: fd, ifIndex: ifi.Index, mac: ifi.HardwareAddr, allmultiFD: -1}
+	c := &conn{ifIndex: ifi.Index, mac: ifi.HardwareAddr, allmultiFD: -1}
 
 	if err := unix.BindToDevice(fd, iface); err != nil {
-		c.Close()
+		unix.Close(fd)
 		return nil, fmt.Errorf("ndproxy: binding to %s: %w", iface, err)
 	}
 	if err := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_MULTICAST_HOPS, 255); err != nil {
-		c.Close()
+		unix.Close(fd)
 		return nil, fmt.Errorf("ndproxy: setting multicast hop limit on %s: %w", iface, err)
 	}
 	if err := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_UNICAST_HOPS, 255); err != nil {
-		c.Close()
+		unix.Close(fd)
 		return nil, fmt.Errorf("ndproxy: setting unicast hop limit on %s: %w", iface, err)
 	}
 
@@ -72,25 +74,33 @@ func listen(iface string, icmpType uint8, allMulticast bool) (*conn, error) {
 	}
 	filt.Data[icmpType/32] &^= 1 << (icmpType % 32) // ...except icmpType
 	if err := unix.SetsockoptICMPv6Filter(fd, unix.SOL_ICMPV6, icmp6Filter, &filt); err != nil {
-		c.Close()
+		unix.Close(fd)
 		return nil, fmt.Errorf("ndproxy: setting ICMPv6 filter on %s: %w", iface, err)
 	}
 
 	if allMulticast {
 		pfd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, 0)
 		if err != nil {
-			c.Close()
+			unix.Close(fd)
 			return nil, fmt.Errorf("ndproxy: opening ALLMULTI holder socket: %w", err)
 		}
 		mreq := &unix.PacketMreq{Ifindex: int32(ifi.Index), Type: unix.PACKET_MR_ALLMULTI}
 		if err := unix.SetsockoptPacketMreq(pfd, unix.SOL_PACKET, unix.PACKET_ADD_MEMBERSHIP, mreq); err != nil {
 			unix.Close(pfd)
-			c.Close()
+			unix.Close(fd)
 			return nil, fmt.Errorf("ndproxy: enabling all-multicast on %s: %w", iface, err)
 		}
 		c.allmultiFD = pfd
 	}
 
+	p, err := pollfd.New(fd, "ndproxy "+iface)
+	if err != nil {
+		if c.allmultiFD >= 0 {
+			unix.Close(c.allmultiFD)
+		}
+		return nil, fmt.Errorf("ndproxy: polling raw ICMPv6 socket on %s: %w", iface, err)
+	}
+	c.fd = p
 	return c, nil
 }
 
@@ -101,7 +111,7 @@ func (c *conn) Close() error {
 		unix.Close(c.allmultiFD)
 		c.allmultiFD = -1
 	}
-	return unix.Close(c.fd)
+	return c.fd.Close()
 }
 
 // message is one received NDP message relevant to the proxy: the
@@ -122,7 +132,7 @@ func (c *conn) readTargets(icmpType uint8, ch chan<- message) {
 	defer close(ch)
 	buf := make([]byte, 1500)
 	for {
-		n, from, err := unix.Recvfrom(c.fd, buf, 0)
+		n, from, err := c.fd.Recvfrom(buf)
 		if err != nil {
 			return
 		}
@@ -145,7 +155,7 @@ func (c *conn) readTargets(icmpType uint8, ch chan<- message) {
 // target's Solicited-Node multicast group.
 func (c *conn) sendSolicitation(target netip.Addr) error {
 	dst := &unix.SockaddrInet6{Addr: solicitedNodeMulticast(target).As16(), ZoneId: uint32(c.ifIndex)}
-	return unix.Sendto(c.fd, marshalNeighborSolicitation(target, c.mac), 0, dst)
+	return c.fd.Sendto(marshalNeighborSolicitation(target, c.mac), dst)
 }
 
 // sendAdvertisement sends the proxy's Neighbor Advertisement for target
@@ -160,5 +170,5 @@ func (c *conn) sendAdvertisement(target, solicitor netip.Addr) error {
 		dstAddr = solicitor
 	}
 	dst := &unix.SockaddrInet6{Addr: dstAddr.As16(), ZoneId: uint32(c.ifIndex)}
-	return unix.Sendto(c.fd, marshalNeighborAdvertisement(target, c.mac, solicited), 0, dst)
+	return c.fd.Sendto(marshalNeighborAdvertisement(target, c.mac, solicited), dst)
 }
