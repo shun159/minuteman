@@ -17,8 +17,8 @@ this package stay a DHCPv6 client rather than a minuteman component.
 | `options.go` | `Option`/`Options` TLV codec, option builders, `ParseSubOptions` |
 | `duid.go` | DUID-LL from a MAC |
 | `retransmit.go` | pure RFC 3315 §5.5/§14 timing constants and formulas |
-| `transport.go` | socket binding, `sendAndWait`, the per-interface exchange lock |
-| `client.go` | `runExchange`, `validateServerMessage`, and the exported exchanges |
+| `exchange.go` | `Exchange`, `Timing`, the `Exchanger` that runs them, `ErrExhausted` |
+| `client.go` | the exported exchanges, each an `Exchange` with its timing |
 
 ## Where the option-decoding line is drawn
 
@@ -79,35 +79,29 @@ count nor a maximum duration) and right wherever the network answers eventually.
 caller's policy for networks that never will; `pkg/aftrdiscovery.Discover`'s `replyTimeout` is
 where minuteman applies one, and `ErrNoReply` is the outcome.
 
-## Transport (`transport.go`)
+## Exchanges and the Exchanger (`exchange.go`, `client.go`)
 
-Two decisions carry the file:
+This package holds no socket. An `Exchange` describes one RFC 3315 §14 exchange -- the message type
+and options to send, the reply type that ends it, its `Timing` (initial delay ceiling, IRT, MRT,
+MRC) -- and an `Exchanger` runs it on an interface: sends `Exchange.Message`, retransmits per the
+timing, and returns the first reply that `Exchange.Answers`. `InformationRequest`, `Solicit`,
+`Request`, `Renew`, `Rebind` and `Release` each build the `Exchange` their RFC section calls for and
+hand it to the `Exchanger` they are given; `Release` treats `ErrExhausted` as success.
 
-**`ListenUDP`, never `DialUDP`.** A connected socket only accepts datagrams from the address it
-is connected to — but the server's Reply comes unicast from the *server's* address, not from the
-multicast destination the request went to. A connected socket would silently drop every reply.
-Binding to a zone-qualified link-local address additionally fixes the outgoing interface for the
-multicast request: on Linux, binding to a link-local sets the socket's bound device, which route
-lookups consult before `IPV6_MULTICAST_IF`, so no explicit multicast-interface sockopt is needed.
+The `Exchanger` minuteman uses is `internal/dhcpv6client`: a molecule process owning the
+interface's client socket for as long as it lives, running exchanges one at a time. Keeping the
+socket out of here is what keeps this package pure, and stdlib-only.
 
-**A per-interface exchange lock (`lockWAN`).** Every exchange binds the same
-`[link-local%iface]:546` with no `SO_REUSEADDR`, so two concurrent exchanges on one interface
-would collide with `EADDRINUSE`. minuteman genuinely runs them concurrently — a long-lived
-DHCPv6-PD maintenance loop alongside periodic AFTR re-discovery, both on the WAN — so they take
-turns here. The lock honours `ctx`, so a Renew waiting behind a long-running AFTR discovery can
-still give up at its own T2.
+`Exchange.Answers` is RFC 3315's general validation rule (restated for stateless service in RFC
+3736 §4) on top of the type and transaction match: an Advertise/Reply must carry
+`OPTION_SERVERID`, and an echoed `OPTION_CLIENTID`, if present, must match ours. A message that
+fails it is **discarded and the exchange keeps retrying** — RFC 3315 is explicit that one bad
+message does not fail the exchange. The expected type is part of the `Exchange` because Solicit
+expects an **Advertise**, not a Reply.
 
-`sendAndWait` returns `(nil, nil)` on a plain timeout (the caller retries with a new RT) and
-discards anything that isn't a reply of the expected type with a matching XID. The expected type
-is a parameter because Solicit expects an **Advertise**, not a Reply.
-
-## The exchange loop (`client.go`)
-
-`runExchange` is the single RFC 3315 §14 retransmission loop behind every exported function.
-`validateServerMessage` is RFC 3315's general validation rule (restated for stateless service in
-RFC 3736 §4): an Advertise/Reply must carry `OPTION_SERVERID`, and an echoed `OPTION_CLIENTID`,
-if present, must match ours. A message that fails validation is **discarded and the exchange
-keeps retrying** — RFC 3315 is explicit that one bad message does not fail the exchange.
+The timing formulas (`InitialDelay`, `FirstRT`, `NextRT`) and `NewTransactionID` draw from a
+`*rand.Rand` they are given, so an `Exchanger` written as a deterministic state machine can keep
+its own generator.
 
 `Solicit` takes the first valid Advertise rather than collecting several over a window and
 picking by preference (§17.1.3). That is the common and correct behavior on a residential link
@@ -119,7 +113,8 @@ with a single upstream delegating router.
 go test ./pkg/dhcpv6/
 ```
 
-`message_test.go`, `options_test.go`, `retransmit_test.go` and `transport_test.go` cover the wire
-codec and the timing formulas with no sockets. Live behavior is exercised through
+`message_test.go`, `options_test.go`, `retransmit_test.go` and `exchange_test.go` cover the wire
+codec, the timing formulas, and building and matching an exchange's messages, with no sockets;
+`internal/dhcpv6client`'s tests run exchanges against a fake server. Live behavior is exercised through
 `pkg/aftrdiscovery` and `pkg/prefixdelegation` in the netns rig (Kea on `mm-isp`), see
 `test/netns/README.md`.

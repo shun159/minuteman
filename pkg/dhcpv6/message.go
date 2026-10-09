@@ -1,8 +1,8 @@
 package dhcpv6
 
 import (
-	"crypto/rand"
 	"fmt"
+	"math/rand/v2"
 )
 
 // MessageType is a DHCPv6 message type (RFC 3315 §5.3).
@@ -28,16 +28,13 @@ const (
 // client message with its Reply (RFC 3315 §6).
 type TransactionID [3]byte
 
-// NewTransactionID generates a random transaction ID. RFC 3315 only
-// requires it be unlikely to collide with other clients' in-flight
-// exchanges, not cryptographic quality; crypto/rand is used here simply
-// because it's always available without seeding.
-func NewTransactionID() (TransactionID, error) {
-	var xid TransactionID
-	if _, err := rand.Read(xid[:]); err != nil {
-		return TransactionID{}, fmt.Errorf("generating transaction ID: %w", err)
-	}
-	return xid, nil
+// NewTransactionID draws a transaction ID from r. RFC 3315 only requires it
+// be unlikely to collide with other clients' in-flight exchanges, not
+// cryptographic quality; taking the generator lets a caller that must stay
+// deterministic keep its own.
+func NewTransactionID(r *rand.Rand) TransactionID {
+	v := r.Uint32()
+	return TransactionID{byte(v >> 16), byte(v >> 8), byte(v)}
 }
 
 // Message is a DHCPv6 client/server message (RFC 3315 §6): a 1-byte type,

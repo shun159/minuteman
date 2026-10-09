@@ -9,7 +9,7 @@ import (
 	"github.com/shun159/miniteman/pkg/dhcpv6"
 )
 
-// Maintain keeps lease alive on ifaceName indefinitely, following RFC 3315's
+// Maintain keeps lease alive through ex indefinitely, following RFC 3315's
 // renewal ladder: Renew at T1, falling back to Rebind at T2 if Renew never
 // gets an answer, falling back to a fresh Acquire if Rebind doesn't either
 // (RFC 3315 §18.1.3/§18.1.4). lease is mutated in place as it's renewed.
@@ -28,15 +28,15 @@ import (
 // returning. Returns nil on a clean ctx-cancelled shutdown; a non-nil error
 // only indicates a bug (Acquire itself already retries indefinitely and
 // only returns on ctx cancellation).
-func Maintain(ctx context.Context, ifaceName string, lease *Lease, onLeaseChange func(*Lease)) error {
-	defer releaseLease(ifaceName, lease)
+func Maintain(ctx context.Context, ex dhcpv6.Exchanger, lease *Lease, onLeaseChange func(*Lease)) error {
+	defer releaseLease(ex, lease)
 
 	for {
 		if err := sleepUntil(ctx, lease.AcquiredAt.Add(lease.T1)); err != nil {
 			return nil
 		}
 
-		if renewed, err := tryRenew(ctx, ifaceName, lease); err == nil {
+		if renewed, err := tryRenew(ctx, ex, lease); err == nil {
 			*lease = *renewed
 			onLeaseChange(lease)
 			continue
@@ -44,7 +44,7 @@ func Maintain(ctx context.Context, ifaceName string, lease *Lease, onLeaseChange
 			return nil
 		}
 
-		if rebound, err := tryRebind(ctx, ifaceName, lease); err == nil {
+		if rebound, err := tryRebind(ctx, ex, lease); err == nil {
 			*lease = *rebound
 			onLeaseChange(lease)
 			continue
@@ -52,7 +52,7 @@ func Maintain(ctx context.Context, ifaceName string, lease *Lease, onLeaseChange
 			return nil
 		}
 
-		fresh, err := Acquire(ctx, ifaceName)
+		fresh, err := Acquire(ctx, ex)
 		if err != nil {
 			// Acquire only returns an error on ctx cancellation.
 			return nil
@@ -65,11 +65,11 @@ func Maintain(ctx context.Context, ifaceName string, lease *Lease, onLeaseChange
 // tryRenew performs one Renew exchange against lease's original server,
 // bounded by ctx or lease's T2 (RFC 3315 §18.1.3: Renew is only valid until
 // T2), whichever comes first.
-func tryRenew(ctx context.Context, ifaceName string, lease *Lease) (*Lease, error) {
+func tryRenew(ctx context.Context, ex dhcpv6.Exchanger, lease *Lease) (*Lease, error) {
 	renewCtx, cancel := context.WithDeadline(ctx, lease.AcquiredAt.Add(lease.T2))
 	defer cancel()
 
-	reply, err := dhcpv6.Renew(renewCtx, ifaceName, dhcpv6.Options{
+	reply, err := dhcpv6.Renew(renewCtx, ex, dhcpv6.Options{
 		{Code: dhcpv6.OptionServerID, Data: lease.ServerID},
 		lease.iaPDOption(),
 		requestedOptions,
@@ -86,11 +86,11 @@ func tryRenew(ctx context.Context, ifaceName string, lease *Lease) (*Lease, erro
 // bounded by ctx or the binding's shortest remaining valid lifetime,
 // whichever comes first -- the point RFC 3315 says the client must stop
 // using it regardless.
-func tryRebind(ctx context.Context, ifaceName string, lease *Lease) (*Lease, error) {
+func tryRebind(ctx context.Context, ex dhcpv6.Exchanger, lease *Lease) (*Lease, error) {
 	rebindCtx, cancel := context.WithDeadline(ctx, lease.AcquiredAt.Add(lease.shortestValidLifetime()))
 	defer cancel()
 
-	reply, err := dhcpv6.Rebind(rebindCtx, ifaceName, dhcpv6.Options{lease.iaPDOption(), requestedOptions})
+	reply, err := dhcpv6.Rebind(rebindCtx, ex, dhcpv6.Options{lease.iaPDOption(), requestedOptions})
 	if err != nil {
 		return nil, err
 	}
@@ -127,18 +127,18 @@ func leaseFromReply(serverID dhcpv6.DUID, reply *dhcpv6.Message) (*Lease, error)
 // client stops using a binding locally regardless of whether the server
 // ever acknowledges it, so failures here are logged, not propagated -- they
 // must not block shutdown.
-func releaseLease(ifaceName string, lease *Lease) {
+func releaseLease(ex dhcpv6.Exchanger, lease *Lease) {
 	// Release must not inherit Maintain's (already-cancelled) ctx, or it
 	// would never get to send even a single attempt.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := dhcpv6.Release(ctx, ifaceName, dhcpv6.Options{
+	err := dhcpv6.Release(ctx, ex, dhcpv6.Options{
 		{Code: dhcpv6.OptionServerID, Data: lease.ServerID},
 		lease.iaPDOption(),
 	})
 	if err != nil && !errors.Is(err, context.DeadlineExceeded) {
-		log.Printf("prefixdelegation: releasing lease on %s: %v", ifaceName, err)
+		log.Printf("prefixdelegation: releasing lease: %v", err)
 	}
 }
 

@@ -51,32 +51,35 @@ const (
 	RelMaxRC   = 5
 )
 
+// The formulas below draw their RAND from r, so that a caller keeping its
+// own generator -- a state machine that must stay deterministic -- can.
+
 // jitter returns a uniformly random value in [-0.1, 0.1] * base, the RAND
 // factor from RFC 3315 §14.
-func jitter(base time.Duration) time.Duration {
-	return time.Duration((rand.Float64()*0.2 - 0.1) * float64(base))
+func jitter(base time.Duration, r *rand.Rand) time.Duration {
+	return time.Duration((r.Float64()*0.2 - 0.1) * float64(base))
 }
 
-// randDelay returns a uniformly random delay in [0, max], applied before the
-// very first transmission of a message exchange (RFC 3315 §14/§18.1.5/
+// InitialDelay returns a uniformly random delay in [0, max], applied before
+// the very first transmission of a message exchange (RFC 3315 §14/§18.1.5/
 // §17.1.2) to avoid clients synchronizing retransmissions after a shared
 // event (e.g. many CPEs rebooting together after a power outage). Exchanges
 // that RFC 3315 says send immediately (Request, Renew, Rebind, Release) pass
-// max=0, for which randDelay always returns 0 without calling rand.
-func randDelay(max time.Duration) time.Duration {
+// max=0, for which InitialDelay always returns 0 without drawing from r.
+func InitialDelay(max time.Duration, r *rand.Rand) time.Duration {
 	if max == 0 {
 		return 0
 	}
-	return time.Duration(rand.Float64() * float64(max))
+	return time.Duration(r.Float64() * float64(max))
 }
 
-// firstRT returns the first retransmission timeout: RT = IRT + RAND*IRT
+// FirstRT returns the first retransmission timeout: RT = IRT + RAND*IRT
 // (RFC 3315 §14).
-func firstRT(irt time.Duration) time.Duration {
-	return irt + jitter(irt)
+func FirstRT(irt time.Duration, r *rand.Rand) time.Duration {
+	return irt + jitter(irt, r)
 }
 
-// nextRT computes the next retransmission timeout from the previous one
+// NextRT computes the next retransmission timeout from the previous one
 // (RFC 3315 §14):
 //
 //	RT = 2*RTprev + RAND*RTprev
@@ -89,10 +92,10 @@ func firstRT(irt time.Duration) time.Duration {
 // around the ceiling indefinitely instead of converging to a single fixed
 // interval, preserving RAND's anti-synchronization purpose for exactly the
 // long-running case where it matters most.
-func nextRT(prev, mrt time.Duration) time.Duration {
-	rt := 2*prev + jitter(prev)
+func NextRT(prev, mrt time.Duration, r *rand.Rand) time.Duration {
+	rt := 2*prev + jitter(prev, r)
 	if mrt != 0 && rt > mrt {
-		rt = mrt + jitter(mrt)
+		rt = mrt + jitter(mrt, r)
 	}
 	return rt
 }

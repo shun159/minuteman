@@ -66,7 +66,7 @@ func usableIAPD(msg *dhcpv6.Message) (*IAPD, dhcpv6.DUID, error) {
 var requestedOptions = dhcpv6.NewORO(dhcpv6.OptionDNSServers)
 
 // Acquire performs a full Solicit/Advertise/Request/Reply exchange (RFC
-// 3315 §17-18, RFC 3633) on ifaceName to obtain a delegated prefix, and
+// 3315 §17-18, RFC 3633) through ex to obtain a delegated prefix, and
 // returns the resulting Lease.
 //
 // Blocks (retrying per RFC 3315 timing) until it succeeds or ctx is
@@ -74,12 +74,12 @@ var requestedOptions = dhcpv6.NewORO(dhcpv6.OptionDNSServers)
 // prefix to assign without one, so indefinite retry is correct. A Reply
 // carrying more than one delegated prefix keeps all of them in
 // Lease.Prefixes; callers that only use one should use Prefixes[0].
-func Acquire(ctx context.Context, ifaceName string) (*Lease, error) {
+func Acquire(ctx context.Context, ex dhcpv6.Exchanger) (*Lease, error) {
 	for {
 		solOptions := dhcpv6.Options{NewIAPDOption(clientIAID), requestedOptions}
-		advertise, err := dhcpv6.Solicit(ctx, ifaceName, solOptions)
+		advertise, err := dhcpv6.Solicit(ctx, ex, solOptions)
 		if err != nil {
-			return nil, fmt.Errorf("prefixdelegation: soliciting on %s: %w", ifaceName, err)
+			return nil, fmt.Errorf("prefixdelegation: soliciting: %w", err)
 		}
 
 		offered, serverID, err := usableIAPD(advertise)
@@ -95,7 +95,7 @@ func Acquire(ctx context.Context, ifaceName string) (*Lease, error) {
 			IAPDOption(*offered),
 			requestedOptions,
 		}
-		reply, err := dhcpv6.Request(ctx, ifaceName, reqOptions)
+		reply, err := dhcpv6.Request(ctx, ex, reqOptions)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, ctxErr

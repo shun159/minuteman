@@ -9,6 +9,7 @@ import (
 	"github.com/shun159/miniteman/internal/slowpath"
 	"github.com/shun159/miniteman/internal/softwirectl"
 	"github.com/shun159/miniteman/pkg/datapath"
+	"github.com/shun159/miniteman/pkg/dhcpv6"
 	"github.com/shun159/miniteman/pkg/hb46pp"
 	"github.com/shun159/miniteman/pkg/netlink"
 	"github.com/shun159/molecule/proc"
@@ -25,7 +26,7 @@ import (
 // fallbackDNS is the DHCPv6-PD lease's servers as of startup, and is not
 // refreshed from later renewals; likewise, a re-discovery's DNS servers are
 // not handed to a running -dns-proxy (docs/rfc-compliance-backlog.md).
-func startSoftwireControl(ctx context.Context, fail context.CancelCauseFunc, node *proc.Node, dp *datapath.Loader, tun *slowpath.Tunnel, b4 netip.Addr, dynamicB4, aftrDynamic bool, wanIface string, wanIfindex uint32, identity hb46ppIdentity, initial aftrDiscovery, fallbackDNS []netip.Addr, wg *sync.WaitGroup) error {
+func startSoftwireControl(ctx context.Context, fail context.CancelCauseFunc, node *proc.Node, dhcp dhcpv6.Exchanger, dp *datapath.Loader, tun *slowpath.Tunnel, b4 netip.Addr, dynamicB4, aftrDynamic bool, wanIface string, wanIfindex uint32, identity hb46ppIdentity, initial aftrDiscovery, fallbackDNS []netip.Addr, wg *sync.WaitGroup) error {
 	var nl *netlink.Socket
 	var router softwirectl.Router
 	if dynamicB4 {
@@ -53,7 +54,7 @@ func startSoftwireControl(ctx context.Context, fail context.CancelCauseFunc, nod
 			Initial:     initial.toSoftwirectl(),
 		},
 		Discover: func(ctx context.Context, token string) (softwirectl.Discovery, error) {
-			disc, err := discoverAFTROnce(ctx, wanIface, identity, token, fallbackDNS)
+			disc, err := discoverAFTROnce(ctx, dhcp, wanIface, identity, token, fallbackDNS)
 			return disc.toSoftwirectl(), err
 		},
 		RetryDelay: hb46pp.RetryDelay,
