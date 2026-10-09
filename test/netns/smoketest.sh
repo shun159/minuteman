@@ -755,7 +755,7 @@ if [[ $dynamic_b4_enabled -eq 1 && $started_minuteman -eq 1 ]]; then
 
     # Renumber the WAN: add a clean second global (WAN_CPE_ADDR2) as a candidate,
     # then deprecate the address minuteman is currently using so the kernel's
-    # RFC 6724 source selection -- and thus minuteman's watchB4/handleWANChange
+    # RFC 6724 source selection -- and thus minuteman's softwirectl B4 poll
     # -- must move off it. (Deprecating rather than deleting keeps the old
     # address reachable, so anything still routing via it, e.g. a PD return route
     # on mm-isp, is unaffected; only *source* selection avoids it.)
@@ -763,7 +763,7 @@ if [[ $dynamic_b4_enabled -eq 1 && $started_minuteman -eq 1 ]]; then
     ip netns exec "$NETNS_CPE" ip addr add "$WAN_CPE_ADDR2" dev "$VETH_CPE_ISP"
     ip netns exec "$NETNS_CPE" ip addr change "$WAN_CPE_ADDR" dev "$VETH_CPE_ISP" preferred_lft 0
 
-    # watchB4 polls every 30s; give it a full interval (plus the new address's
+    # The B4 poll runs every 30s; give it a full interval (plus the new address's
     # DAD) to notice the change and hard-switch. It re-selects whichever source
     # the kernel now prefers among the remaining non-deprecated WAN globals
     # (WAN_CPE_ADDR2: setup.sh turns SLAAC off on this link in this mode) --

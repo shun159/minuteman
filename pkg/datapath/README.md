@@ -85,7 +85,7 @@ free slot and "(active+1)" would overwrite the pinned flows' slot out from under
 
 ## Graceful AFTR migration
 
-`migration.go` implements what `cmd/minuteman`'s `migrateAFTR` drives: moving to a new AFTR
+`migration.go` implements what `internal/softwirectl`'s controller drives: moving to a new AFTR
 *without* breaking flows already established through the old one. Four calls, one control word:
 
 ```

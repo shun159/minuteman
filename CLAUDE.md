@@ -724,7 +724,7 @@ orphaned the running kernel's module directory — reboot to fix that).
   it. No unit tests — pure syscall wrappers, exercised by the netns rig like
   `pkg/ndproxy`'s and `pkg/routeradvert`'s socket I/O.
 - **`cmd/minuteman/main.go`** — thin CLI entrypoint. Flags: `-wan`, `-b4` (optional — omitted means the
-  softwire source is tracked dynamically; see `resolveB4`/`watchB4`/`runAFTRRediscovery` below), `-aftr`
+  softwire source is tracked dynamically; see `resolveB4`/`internal/softwirectl` below), `-aftr`
   (optional — see below),
   repeatable `-lan iface=gatewayIP[/prefixlen][,mtu]` (the `/prefixlen`, default `/24`, is the DHCPv4
   subnet), `-wan-dst-mac` (fallback only), `-stats-interval`, `-dhcpv6-pd`
@@ -780,7 +780,7 @@ orphaned the running kernel's module directory — reboot to fix that).
   script written against it isn't silently handed a different shape.
   Startup order is load-bearing in one place: when `-dhcpv6-pd` is set, `run()` calls
   `prefixdelegation.Acquire` **before** `resolveAFTR`, and hands the lease's DNS servers (via
-  `pdDNSServers`) to AFTR discovery, to `runAFTRRediscovery`, and — as a last fallback behind
+  `pdDNSServers`) to AFTR discovery, to `startSoftwireControl` (re-discovery), and — as a last fallback behind
   `-dns-server` and the discovery-learned set — to `-dns-proxy`'s upstreams. The rest of the PD setup
   (LAN address assignment, RA workers, `Maintain`) still runs in its old position, with `runPrefixDelegation`
   now taking the already-acquired lease. Both exchanges bind the same WAN DHCPv6 socket and are serialized
@@ -801,16 +801,17 @@ orphaned the running kernel's module directory — reboot to fix that).
   have been reached without any evidence from DHCPv6 about what kind of network this is. The B4 softwire source is `-b4` if given, else resolved
   dynamically by `resolveB4()` — a `pkg/netlink.Socket.SourceForDest` (`RTM_GETROUTE`/`RTA_PREFSRC`) query
   run after `AttachWAN`, retrying until the WAN's RA-learned route to the AFTR is back, so the kernel's
-  RFC 6724 logic picks the exact source its own ip6tnl would. `runAFTRRediscovery()` (started whenever the
-  AFTR *or* the B4 is dynamic) is the *single owner* of the live softwire endpoints, a `rediscovery` struct
-  driving one goroutine: it runs periodic AFTR re-discovery (applying a changed AFTR via the
-  flow-preserving `migrateAFTR`) and, for a dynamic B4, folds in a WAN-address-change signal from a
-  `watchB4()` poller — on which `handleWANChange()` hard-switches the source (`dp.SwitchAFTR`, since a B4
-  change can't be drained: RFC 7785 §4 recommends the AFTR migrate its NAT state to the new B4, but that
-  can't be relied on, so minuteman cuts cleanly) then re-triggers AFTR discovery. The watcher only signals (size-1
-  latest-wins channel); the loop re-queries the source itself so no stale value rides the channel, and
-  `migrateAFTR`'s long waits also select on the signal (returning `errMigrationInterrupted`) so a WAN
-  change interrupts even a multi-hour drain. `watchTunnelPMTU()` (always started, `pmtu.go`) polls the path MTU the datapath learns from inbound
+  RFC 6724 logic picks the exact source its own ip6tnl would. `startSoftwireControl()` (`softwire.go`,
+  started whenever the AFTR *or* the B4 is dynamic) starts the molecule supervision tree of
+  `internal/softwirectl`, whose `Controller` — a pure genstatem — is the *single owner* of the live
+  softwire endpoints: it runs periodic AFTR re-discovery (applying a changed AFTR via the
+  flow-preserving migration, phases Priming → Draining) and, for a dynamic B4, polls the WAN source every
+  30s and on a change hard-switches (`dp.SwitchAFTR`, since a B4 change can't be drained: RFC 7785 §4
+  recommends the AFTR migrate its NAT state to the new B4, but that can't be relied on, so minuteman cuts
+  cleanly) then re-triggers AFTR discovery. A switch can happen in any phase, so a WAN change interrupts
+  even a multi-hour drain; it bumps a generation that makes every response still in flight stale. The
+  datapath, tunnel and netlink calls are made by the tree's `softwire` server, discovery by its
+  `aftr-discovery` process; see `internal/softwirectl/README.md`. `watchTunnelPMTU()` (always started, `pmtu.go`) polls the path MTU the datapath learns from inbound
   ICMPv6 Packet Too Big messages and applies it to the two things userspace owns — the fragmenter's
   `frag_unit` and the companion ip6tnl's MTU — including the widening direction, since a reading that ages
   out simply stops being reported. When `-dhcpv6-pd` is set, `runPrefixDelegation()` similarly blocks
@@ -924,8 +925,8 @@ orphaned the running kernel's module directory — reboot to fix that).
   `SetSoftwireMTU(mtu)` re-derives the device MTU when the datapath learns a narrower softwire path MTU
   (same best-effort stance), and `Close()`
   deletes it best-effort on shutdown. `cmd/minuteman` creates it right after `SetB4Config` for every run
-  (static or dynamic) and hands it to `runAFTRRediscovery` so the single endpoint owner can repoint it;
-  its `defer Close()` runs after `bgWG.Wait()` (so the rediscovery goroutine has drained) but before
+  (static or dynamic) and hands it to `startSoftwireControl` so the single endpoint owner can repoint it;
+  its `defer Close()` runs after `bgWG.Wait()` (so the softwire control tree has stopped) but before
   `dp.Close()`.
 - **`internal/fragpath`** — owns the companion veth pairs the in-XDP softwire fragmenter bounces its
   broadcast clones through (see the `bpf/datapath.bpf.c` fragmenter bullet for the two kernel constraints

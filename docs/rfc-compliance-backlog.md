@@ -151,7 +151,7 @@ resolvers to work with:
   source. The RFC 3646 decoding moved to `dhcpv6.Options.DNSServers()` rather than being duplicated, since
   `pkg/aftrdiscovery` reads the same option.
 - **`run()` acquires the PD lease before AFTR discovery**, and hands its servers to `resolveAFTR`,
-  `runAFTRRediscovery`, and (behind `-dns-server` and the discovery-learned set) `-dns-proxy`'s upstreams.
+  the re-discovery of `internal/softwirectl`, and (behind `-dns-server` and the discovery-learned set) `-dns-proxy`'s upstreams.
   Only the `Acquire` call moved; `runPrefixDelegation` now takes the already-acquired lease and does the
   LAN assignment, RA workers and `Maintain` in its old position. Both exchanges bind the same WAN DHCPv6
   socket and are serialized by `pkg/dhcpv6`'s per-interface lock, so their concurrency is unchanged.
@@ -185,7 +185,7 @@ constants above rather than from inference about the network.
   no-op check compares one resolved address (`aftrdiscovery` returns `addrs[0]`), not set membership.
   Benign at day-scale intervals — a graceful flow-affinity migration each time, not a hard break — but
   a proper fix exposes all resolved addresses and no-ops when the current AFTR is still among them.
-- Dynamic-B4 change detection is polling (`cmd/minuteman`'s `watchB4`, ~30s), not event-driven. A netlink
+- Dynamic-B4 change detection is polling (`internal/softwirectl`'s B4 poll, ~30s), not event-driven. A netlink
   `RTNLGRP_IPV6_IFADDR` event subscription would react in sub-second but adds a new pkg/netlink surface
   plus debounce/DAD handling; home-CPE renumbering usually rides link events slower than a poll interval
   anyway, so this is a latency nicety, not a correctness gap.
