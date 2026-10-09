@@ -50,6 +50,24 @@ func TestNextB4(t *testing.T) {
 			wantChanged: false,
 		},
 		{
+			// The kernel's fallback while the WAN's global is DAD-tentative:
+			// no AFTR can reach it.
+			name:        "link-local queried address keeps current",
+			current:     a,
+			queried:     netip.MustParseAddr("fe80::1"),
+			ok:          true,
+			wantB4:      a,
+			wantChanged: false,
+		},
+		{
+			name:        "ULA is a usable B4",
+			current:     a,
+			queried:     netip.MustParseAddr("fd00:1::2"),
+			ok:          true,
+			wantB4:      netip.MustParseAddr("fd00:1::2"),
+			wantChanged: true,
+		},
+		{
 			name:        "invalid queried address keeps current",
 			current:     a,
 			queried:     netip.Addr{},

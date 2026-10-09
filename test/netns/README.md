@@ -89,10 +89,13 @@ selects the softwire source dynamically from the WAN's kernel-chosen source towa
 re-selects it when the WAN address changes (the DS-Lite B4-address change of RFC 7785). `smoketest.sh` first asserts minuteman logged the
 startup selection (`WAN_CPE_ADDR`), then drives a renumbering scenario: it adds a second WAN global and
 deprecates the first (`preferred_lft 0`), waits out minuteman's 30s `watchB4` poll for the hard-switch
-(parsing the re-selected address from the log rather than assuming which candidate the kernel picks —
-`WAN_CPE_ADDR2` or the WAN's own SLAAC address), points the AFTR's `ip6tnl` `remote` at it (the
+(parsing the re-selected address from the log rather than assuming it is `WAN_CPE_ADDR2`), points the AFTR's `ip6tnl` `remote` at it (the
 NAT-state-follows-the-address step a real AFTR does via its own B4 re-learning), and re-runs the DS-Lite
-data-path check — which only passes if the switch actually took. Composes with the other toggles.
+data-path check — which only passes if the switch actually took. In this mode `setup.sh` turns SLAAC off on
+`mm-cpe`'s WAN (`autoconf=0`, RAs still accepted for the default route), so `WAN_CPE_ADDR` is its only global
+at startup: with a SLAAC address beside it, which of the two the kernel prefers would depend on which finishes
+DAD first after `AttachWAN` bounces the link, while the AFTR's tunnel is pinned to `WAN_CPE_ADDR`. Composes
+with the other toggles.
 
 An eighth independent toggle, `MM_SOFTWIRE_FRAG` (`0` default or `1`), exercises softwire fragmentation
 (RFC 6333 §5.3) in both directions. It changes no minuteman flag and adds no topology — every link is
