@@ -281,12 +281,42 @@ if [[ $dhcpv4_enabled -eq 1 ]]; then
 timeout 20;
 request subnet-mask, broadcast-address, routers, domain-name-servers, interface-mtu;
 EOF
+    # dhclient runs with a script of its own (-sf), applying the address,
+    # the default route and the MTU -- what the checks below look at -- and
+    # nothing else. The system dhclient-script would also write the DNS
+    # server minuteman hands out (its LAN gateway, with -dns-proxy) to
+    # /etc/resolv.conf, and `ip netns exec` gives a namespace its own
+    # network, not its own /etc: that is the *host's* resolv.conf, left
+    # pointing at an address only mm-host can reach, and the long-lived
+    # dhclient would rewrite it again on every renewal.
+    cat >"$DHCLIENT_SCRIPT" <<'SCRIPT'
+#!/bin/sh
+case "$reason" in
+BOUND|RENEW|REBIND|REBOOT)
+    if [ -n "$new_interface_mtu" ]; then
+        ip link set dev "$interface" mtu "$new_interface_mtu"
+    fi
+    ip addr replace "$new_ip_address/$new_subnet_mask" dev "$interface"
+    for router in $new_routers; do
+        ip route replace default via "$router" dev "$interface"
+        break
+    done
+    ;;
+EXPIRE|FAIL|RELEASE|STOP)
+    if [ -n "$old_ip_address" ]; then
+        ip addr del "$old_ip_address/$old_subnet_mask" dev "$interface"
+    fi
+    ;;
+esac
+exit 0
+SCRIPT
+    chmod +x "$DHCLIENT_SCRIPT"
     if [[ $started_minuteman -eq 1 ]]; then
         check "minuteman is serving DHCPv4 on $VETH_CPE_HOST (see $RUNDIR/minuteman.log)" \
             grep -q "DHCPv4: serving $LAN_PREFIX on $VETH_CPE_HOST" "$RUNDIR/minuteman.log"
     fi
     check "$NETNS_HOST acquired an IPv4 lease via dhclient (DORA against minuteman)" \
-        ip netns exec "$NETNS_HOST" dhclient -4 -1 \
+        ip netns exec "$NETNS_HOST" dhclient -4 -1 -sf "$DHCLIENT_SCRIPT" \
             -cf "$DHCLIENT_CONF" -lf "$DHCLIENT_LEASES" -pf "$DHCLIENT_PIDFILE" "$VETH_HOST_CPE"
     check "$NETNS_HOST got the pool's first address ($DHCPV4_HOST_ADDR/24)" \
         bash -c "ip netns exec $NETNS_HOST ip -4 addr show dev $VETH_HOST_CPE | grep -q 'inet $DHCPV4_HOST_ADDR/24'"

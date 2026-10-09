@@ -169,6 +169,9 @@ DHCPV4_ENABLED_FILE="$RUNDIR/dhcpv4-enabled"
 DHCLIENT_CONF="$RUNDIR/dhclient.conf"
 DHCLIENT_LEASES="$RUNDIR/dhclient.leases"
 DHCLIENT_PIDFILE="$RUNDIR/dhclient.pid"
+# The dhclient-script smoketest.sh runs dhclient with (-sf): see the note
+# there on why the system one must not run in mm-host.
+DHCLIENT_SCRIPT="$RUNDIR/dhclient-script"
 
 # Whether setup.sh built the MM_DUALSTACK native-IPv6 topology above -- a
 # fifth independent toggle (orthogonal to the four above; it changes no
