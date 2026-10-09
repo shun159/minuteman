@@ -45,7 +45,7 @@ Framing is manual byte-slice work, matching `pkg/dhcpv6`'s style.
 
 `RDNSSAddr` is a concrete address, not an "advertise RDNSS" boolean, and that is deliberate: RFC
 7084 §L-11 wants an IPv6-only SLAAC client to get a DNS server, but advertising one nothing
-answers on is worse than advertising none. The caller passes the address `pkg/dnsproxy` *actually
+answers on is worse than advertising none. The caller passes the address `internal/dnsproxy` *actually
 bound*. Having `Serve` re-resolve it independently could diverge from what the proxy bound — e.g.
 if the link-local was still tentative when the proxy started.
 

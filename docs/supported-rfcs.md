@@ -59,7 +59,7 @@ Provisioning Protocol many Japanese VNEs use instead of the DHCPv6 AFTR-Name —
 | **7084** | Basic Requirements for IPv6 Customer Edge Routers | ◐ | Aspirational compliance target for the *base* document. §L-11 (DNS via RA, referencing RFC 6106/8106) drives the RA RDNSS option — but minuteman advertises **RDNSS only**, not the DNSSL option L-11 also calls for. Several base requirements remain open (see backlog). The updates below (RFC 9096, RFC 9818) are **not** targeted. |
 | **9096** | Improving the Reaction of Customer Edge Routers to IPv6 Renumbering Events (updates 7084) | ✗ | Not implemented. Adds WPD-9/WPD-10 (WAN: don't auto-RELEASE on restart; stable WAN IAID) and L-13(replaced)/L-15/L-16 (LAN: signal stale config; cap LAN SLAAC/DHCPv6 lifetimes to the WAN prefix's remaining lifetime). Newly relevant given dynamic B4 handles WAN renumbering — see backlog. |
 | **9818** | IPv6 Prefix Delegation on the Local Area Network (updates 7084) | ✗ | Out of scope. Adds LPD-1..LPD-10 (running DHCPv6-PD on the *LAN* side to delegate sub-prefixes to downstream routers). minuteman is a single-tier CPE: LAN hosts SLAAC from one carved /64, no downstream delegation. |
-| **6333** (§ B4 SHOULD) | DNS proxy | ✅ | `-dns-proxy`: opaque UDP/TCP relay to upstream resolvers, bypassing the softwire (`pkg/dnsproxy`). |
+| **6333** (§ B4 SHOULD) | DNS proxy | ✅ | `-dns-proxy`: opaque UDP/TCP relay to upstream resolvers, bypassing the softwire (`internal/dnsproxy`). |
 | **7766** | DNS Transport over TCP — Implementation Requirements | ✅ | TCP DNS relayed as a byte stream, so query pipelining (§6.2.1) works for free. |
 
 ## ICMP & IPv4 forwarding in the datapath

@@ -101,7 +101,7 @@ serving), `wanextend` (NDProxy LAN policy, including RA serving and host-route m
 (the DS-Lite companion `ip6tnl` lifecycle for softwire reassembly + fragmentation fallback), and
 `fragpath` (the companion veth pairs the in-XDP softwire fragmenter bounces its clones through);
 `pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/`pkg/prefixdelegation`/`pkg/routeradvert`/`pkg/ndproxy`/
-`pkg/netlink`/`pkg/dnsproxy`/`pkg/dhcpv4`/`pkg/ethtool` are the reusable protocol packages. Every package under both
+`pkg/netlink`/`pkg/dhcpv4`/`pkg/ethtool` are the reusable protocol packages (and `internal/dnsproxy`, all I/O, runs as a molecule supervision tree). Every package under both
 trees carries its own `README.md` covering its rationale in more depth than the Architecture section
 below, indexed by `internal/README.md` and `pkg/README.md`.
 
@@ -650,28 +650,23 @@ orphaned the running kernel's module directory — reboot to fix that).
   reads into a 64 KiB buffer rather than `Addrs`' single page: a link dump entry carries the device's
   whole `rtnl_link_stats64` plus per-protocol attributes, and a `Recvfrom` buffer shorter than the
   kernel's next dump message silently truncates it.
-- **`pkg/dnsproxy/`** — the DNS proxy RFC 6333 recommends a DS-Lite B4 run (the B4 SHOULD act as a DNS
+- **`internal/dnsproxy/`** — the DNS proxy RFC 6333 recommends a DS-Lite B4 run (the B4 SHOULD act as a DNS
   proxy for LAN clients): opaque byte-relay only, no DNS message parsing, caching, or rewriting of any
-  kind, so it's simple enough to have no unit tests of its own (like `pkg/ndproxy`/`pkg/routeradvert`'s raw
-  socket I/O, correctness here is exercised by `test/netns`, not `go test`). `serve.go` splits opening
-  from serving the same way `pkg/dhcpv4` does (`New`/`Serve`): `Listen(Config)` opens a UDP `net.ListenUDP`
-  and TCP `net.ListenTCP` socket per `Config.ListenAddrs` (port 53) *synchronously*, returning a `*Server`
-  or a bind failure to the caller (so `cmd/minuteman` fails fast, and only advertises one of these
-  addresses as an RDNSS DNS server once it's actually bound — see `startDNSProxy`/`routeradvert`), and the
-  returned `Server`'s `Serve(ctx)` runs the forwarding loops, closing every socket on `ctx.Done()` to
-  unblock `serveUDP`/`serveTCP`'s read loops — the same close-to-unblock shutdown pattern `pkg/ndproxy`'s
-  `conn`/`packetConn` use. A listen address that's IPv6 link-local carries a zone (`netip.Addr.Zone()`,
-  set by `routeradvert.LinkLocalAddr`), threaded into the `net.UDPAddr`/`net.TCPAddr` so the kernel binds
-  it to the right interface. `udp.go`'s `serveUDP` spawns
-  one goroutine per received datagram (so one slow upstream never blocks the next query), trying
-  `Config.Upstreams` in order over a fresh one-shot `net.DialUDP` socket per query (deliberately not
-  pooled: a dedicated socket means a response can never be confused with a different concurrent query's,
-  and DNS-over-UDP is a single round trip anyway) bounded by `udpQueryTimeout`; every upstream failing just
-  drops the query, relying on the client's own resolver to retry, same as if this proxy weren't in the
-  path. `tcp.go`'s `relayTCP` is a full bidirectional byte-level `io.Copy` relay per accepted connection
-  rather than framing individual length-prefixed DNS-over-TCP messages — RFC 7766 §6.2.1 allows pipelining
-  multiple queries on one connection, which a byte relay handles for free without this package ever
-  needing to parse a message boundary.
+  kind. A molecule supervision tree (`Spec(Config)`, one_for_one): per listen address, a UDP listener and a
+  `gentcpacceptor` raw TCP listener, each bound before the tree's start returns (so `cmd/minuteman` fails
+  fast, and only advertises one of these addresses as an RDNSS DNS server once it's actually bound — see
+  `startDNSProxy`/`routeradvert`). The UDP listener (`udp.go`, a proc process: it starts a process per
+  query) owns a `genudp` socket in `N(maxInFlight)` mode and re-arms it by one as each forwarder exits, so
+  queries in flight are bounded and the rest wait in the kernel; it waits out a link-local address still
+  DAD-tentative (`EADDRNOTAVAIL`, `bindRetries`) before its TCP sibling binds. Each forwarder tries
+  `Config.Upstreams` in order over a fresh one-shot `genudp` socket (deliberately not pooled: a dedicated
+  socket means a response can never be confused with a different concurrent query's), bounded by
+  `udpQueryTimeout`; every upstream failing just drops the query, relying on the client's own resolver to
+  retry. `tcp.go`'s `relay` is a full bidirectional byte-level `io.Copy` relay per accepted connection rather
+  than framing individual length-prefixed DNS-over-TCP messages — RFC 7766 §6.2.1 allows pipelining
+  multiple queries on one connection, which a byte relay handles for free. A listen address that's IPv6
+  link-local carries its zone (`routeradvert.LinkLocalAddr`) so the kernel binds the right interface.
+  Tested with `go test` against loopback upstreams, and end to end by the netns rig's `MM_DNS_PROXY=1`.
 - **`pkg/dhcpv4/`** — the LAN-side DHCPv4 *server* (RFC 2131/2132) minuteman runs behind `-dhcpv4` to hand
   its LAN clients the private IPv4 the DS-Lite softwire carries. Server only, and only the directly-attached
   single-subnet-per-interface case a home CPE serves (no BOOTP relay — a `giaddr != 0` request is rejected,
@@ -825,8 +820,8 @@ orphaned the running kernel's module directory — reboot to fix that).
   `-ndproxy` is set instead, `runNDProxy()` is a thin wrapper that hands the `-lan` interface names straight
   to `internal/wanextend.Serve`, which owns the whole flow itself (see that package's own entry below) and
   registers every goroutine it starts on the same `sync.WaitGroup` as the `-dhcpv6-pd` path, for the same
-  shutdown-draining reason. If `-dns-proxy` is set, `startDNSProxy()` opens `pkg/dnsproxy` (via
-  `dnsproxy.Listen`, *synchronously*, so a bind failure fails `run()`) listening on every `-lan`
+  shutdown-draining reason. If `-dns-proxy` is set, `startDNSProxy()` starts `internal/dnsproxy`'s
+  supervision tree (its start returns once every listener is bound, so a bind failure fails `run()`) listening on every `-lan`
   interface's IPv4 gateway IP *and* its own link-local IPv6 address, forwarding to `-dns-server` if any
   were given or else the DNS servers `resolveAFTR()` returned; `run()` fails fast before any of this if
   `-dns-proxy` is set but no DNS servers are available from either source. It's started *before*
@@ -834,7 +829,7 @@ orphaned the running kernel's module directory — reboot to fix that).
   actually bound; that map is passed to those two so their RA workers advertise an RFC 8106 RDNSS option
   (RFC 7084 §L-11, so an IPv6-only SLAAC client gets a DNS server) pointing *only* at addresses this proxy
   really bound — never a DNS server nothing answers on. A LAN link-local still DAD-tentative at bind time
-  (`EADDRNOTAVAIL`) is retried on the tentative cadence; any other bind error (port 53 in use, etc.) fails
+  (`EADDRNOTAVAIL`) is waited out by the UDP listener; any other bind error (port 53 in use, etc.) fails
   immediately. If `-dhcpv4` is set, `runDHCPv4()` builds one `pkg/dhcpv4.InterfaceConfig`
   per `-lan` (subnet from its `/prefixlen`, gateway as router; DNS = `-dhcpv4-dns`, else the gateway when
   `-dns-proxy` runs, else omitted; MTU = the `-lan` MTU or else the WAN MTU minus the 40-byte tunnel
@@ -946,7 +941,7 @@ When implementing new functionality, follow this split: per-packet fast-path log
 `bpf/datapath.bpf.c`; anything that needs `cilium/ebpf` or knows about BPF map layouts goes in
 `pkg/datapath`; generic protocol/wire-format code goes in its own `pkg/` package the way
 `pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/`pkg/prefixdelegation`/`pkg/routeradvert`/`pkg/ndproxy`/
-`pkg/netlink`/`pkg/dnsproxy`/`pkg/dhcpv4`/`pkg/ethtool` do; CLI-specific glue and policy decisions belong in `internal/` or `cmd/` (e.g.
+`pkg/netlink`/`pkg/dhcpv4`/`pkg/ethtool` do; CLI-specific glue and policy decisions belong in `internal/` or `cmd/` (e.g.
 `internal/lanprefix`'s delegated-prefix-to-LAN-address and delegated-prefix-to-RA policy,
 `internal/wanextend`'s WAN-prefix-discovery-to-RA and confirmed-target-to-host-route policy, or
 `cmd/minuteman/ifstats.go` joining a netlink link dump, `pkg/datapath`'s program classification and

@@ -16,7 +16,6 @@ AFTR, what a confirmed neighbor implies for the routing table. That lives in
 | [`ndproxy`](ndproxy/) | RFC 4389 Neighbor Discovery Proxy, actively verified | — |
 | [`netlink`](netlink/) | hand-rolled `NETLINK_ROUTE` client — the only netlink wire code | — |
 | [`ethtool`](ethtool/) | hand-rolled `SIOCETHTOOL` client: a device's `ethtool -S` driver counters | — |
-| [`dnsproxy`](dnsproxy/) | RFC 6333's B4 SHOULD: an opaque DNS byte relay over native IPv6 | — |
 | [`dhcpv4`](dhcpv4/) | RFC 2131/2132 LAN-side DHCPv4 server | — |
 
 ## Conventions these packages share
@@ -31,10 +30,8 @@ what BTF-derived `vmlinux.h` lacks.
 each takes an explicit `now` or plain values rather than reading a clock or a socket. Raw-socket
 I/O and goroutine orchestration are covered by the netns rig instead (`test/netns/README.md`).
 
-**Open synchronously, serve in the background.** `dnsproxy.Listen`/`Serve` and `dhcpv4.New`/`Serve`
-both split binding from running, so a bind failure fails `cmd/minuteman`'s startup instead of
-appearing later in a log line — which is what lets minuteman advertise a DNS server only once
-something is really listening on it.
+**Open synchronously, serve in the background.** `dhcpv4.New`/`Serve` splits binding from running,
+so a bind failure fails `cmd/minuteman`'s startup instead of appearing later in a log line.
 
 **Policy is reported, not enacted.** `aftrdiscovery` returns RFC 4242's refresh interval and
 `hb46pp` returns a `RetryDelay` window; neither sleeps on it. The exception is
