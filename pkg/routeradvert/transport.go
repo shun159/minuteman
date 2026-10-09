@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 
+	"github.com/shun159/miniteman/pkg/internal/pollfd"
 	"golang.org/x/sys/unix"
 )
 
@@ -25,9 +26,10 @@ const icmp6Filter = 1
 // Conn is a raw ICMPv6 socket bound to one interface, used to send Router
 // Advertisements and receive Router Solicitations on it. Not safe for
 // concurrent use except Close, which may be called from another goroutine
-// to unblock a blocked Solicitations reader.
+// to unblock a blocked Solicitations reader: the socket goes through the
+// runtime's poller (pkg/internal/pollfd), as close(2) alone would not.
 type Conn struct {
-	fd      int
+	fd      *pollfd.FD
 	ifIndex int
 }
 
@@ -43,29 +45,28 @@ func Listen(iface string) (*Conn, error) {
 		return nil, fmt.Errorf("routeradvert: looking up interface %s: %w", iface, err)
 	}
 
-	fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_RAW, unix.IPPROTO_ICMPV6)
+	fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_RAW|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, unix.IPPROTO_ICMPV6)
 	if err != nil {
 		return nil, fmt.Errorf("routeradvert: opening raw ICMPv6 socket: %w", err)
 	}
-	c := &Conn{fd: fd, ifIndex: ifi.Index}
 
 	if err := unix.BindToDevice(fd, iface); err != nil {
-		c.Close()
+		unix.Close(fd)
 		return nil, fmt.Errorf("routeradvert: binding to %s: %w", iface, err)
 	}
 
 	mreq := &unix.IPv6Mreq{Multiaddr: allRoutersMulticast.As16(), Interface: uint32(ifi.Index)}
 	if err := unix.SetsockoptIPv6Mreq(fd, unix.IPPROTO_IPV6, unix.IPV6_JOIN_GROUP, mreq); err != nil {
-		c.Close()
+		unix.Close(fd)
 		return nil, fmt.Errorf("routeradvert: joining all-routers multicast group on %s: %w", iface, err)
 	}
 
 	if err := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_MULTICAST_HOPS, 255); err != nil {
-		c.Close()
+		unix.Close(fd)
 		return nil, fmt.Errorf("routeradvert: setting multicast hop limit on %s: %w", iface, err)
 	}
 	if err := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_UNICAST_HOPS, 255); err != nil {
-		c.Close()
+		unix.Close(fd)
 		return nil, fmt.Errorf("routeradvert: setting unicast hop limit on %s: %w", iface, err)
 	}
 
@@ -75,17 +76,21 @@ func Listen(iface string) (*Conn, error) {
 	}
 	filt.Data[icmpTypeRouterSolicit/32] &^= 1 << (icmpTypeRouterSolicit % 32) // ...except Router Solicitation
 	if err := unix.SetsockoptICMPv6Filter(fd, unix.SOL_ICMPV6, icmp6Filter, &filt); err != nil {
-		c.Close()
+		unix.Close(fd)
 		return nil, fmt.Errorf("routeradvert: setting ICMPv6 filter on %s: %w", iface, err)
 	}
 
-	return c, nil
+	p, err := pollfd.New(fd, "routeradvert "+iface)
+	if err != nil {
+		return nil, fmt.Errorf("routeradvert: polling raw ICMPv6 socket on %s: %w", iface, err)
+	}
+	return &Conn{fd: p, ifIndex: ifi.Index}, nil
 }
 
 // Close closes the underlying socket, unblocking any goroutine currently
 // reading from Solicitations.
 func (c *Conn) Close() error {
-	return unix.Close(c.fd)
+	return c.fd.Close()
 }
 
 // LinkLocalAddr returns iface's own fe80::/10 unicast address (the one this
@@ -138,7 +143,7 @@ func (c *Conn) Solicitations() <-chan struct{} {
 		defer close(ch)
 		buf := make([]byte, 512)
 		for {
-			n, _, err := unix.Recvfrom(c.fd, buf, 0)
+			n, _, err := c.fd.Recvfrom(buf)
 			if err != nil {
 				return
 			}
@@ -158,5 +163,5 @@ func (c *Conn) Solicitations() <-chan struct{} {
 // §4.2: both unsolicited and solicited Advertisements may be multicast).
 func (c *Conn) SendAdvertisement(ra *RouterAdvertisement) error {
 	dst := &unix.SockaddrInet6{Addr: allNodesMulticast.As16(), ZoneId: uint32(c.ifIndex)}
-	return unix.Sendto(c.fd, ra.Marshal(), 0, dst)
+	return c.fd.Sendto(ra.Marshal(), dst)
 }

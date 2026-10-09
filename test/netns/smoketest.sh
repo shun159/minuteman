@@ -533,6 +533,16 @@ if [[ $started_minuteman -eq 1 ]]; then
     mss_clamped0="$(read_stat MSSClamped)"
     mss_wan_mtu="$(ip netns exec "$NETNS_CPE" cat "/sys/class/net/$VETH_CPE_ISP/mtu")"
     expected_mss=$((mss_wan_mtu - 80))
+    # A clamp is counted only where an MSS is lowered. The remote's SYN-ACK
+    # always is; the LAN client's SYN not when the client already sizes it
+    # to fit -- as under MM_DHCPV4=1, where it takes the softwire-adjusted
+    # MTU minuteman hands out (option 26), so its SYN carries expected_mss
+    # to begin with.
+    mss_host_mtu="$(ip netns exec "$NETNS_HOST" cat "/sys/class/net/$VETH_HOST_CPE/mtu")"
+    expected_clamps=2
+    if ((mss_host_mtu - 40 <= expected_mss)); then
+        expected_clamps=1
+    fi
     mss_syn_pcap="$RUNDIR/mss-clamp-outbound.log"
     mss_synack_pcap="$RUNDIR/mss-clamp-inbound.log"
 
@@ -568,8 +578,8 @@ if [[ $started_minuteman -eq 1 ]]; then
         grep -q "mss $expected_mss" "$mss_syn_pcap"
     check "the remote's SYN-ACK reaches the LAN client advertising mss $expected_mss (decap side)" \
         grep -q "mss $expected_mss" "$mss_synack_pcap"
-    check "the datapath counted a clamp in each direction (MSSClamped +$((mss_clamped - mss_clamped0)))" \
-        test "$((mss_clamped - mss_clamped0))" -ge 2
+    check "the datapath counted a clamp wherever an MSS was lowered (MSSClamped +$((mss_clamped - mss_clamped0)), want $expected_clamps)" \
+        test "$((mss_clamped - mss_clamped0))" -ge "$expected_clamps"
 fi
 
 if [[ $started_minuteman -eq 1 ]]; then

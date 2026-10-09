@@ -235,6 +235,8 @@ verified passing from a fresh setup for:
   clamping is asserted unconditionally: the LAN client's SYN reaching the AFTR and the remote's SYN-ACK
   reaching the LAN client both advertising `mss 1420` (the rig's 1500 WAN MTU less 40 + 40), the connection
   completing (so the hand-rolled TCP checksum fixup is right), and `MSSClamped` advancing once per direction
+  that needed it (under `MM_DHCPV4=1` the client takes the softwire-adjusted MTU, so its SYN already carries
+  `mss 1420` and only the SYN-ACK is clamped)
 - `MM_AFTR_DISCOVERY=dhcpv6`/`hb46pp` (both against the `dhcpv6-pd` WAN model)
 - `MM_WAN_MODEL=dhcpv6-pd`/`ndproxy` (both against `dhcpv6` AFTR discovery)
 - `MM_DNS_PROXY=1`

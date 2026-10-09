@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 
+	"github.com/shun159/miniteman/pkg/internal/pollfd"
 	"golang.org/x/sys/unix"
 )
 
@@ -46,9 +47,10 @@ var nsFilter = []unix.SockFilter{
 
 // packetConn receives Neighbor Solicitations on one interface via an
 // AF_PACKET socket (see the comment above). Close may be called from
-// another goroutine to unblock a blocked reader.
+// another goroutine to unblock a blocked reader: the socket goes through
+// the runtime's poller (pkg/internal/pollfd), as close(2) alone would not.
 type packetConn struct {
-	fd int
+	fd *pollfd.FD
 }
 
 // listenPacket opens the NS-receiving packet socket on iface.
@@ -60,22 +62,21 @@ func listenPacket(iface string) (*packetConn, error) {
 
 	// Protocol ETH_P_IPV6 in network byte order, as AF_PACKET requires.
 	proto := bits.ReverseBytes16(unix.ETH_P_IPV6)
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, int(proto))
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_DGRAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, int(proto))
 	if err != nil {
 		return nil, fmt.Errorf("ndproxy: opening packet socket: %w", err)
 	}
-	c := &packetConn{fd: fd}
 
 	// Attach the filter before bind so no unfiltered packet is ever
 	// queued (a socket receives from creation, filter or not).
 	prog := unix.SockFprog{Len: uint16(len(nsFilter)), Filter: &nsFilter[0]}
 	if err := unix.SetsockoptSockFprog(fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &prog); err != nil {
-		c.Close()
+		unix.Close(fd)
 		return nil, fmt.Errorf("ndproxy: attaching NS filter on %s: %w", iface, err)
 	}
 
 	if err := unix.Bind(fd, &unix.SockaddrLinklayer{Protocol: proto, Ifindex: ifi.Index}); err != nil {
-		c.Close()
+		unix.Close(fd)
 		return nil, fmt.Errorf("ndproxy: binding packet socket to %s: %w", iface, err)
 	}
 
@@ -85,15 +86,19 @@ func listenPacket(iface string) (*packetConn, error) {
 	// close.
 	mreq := &unix.PacketMreq{Ifindex: int32(ifi.Index), Type: unix.PACKET_MR_ALLMULTI}
 	if err := unix.SetsockoptPacketMreq(fd, unix.SOL_PACKET, unix.PACKET_ADD_MEMBERSHIP, mreq); err != nil {
-		c.Close()
+		unix.Close(fd)
 		return nil, fmt.Errorf("ndproxy: enabling all-multicast on %s: %w", iface, err)
 	}
 
-	return c, nil
+	p, err := pollfd.New(fd, "ndproxy "+iface)
+	if err != nil {
+		return nil, fmt.Errorf("ndproxy: polling packet socket on %s: %w", iface, err)
+	}
+	return &packetConn{fd: p}, nil
 }
 
 func (c *packetConn) Close() error {
-	return unix.Close(c.fd)
+	return c.fd.Close()
 }
 
 // readSolicitations reads Neighbor Solicitations into ch until the
@@ -104,7 +109,7 @@ func (c *packetConn) readSolicitations(ch chan<- message) {
 	defer close(ch)
 	buf := make([]byte, 1500)
 	for {
-		n, _, err := unix.Recvfrom(c.fd, buf, 0)
+		n, _, err := c.fd.Recvfrom(buf)
 		if err != nil {
 			return
 		}
