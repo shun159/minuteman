@@ -58,7 +58,10 @@ its very first check, before anything else assumes the host has IPv4 — runs a 
 to acquire them, then asserts the pool's first address (`.2`), the gateway default route, and the
 DS-Lite-adjusted interface MTU (`1460`, from option 26) all landed; every later check (DNS proxy, the
 DS-Lite data path) then runs over that DHCP-assigned config, so the whole rig doubles as an end-to-end
-DHCPv4 test. `dhclient` is given a small conf requesting `interface-mtu` so it applies option 26.
+DHCPv4 test. `dhclient` is given a small conf requesting `interface-mtu` so it applies option 26, and a
+`dhclient-script` of its own (`-sf`) that applies the address, default route and MTU and nothing else: the
+system script would write the DNS server minuteman hands out to `/etc/resolv.conf`, and `ip netns exec`
+separates a namespace's network, not its `/etc` -- that would be the host's resolv.conf.
 `teardown.sh` also stops any `dhclient` left running in `mm-host`.
 
 A fifth, independent toggle, `MM_DUALSTACK` (`0` default or `1`), exercises RFC 6333's core dual-stack
