@@ -464,15 +464,12 @@ orphaned the running kernel's module directory — reboot to fix that).
   options that are generic DHCPv6 *and* have more than one consumer here, which get an `Options` accessor
   instead of being decoded once per consumer: `InformationRefreshTime()` (RFC 4242) and `DNSServers()`
   (RFC 3646, read by both `pkg/aftrdiscovery` and `pkg/prefixdelegation`)), `retransmit.go` (pure
-  RFC 3315 §5.5/§14 timing for every exchange — initial jitter via `randDelay`, then backoff capped at each
+  RFC 3315 §5.5/§14 timing for every exchange — initial jitter via `InitialDelay`, then backoff capped at each
   exchange's MRT with jitter re-applied around the cap forever, *not* clamped to a fixed value; Request/
-  Release additionally have a maximum retransmission *count*), `transport.go` (`ListenUDP`, never
-  `DialUDP`, bound to the WAN interface's link-local address — a connected socket would drop the server's
-  unicast Reply; `sendAndWait` takes the expected reply `MessageType` since Solicit expects an Advertise,
-  not a Reply), `client.go`'s `runExchange` (the shared RFC 3315 §14 retransmission loop, driving
-  `InformationRequest` and every `doExchange`-based function) and `validateServerMessage` (RFC 3315's
-  general validation rule: an Advertise/Reply must carry `OPTION_SERVERID`, echoed `OPTION_CLIENTID` if sent
-  must match), plus the exported stateful exchanges `Solicit`/`Request`/`Renew`/`Rebind`/`Release` — all
+  Release additionally have a maximum retransmission *count*; the formulas draw from a `*rand.Rand` they're
+  given), `exchange.go` (`Exchange` -- type, options, expected reply type, `Timing` -- with `Message` to build
+  what's sent and `Answers`, RFC 3315's general validation rule on top of the type/XID match; and the
+  `Exchanger` interface that runs one: the package holds no socket), plus the exported stateful exchanges `Solicit`/`Request`/`Renew`/`Rebind`/`Release` — all
   IA-type-agnostic (they take/return a plain `Options`/`*Message`; IA_PD-specific option decoding is
   `pkg/prefixdelegation`'s job, not this package's).
 - **`pkg/aftrdiscovery/`** — RFC 6334-specific logic on top of `pkg/dhcpv6`: `dnsname.go` decodes
@@ -778,8 +775,8 @@ orphaned the running kernel's module directory — reboot to fix that).
   `pdDNSServers`) to AFTR discovery, to `startSoftwireControl` (re-discovery), and — as a last fallback behind
   `-dns-server` and the discovery-learned set — to `-dns-proxy`'s upstreams. The rest of the PD setup
   (LAN address assignment, RA workers, `Maintain`) still runs in its old position, with `runPrefixDelegation`
-  now taking the already-acquired lease. Both exchanges bind the same WAN DHCPv6 socket and are serialized
-  by `pkg/dhcpv6`'s own per-interface lock, so only their order changed, not their concurrency.
+  now taking the already-acquired lease. Both exchanges go through the WAN's one DHCPv6 client
+  (`internal/dhcpv6client`), which runs them one at a time, so only their order changed, not their concurrency.
   `resolveAFTR()` returns `-aftr` parsed directly if given (in which case its second return, the DNS
   servers `-dns-proxy` defaults to using, is nil — that path skips the DHCPv6 exchange entirely), otherwise
   blocks on `pkg/aftrdiscovery.Discover`

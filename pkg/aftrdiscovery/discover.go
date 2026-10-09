@@ -50,7 +50,7 @@ type Result struct {
 	RefreshInterval time.Duration
 }
 
-// Discover performs a DHCPv6 Information-Request on ifaceName (RFC 3736),
+// Discover performs a DHCPv6 Information-Request through ex (RFC 3736),
 // extracts the AFTR-Name (RFC 6334 OPTION_AFTR_NAME) and DNS servers (RFC
 // 3646 OPTION_DNS_SERVERS) from the Reply, and resolves the AFTR-Name to an
 // IPv6 address via DNS.
@@ -68,7 +68,7 @@ type Result struct {
 // If the Reply carries no OPTION_AFTR_NAME, Discover returns ErrNoAFTRName
 // together with a partial Result (DNSServers and RefreshInterval only) --
 // the one case where both return values are non-nil.
-func Discover(ctx context.Context, ifaceName string, replyTimeout time.Duration) (*Result, error) {
+func Discover(ctx context.Context, ex dhcpv6.Exchanger, replyTimeout time.Duration) (*Result, error) {
 	irCtx := ctx
 	if replyTimeout > 0 {
 		var cancel context.CancelFunc
@@ -76,7 +76,7 @@ func Discover(ctx context.Context, ifaceName string, replyTimeout time.Duration)
 		defer cancel()
 	}
 
-	reply, err := dhcpv6.InformationRequest(irCtx, ifaceName, []uint16{
+	reply, err := dhcpv6.InformationRequest(irCtx, ex, []uint16{
 		dhcpv6.OptionDNSServers,
 		dhcpv6.OptionAFTRName,
 		dhcpv6.OptionInformationRefreshTime,

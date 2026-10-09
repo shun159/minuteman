@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/shun159/miniteman/internal/dhcpv6client"
+	"github.com/shun159/miniteman/pkg/dhcpv6"
 	"github.com/shun159/molecule/behaviours/supervisor"
 	"github.com/shun159/molecule/proc"
 )
@@ -51,4 +53,26 @@ func superviseTree(ctx context.Context, fail context.CancelCauseFunc, node *proc
 		}
 	}()
 	return nil
+}
+
+// startDHCPv6Client starts the DHCPv6 client of wanIface
+// (internal/dhcpv6client) on node, and returns it with the function stopping
+// it. The client is not tied to run's ctx, as the other trees are: its users
+// -- the DHCPv6-PD maintenance releasing its lease, AFTR re-discovery --
+// stop on that ctx, and may still exchange while they do, so the caller
+// stops the client once they have. If it gives up on its own, it fails
+// minuteman through fail, as superviseTree's trees do.
+func startDHCPv6Client(fail context.CancelCauseFunc, node *proc.Node, wanIface string) (dhcpv6.Exchanger, func(), error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	spec := supervisor.Spec{Children: []supervisor.ChildSpec{dhcpv6client.ChildSpec(dhcpv6client.Config{Iface: wanIface})}}
+	if err := superviseTree(ctx, fail, node, "DHCPv6 client", spec, &wg, nil); err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	stop := func() {
+		cancel()
+		wg.Wait()
+	}
+	return dhcpv6client.NewClient(node, wanIface), stop, nil
 }

@@ -12,9 +12,9 @@ import (
 // discovery (which blocks until it succeeds -- no AFTR, no service), a
 // re-discovery is best-effort: the current AFTR still works, so if an attempt
 // can't finish promptly it's abandoned and retried next interval. Bounding it
-// also bounds how long it holds the shared DHCPv6 WAN lock (see
-// pkg/dhcpv6.lockWAN), so a stuck Information-Request can't starve DHCPv6-PD
-// renewal.
+// also bounds how long it holds the WAN's DHCPv6 client, which runs one
+// exchange at a time (internal/dhcpv6client), so a stuck Information-Request
+// can't starve DHCPv6-PD renewal.
 const rediscoveryTimeout = 2 * time.Minute
 
 // DiscoverFunc runs one AFTR discovery attempt, echoing token on an HB46PP

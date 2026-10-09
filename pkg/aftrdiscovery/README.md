@@ -16,10 +16,11 @@ nothing about softwires.
 | `dnsname.go` | RFC 1035 wire-format name decoding (package doc lives here) |
 | `resolve.go` | AAAA resolution against the Reply's own DNS servers |
 
-## `Discover(ctx, ifaceName, replyTimeout)`
+## `Discover(ctx, ex, replyTimeout)`
 
-One Information-Request with an ORO for DNS servers, AFTR-Name and Information-Refresh-Time, then
-a AAAA lookup of the decoded name.
+One Information-Request with an ORO for DNS servers, AFTR-Name and Information-Refresh-Time, run
+through `ex` (a `dhcpv6.Exchanger`: minuteman's is `internal/dhcpv6client`), then a AAAA lookup of
+the decoded name.
 
 `replyTimeout` bounds **only the Information-Request phase**, not the DNS resolution that
 follows. That split is what makes a timeout unambiguous: it means "nothing answered", reported as

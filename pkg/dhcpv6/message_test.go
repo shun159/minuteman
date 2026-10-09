@@ -3,10 +3,7 @@ package dhcpv6
 import "testing"
 
 func TestMessageMarshalParseRoundTrip(t *testing.T) {
-	xid, err := NewTransactionID()
-	if err != nil {
-		t.Fatalf("NewTransactionID: %v", err)
-	}
+	xid := NewTransactionID(rng)
 	want := &Message{
 		Type: MessageTypeInformationRequest,
 		XID:  xid,
