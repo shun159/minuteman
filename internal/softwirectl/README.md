@@ -10,23 +10,23 @@ whenever the AFTR or the B4 is dynamic:
   hard-switches the softwire (the DS-Lite B4-address change of RFC 7785) and re-discovers the
   AFTR at once, as the VNE may map the new prefix to a different one.
 
-It is written with [molecule](https://github.com/shun159/molecule): a supervision tree of three
+It is written with [molecule](https://github.com/shun159/molecule): a supervision tree of two
 processes.
 
 ```
 softwirectl-sup (rest_for_one)
 ├── softwire        genserver: the datapath, tunnel and netlink calls
-├── aftr-discovery  proc process: runs discovery attempts, cancellable (dynamic AFTR only)
-└── softwirectl     genstatem: the Controller, pure
+└── softwirectl     genstatem: the Controller, pure; discovery runs in an Async of its own
 ```
 
 ## The controller
 
 `Controller` decides everything and does nothing: its `HandleEvent` returns the next phase and
 the requests to send, and the runtime sends them. So the policy is tested by calling it, or by
-running the whole tree in `gensim` with a fake datapath (`sim_test.go`) — migrations, WAN
-changes mid-discovery and mid-drain, a controller crash mid-drain — on a virtual clock, where a
-2h drain cap takes no time.
+running the whole tree in `gensim` with a fake datapath and a fake discovery (`sim_test.go`) —
+migrations, a WAN change mid-drain, a controller crash mid-drain — on a virtual clock, where a 2h
+drain cap takes no time. A WAN change mid-discovery is tested by calling `HandleEvent` itself: in
+gensim the discovery's Async is done before anything can come in between.
 
 ```
            refresh              new AFTR                 primed, nothing lost
@@ -58,13 +58,13 @@ made by `cmd/minuteman` and outlives the processes. A restarted controller start
 the endpoints new flows use), and goes on from there; if the AFTR moved since startup, the
 refresh pacing and HB46PP token died with the old controller, so it re-discovers at once.
 
-The supervisor is `rest_for_one`, each child depending on those before it. Past its restart
+The supervisor is `rest_for_one`, the controller depending on the softwire server. Past its restart
 intensity it gives up, and `startSoftwireControl` fails the whole of minuteman, for whatever
 supervises minuteman to start it cleanly.
 
 ## Discovery
 
-`aftr-discovery` is written against `proc` rather than as a behaviour because it owns a blocking
-call: an attempt runs for up to 2 minutes, in a goroutine tied to the process's context, while
-the process stays free to receive the controller's cancel. `hb46pp.RetryDelay`'s backoff is
-random, so it is computed there too, and the controller stays deterministic.
+A discovery attempt blocks, for up to 2 minutes, which a callback must not: the controller runs it
+as a `molecule.Async`, its outcome arriving as an `AsyncResult`, and a hard switch cancels it with
+`CancelAsync` -- its ctx done, its outcome never delivered. `hb46pp.RetryDelay`'s backoff is
+random, so it is drawn in the Async too, and the controller stays deterministic.

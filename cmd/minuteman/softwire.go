@@ -52,12 +52,12 @@ func startSoftwireControl(ctx context.Context, fail context.CancelCauseFunc, nod
 			DynamicAFTR: aftrDynamic,
 			DynamicB4:   dynamicB4,
 			Initial:     initial.toSoftwirectl(),
+			Discover: func(ctx context.Context, token string) (softwirectl.Discovery, error) {
+				disc, err := discoverAFTROnce(ctx, dhcp, wanIface, identity, token, fallbackDNS)
+				return disc.toSoftwirectl(), err
+			},
+			RetryDelay: hb46pp.RetryDelay,
 		},
-		Discover: func(ctx context.Context, token string) (softwirectl.Discovery, error) {
-			disc, err := discoverAFTROnce(ctx, dhcp, wanIface, identity, token, fallbackDNS)
-			return disc.toSoftwirectl(), err
-		},
-		RetryDelay: hb46pp.RetryDelay,
 	})
 
 	return superviseTree(ctx, fail, node, "softwire control", spec, wg, closeNL)

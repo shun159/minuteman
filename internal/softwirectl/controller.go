@@ -174,14 +174,16 @@ type Data struct {
 // change of RFC 7785) when the B4 is.
 //
 // It is pure: the datapath, the tunnel and the netlink socket are driven by the
-// softwire server ([SoftwireName]), discovery runs in the discovery process
-// ([DiscoveryName]), and the controller only sends them requests and handles
-// their responses.
+// softwire server ([SoftwireName]), which the controller only sends requests
+// to, and discovery, which blocks, runs as an Async.
 type Controller struct {
 	DynamicAFTR bool
 	DynamicB4   bool
 	// Initial is what startup discovered, or the static -aftr.
 	Initial Discovery
+	// Discover and RetryDelay run re-discovery, with a dynamic AFTR.
+	Discover   DiscoverFunc
+	RetryDelay func(error) time.Duration
 	// Logf logs; log.Printf if nil.
 	Logf func(format string, args ...any)
 }
@@ -244,9 +246,7 @@ func (c Controller) HandleEvent(st Phase, d Data, ev genstatem.Event) (Phase, Da
 	case genstatem.StateTimeout:
 		switch e.Msg.(type) {
 		case refresh:
-			return Discovering, d, molecule.Do(molecule.SendRequest{
-				To: DiscoveryName, Req: discoverReq{Token: d.Current.HB46PPToken}, Tag: tag{opDiscover, d.Gen},
-			})
+			return Discovering, d, molecule.Do(c.discover(d.Current.HB46PPToken))
 		case primed:
 			return st, d, molecule.Do(softwire(opCounts, d.Gen, countsReq{}))
 		case drainTick:
@@ -273,6 +273,10 @@ func (c Controller) HandleEvent(st Phase, d Data, ev genstatem.Event) (Phase, Da
 		}
 
 	case genstatem.Info:
+		if a, ok := e.Msg.(molecule.AsyncResult); ok {
+			// Never stale: a hard switch cancels the attempt running.
+			return c.response(st, d, opDiscover, molecule.Response{Value: a.Value, Err: a.Err})
+		}
 		r, ok := e.Msg.(molecule.Response)
 		if !ok {
 			break
@@ -479,7 +483,7 @@ func (c Controller) hardSwitch(st Phase, d Data, b4 netip.Addr) (Phase, Data, []
 	to := d.Current
 	switch st {
 	case Discovering:
-		effs = append(effs, molecule.Cast{To: DiscoveryName, Req: cancelDiscovery{}})
+		effs = append(effs, molecule.CancelAsync{Key: discoverKey{}})
 	case Draining:
 		// New flows are on the new AFTR already: stay there.
 		to = d.Next
