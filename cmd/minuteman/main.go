@@ -32,7 +32,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -40,6 +39,7 @@ import (
 	"github.com/shun159/miniteman/internal/fragpath"
 	"github.com/shun159/miniteman/internal/lanprefix"
 	"github.com/shun159/miniteman/internal/slowpath"
+	"github.com/shun159/miniteman/internal/softwirectl"
 	"github.com/shun159/miniteman/internal/wanextend"
 	"github.com/shun159/miniteman/pkg/aftrdiscovery"
 	"github.com/shun159/miniteman/pkg/datapath"
@@ -274,6 +274,11 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// A part of minuteman that gives up for good -- a supervision tree past
+	// its restart intensity -- ends the whole of it through fail, as a signal
+	// would, and run returns why.
+	ctx, fail := context.WithCancelCause(ctx)
+	defer fail(nil)
 
 	// The DHCPv6-PD lease is acquired before AFTR discovery, not with the rest
 	// of the prefix-delegation setup further down, because on a network that
@@ -466,15 +471,17 @@ func run() error {
 			return err
 		}
 	}
-	// The single owner of the live softwire endpoints (see runAFTRRediscovery).
-	// It runs when the AFTR is dynamic (RFC 4242 periodic re-discovery, applying
-	// a changed AFTR live) and/or the B4 is dynamic (watch the WAN source and
-	// hard-switch on a change -- the DS-Lite B4-address change of RFC 7785). A
-	// fully static run (both -aftr and -b4 given) has nothing to track, so it's
-	// skipped.
+	// The single owner of the live softwire endpoints (see
+	// startSoftwireControl). It runs when the AFTR is dynamic (RFC 4242
+	// periodic re-discovery, applying a changed AFTR live) and/or the B4 is
+	// dynamic (watch the WAN source and hard-switch on a change -- the DS-Lite
+	// B4-address change of RFC 7785). A fully static run (both -aftr and -b4
+	// given) has nothing to track, so it's skipped.
 	aftrDynamic := *aftrAddr == ""
 	if aftrDynamic || dynamicB4 {
-		runAFTRRediscovery(ctx, dp, tun, b4, dynamicB4, aftrDynamic, *wanIface, wanIfindex, identity, disc, pdDNSServers(pdLease), &bgWG)
+		if err := startSoftwireControl(ctx, fail, dp, tun, b4, dynamicB4, aftrDynamic, *wanIface, wanIfindex, identity, disc, pdDNSServers(pdLease), &bgWG); err != nil {
+			return err
+		}
 	}
 	// Follows the softwire path MTU the datapath learns from ICMPv6 Packet Too
 	// Big messages about its own tunnel packets, applying it to the fragment
@@ -494,6 +501,9 @@ func run() error {
 	}
 
 	logStatsUntilDone(ctx, dp, *statsEvery)
+	if err := context.Cause(ctx); !errors.Is(err, context.Canceled) {
+		return err
+	}
 	return nil
 }
 
@@ -725,45 +735,10 @@ type aftrDiscovery struct {
 	hb46ppToken string
 }
 
-// aftrSwitchRetry is how soon the re-discovery loop retries after a *failed
-// live switch*, and the fallback wait when a discovery reports a
-// non-positive refresh interval, rather than waiting a full (day-scale)
-// refresh: short enough to recover promptly, long enough not to hammer the
-// server. (A failed *discovery* instead backs off per hb46pp.RetryDelay for
-// its failure class.)
-const aftrSwitchRetry = 5 * time.Minute
-
-// aftrRediscoveryTimeout bounds one periodic re-discovery attempt. Unlike the
-// initial discovery (which blocks until it succeeds -- no AFTR, no service),
-// a periodic attempt is best-effort: the current AFTR still works, so if an
-// attempt can't finish promptly it's abandoned and retried next interval.
-// Bounding it also bounds how long it holds the shared DHCPv6 WAN lock (see
-// pkg/dhcpv6.lockWAN), so a stuck Information-Request can't starve DHCPv6-PD
-// renewal.
-const aftrRediscoveryTimeout = 2 * time.Minute
-
-// nextRefreshWait clamps a reported refresh interval to a positive sleep: a
-// discovery that reports 0 (a DHCPv6 server may send information-refresh-time=0)
-// falls back to aftrSwitchRetry instead of busy-looping. Used for both the
-// actual sleep and the logged "next refresh in ..." so the two agree.
-func nextRefreshWait(refresh time.Duration) time.Duration {
-	if refresh <= 0 {
-		return aftrSwitchRetry
-	}
-	return refresh
-}
-
 // b4ResolveRetryInterval is how often resolveB4 re-asks the kernel for the B4
 // source at startup while the WAN's route to the AFTR is still absent (the
 // AttachWAN forwarding flip purged it; SolicitRouters is bringing it back).
 const b4ResolveRetryInterval = time.Second
-
-// b4WatchInterval is how often watchB4 re-queries the kernel's chosen B4 source
-// toward the AFTR to notice a WAN-address change (the DS-Lite B4-address change
-// of RFC 7785). Polling rather than subscribing to RTNLGRP_IPV6_IFADDR is a
-// deliberate simplification (see docs/rfc-compliance-backlog.md): home-CPE
-// renumbering is rare and usually rides link events slower than one poll anyway.
-const b4WatchInterval = 30 * time.Second
 
 // resolveB4 asks the kernel which local IPv6 address it would use as the
 // softwire source toward aftr out the WAN interface (RFC 6724 selection, via
@@ -771,10 +746,10 @@ const b4WatchInterval = 30 * time.Second
 // answer is available. At startup the WAN's RA-learned route to the AFTR is
 // briefly gone (AttachWAN's forwarding-enable purge; SolicitRouters restores
 // it), so the first few queries return no source -- that's expected, not fatal.
-// Nor is a source that isn't global (see usableB4): right after AttachWAN
-// bounces the link, the WAN's own global address is DAD-tentative again, and
-// until it is usable the kernel answers with the link-local one, which no AFTR
-// can reach. Blocks until it resolves or ctx is cancelled.
+// Nor is a source that isn't global (see softwirectl.UsableB4): right after
+// AttachWAN bounces the link, the WAN's own global address is DAD-tentative
+// again, and until it is usable the kernel answers with the link-local one,
+// which no AFTR can reach. Blocks until it resolves or ctx is cancelled.
 func resolveB4(ctx context.Context, wanIfindex int, aftr netip.Addr) (netip.Addr, error) {
 	nl, err := netlink.Open()
 	if err != nil {
@@ -789,7 +764,7 @@ func resolveB4(ctx context.Context, wanIfindex int, aftr netip.Addr) (netip.Addr
 			return netip.Addr{}, fmt.Errorf("selecting B4 source toward %s: %w", aftr, err)
 		}
 		switch {
-		case ok && usableB4(src):
+		case ok && softwirectl.UsableB4(src):
 			return src, nil
 		case ok && !loggedNotGlobal:
 			log.Printf("dynamic B4: kernel offers %s toward AFTR %s, not a global address; waiting for the WAN's own (likely still DAD-tentative)", src, aftr)
@@ -803,272 +778,6 @@ func resolveB4(ctx context.Context, wanIfindex int, aftr netip.Addr) (netip.Addr
 			return netip.Addr{}, ctx.Err()
 		case <-time.After(b4ResolveRetryInterval):
 		}
-	}
-}
-
-// nextB4 is the pure decision for whether a freshly-queried B4 source is a
-// change worth acting on, split out from the I/O (watchB4 / handleWANChange) so
-// it's unit-tested without a socket -- the same rationale as
-// internal/wanextend.nextWatchState. A query that returned no source (ok=false:
-// the WAN route is momentarily gone, e.g. mid-renumbering) or an invalid/
-// unchanged address is *not* a change: keep the current B4 rather than switch
-// to something invalid, so a transient blip never breaks the softwire. Nor is a
-// source that isn't global (see usableB4), e.g. the link-local one the kernel
-// falls back to while a renumbered WAN's new global is still DAD-tentative.
-func nextB4(current, queried netip.Addr, ok bool) (b4 netip.Addr, changed bool) {
-	if !ok || !usableB4(queried) || queried == current {
-		return current, false
-	}
-	return queried, true
-}
-
-// usableB4 reports whether a kernel-chosen source can be the B4: the AFTR
-// reaches it across the access network, so it must be a global unicast address
-// (a ULA counts) -- never link-local, loopback, multicast or unspecified.
-func usableB4(addr netip.Addr) bool {
-	return addr.Is6() && addr.IsGlobalUnicast()
-}
-
-// watchB4 polls the kernel's chosen B4 source toward aftr every b4WatchInterval
-// and signals wanChange whenever it observes a change, so the re-discovery loop
-// (the single owner of the datapath endpoints) can re-query and hard-switch.
-// It only signals -- it never touches the datapath and never sends the observed
-// value -- so no stale address rides the channel; the handler re-queries at
-// handling time. The send is non-blocking onto a size-1 latest-wins channel: a
-// pending signal already says "something changed, go look", so coalescing is
-// correct. Registered on wg; returns when ctx is cancelled.
-//
-// It watches the source toward the AFTR minuteman started with; if AFTR
-// re-discovery later moves to a different AFTR, this keeps polling toward the
-// original one. That only matters as a coarse trigger anyway (the handler
-// re-queries toward the current AFTR authoritatively), and on a home CPE's
-// single WAN /64 the selected source is the same toward either AFTR.
-//
-// appliedB4 is the B4 the loop has actually applied (loop-written, watcher-read).
-// Comparing against it, rather than a local "last signalled" value, is what makes
-// the watcher keep re-signalling a change the loop hasn't managed to apply yet
-// (a transient re-query miss or a SwitchAFTR failure) instead of falling silent.
-func watchB4(ctx context.Context, wanIfindex int, aftr netip.Addr, appliedB4 *atomic.Pointer[netip.Addr], wanChange chan<- struct{}, wg *sync.WaitGroup) {
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		nl, err := netlink.Open()
-		if err != nil {
-			log.Printf("dynamic B4: cannot open netlink socket to watch the WAN source: %v (WAN-change re-selection disabled)", err)
-			return
-		}
-		defer nl.Close()
-
-		ticker := time.NewTicker(b4WatchInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-			}
-
-			src, ok, err := nl.SourceForDest(wanIfindex, aftr)
-			if err != nil {
-				log.Printf("dynamic B4: querying the WAN source failed: %v (will retry)", err)
-				continue
-			}
-			if _, changed := nextB4(*appliedB4.Load(), src, ok); !changed {
-				continue
-			}
-			log.Printf("dynamic B4: WAN source now %s, differs from the applied B4 -- signalling re-selection", src)
-			select {
-			case wanChange <- struct{}{}:
-			default: // a signal is already pending; it covers this change too
-			}
-		}
-	}()
-}
-
-// AFTR migration policy (the datapath mechanism is pkg/datapath's
-// BeginMigration/Cutover/CompleteMigration; see docs/rfc-compliance-backlog.md's
-// AFTR re-discovery entry for why it is shaped this way).
-const (
-	// aftrPrimingDuration is how long the datapath records flows before the
-	// cutover. It is the window in which a flow must send or receive at least
-	// one packet to be recognised as pre-existing -- and that recording is the
-	// only way to tell, afterwards, a pre-existing flow's next packet from a
-	// brand-new flow's first one. Anything worth protecting (a call, a stream,
-	// a download, a game) has sub-second gaps, so a minute is generous; a flow
-	// that stays completely silent throughout is the accepted, bounded cost.
-	aftrPrimingDuration = 60 * time.Second
-
-	// aftrDrainInterval is how often the drain reclaims idle flows and checks
-	// whether anything is still pinned to the old AFTR.
-	aftrDrainInterval = 30 * time.Second
-
-	// aftrMaxDrainDuration caps how long the old AFTR is held open for the
-	// flows still pinned to it. It is only a safety valve: the drain normally
-	// ends when the last pinned flow falls idle. Keeping two AFTRs alive
-	// indefinitely isn't an option, so a flow still running after this does
-	// break -- which is why the cap is generous rather than tight.
-	aftrMaxDrainDuration = 2 * time.Hour
-)
-
-// aftrFlowIdle bounds how long a pinned flow may go silent -- in *either*
-// direction, since the datapath refreshes from both -- before the drain stops
-// holding the old AFTR for it. An active flow refreshes continuously, so these
-// only need to exceed a normal gap in its traffic; and once the AFTR's own NAT
-// entry has timed out, the pin is worthless anyway.
-var aftrFlowIdle = datapath.FlowIdleTimeouts{
-	TCP:   30 * time.Minute,
-	Other: 5 * time.Minute,
-}
-
-// errMigrationAbandoned reports that a migration was called off *safely*: the
-// datapath was left on the AFTR it was already using, which still works. The
-// caller should keep that AFTR and try again later rather than treat it as a
-// failure to act on.
-var errMigrationAbandoned = errors.New("AFTR migration abandoned")
-
-// errMigrationInterrupted reports that a graceful migration bailed out because
-// the WAN address changed (dynamic B4): a B4 change can't be drained -- the
-// AFTR's NAT state dies with the address -- so the pending flow-preserving move
-// is moot and the re-discovery loop must hard-switch instead. migrateAFTR
-// leaves the datapath mid-migration here on purpose; the loop's SwitchAFTR ends
-// any in-progress migration safely, so cleaning up here would be redundant.
-var errMigrationInterrupted = errors.New("AFTR migration interrupted by a WAN-address change")
-
-// abortMigration rolls a pre-cutover migration back to the AFTR still carrying
-// traffic. On success it returns cause unchanged, so an abandonment stays an
-// abandonment.
-//
-// If the rollback itself fails it returns a plain error that deliberately does
-// *not* carry cause's sentinel: a failed rollback is not a benign abandonment.
-// It leaves the datapath stuck in PRIMING, which blocks every later migration
-// (BeginMigration requires STEADY), so the caller must see a failure rather
-// than a "we safely stayed put".
-func abortMigration(dp *datapath.Loader, cause error) error {
-	if err := dp.AbortMigration(); err != nil {
-		return fmt.Errorf("rolling the migration back after %v failed, "+
-			"leaving the datapath mid-migration: %w", cause, err)
-	}
-	return cause
-}
-
-// migrateAFTR moves the datapath from oldAFTR to newAFTR without breaking the
-// flows that predate the move.
-//
-// It primes first: for aftrPrimingDuration the datapath keeps using oldAFTR but
-// records every softwire flow it sees. Only then does it cut over, after which
-// a recorded flow still routes to oldAFTR while anything new goes to newAFTR --
-// the distinction cannot be made at the cutover itself, because a flow-table
-// miss looks identical for a new flow and for a pre-existing flow's next packet
-// (UDP/QUIC/ICMP have no start marker), so it has to be learned beforehand.
-// oldAFTR is finally retired once nothing is pinned to it (or the drain cap
-// expires).
-//
-// It blocks until the migration finishes, is abandoned, or ctx is cancelled.
-// That is deliberate: it serialises migrations against the re-discovery loop
-// that calls it (which runs on a day-scale refresh, so blocking it for a drain
-// costs nothing), and the datapath only supports one migration at a time.
-//
-// wanChange (dynamic B4 only; nil otherwise) interrupts both long waits -- the
-// priming window and the drain -- so a WAN-address change never queues behind a
-// potentially-hours-long drain. On that signal it returns errMigrationInterrupted
-// *without* rolling back, leaving the datapath mid-migration on purpose: the
-// caller's SwitchAFTR ends any in-progress migration safely (a B4 change can't
-// be drained anyway, so the graceful move is moot).
-//
-// Except on ctx cancellation -- where the process is exiting and the XDP
-// programs are about to be detached anyway -- or a WAN-change interruption, it
-// never returns leaving a migration half-applied: any failure before the
-// cutover aborts back to oldAFTR, and after the cutover it keeps retrying the
-// retirement.
-func migrateAFTR(ctx context.Context, dp *datapath.Loader, tun *slowpath.Tunnel, b4, oldAFTR, newAFTR netip.Addr, wanChange <-chan struct{}) error {
-	// The affinity counters are cumulative across the process, so baseline
-	// them: what matters is whether *this* priming pass lost any flow.
-	before, err := dp.Stats()
-	if err != nil {
-		return fmt.Errorf("reading datapath stats: %w", err)
-	}
-
-	if err := dp.BeginMigration(b4, newAFTR); err != nil {
-		return err
-	}
-	log.Printf("AFTR migration: priming %v on %s before moving to %s", aftrPrimingDuration, oldAFTR, newAFTR)
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-wanChange:
-		return errMigrationInterrupted
-	case <-time.After(aftrPrimingDuration):
-	}
-
-	after, err := dp.Stats()
-	if err != nil {
-		return abortMigration(dp, fmt.Errorf("reading datapath stats: %w", err))
-	}
-
-	// A flow the datapath couldn't record may well be one that predates the
-	// switch, and cutting over would move it to an AFTR holding no NAT state
-	// for it. Staying on an AFTR that still works is the safe answer. (The
-	// datapath only counts a genuinely full table here -- see the BPF_ANY note
-	// on touch_flow_affinity -- so this isn't tripped by a benign insert race
-	// between CPUs recording the same flow.)
-	if lost := after.AffinityInsertFail - before.AffinityInsertFail; lost > 0 {
-		log.Printf("AFTR migration: abandoning -- the flow-affinity table filled up, so %d flow(s) went "+
-			"unrecorded and would break at the cutover; staying on %s", lost, oldAFTR)
-		return abortMigration(dp, errMigrationAbandoned)
-	}
-
-	if err := dp.Cutover(); err != nil {
-		return abortMigration(dp, err)
-	}
-	// Repoint the fragmentation slow path at the new AFTR now that the fast path
-	// has cut over to it, rather than after the (possibly hours-long) drain: new
-	// flows are on newAFTR, so their fragments must reassemble/encapsulate
-	// through it too. The trade-off is that the draining flows' own fragments
-	// (a rare corner) fall to the kernel with the old remote until they finish
-	// -- documented in docs/rfc-compliance-backlog.md. Best-effort: a failure
-	// only lags fragmentation, not the fast path.
-	if err := tun.SetEndpoints(b4, newAFTR); err != nil {
-		log.Printf("AFTR migration: %v", err)
-	}
-	log.Printf("AFTR migration: cut over to %s; the %d flow(s) recorded on %s stay there until they fall idle",
-		newAFTR, after.AffinityInsert-before.AffinityInsert, oldAFTR)
-
-	deadline := time.Now().Add(aftrMaxDrainDuration)
-	ticker := time.NewTicker(aftrDrainInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-wanChange:
-			return errMigrationInterrupted
-		case <-ticker.C:
-		}
-
-		remaining, err := dp.GCFlowAffinity(aftrFlowIdle)
-		if err != nil {
-			log.Printf("AFTR migration: draining %s: %v (retrying)", oldAFTR, err)
-			continue
-		}
-		if remaining > 0 && time.Now().Before(deadline) {
-			continue
-		}
-		if remaining > 0 {
-			log.Printf("AFTR migration: drain cap of %v reached with %d flow(s) still on %s; retiring it anyway",
-				aftrMaxDrainDuration, remaining, oldAFTR)
-		}
-
-		if err := dp.CompleteMigration(); err != nil {
-			// Retried rather than returned: leaving the datapath mid-drain
-			// would block every later migration.
-			log.Printf("AFTR migration: retiring %s: %v (retrying)", oldAFTR, err)
-			continue
-		}
-		log.Printf("AFTR migration: complete, %s retired", oldAFTR)
-		return nil
 	}
 }
 
@@ -1212,279 +921,6 @@ func discoverViaHB46PP(ctx context.Context, dnsServers []netip.Addr, identity hb
 		refresh:     result.RefreshInterval,
 		hb46ppToken: result.Provisioning.Token,
 	}, nil
-}
-
-// rediscovery is the running state of the AFTR/B4 re-discovery loop: the sole
-// owner of the live softwire endpoints. Keeping it in one goroutine is a
-// correctness requirement -- two writers driving the next-hop slots would
-// recreate the concurrent-slot-write hazard pkg/datapath's migration API guards
-// against -- so both the periodic AFTR re-discovery and the WAN-change B4 switch
-// run here, and the WAN watcher (watchB4) merely signals.
-type rediscovery struct {
-	dp          *datapath.Loader
-	tun         *slowpath.Tunnel // repointed at the new endpoints after an AFTR migration or B4 switch
-	nl          *netlink.Socket  // re-queries the B4 source on a WAN-change signal; nil for a static B4
-	wanIface    string           // for DHCPv6/HB46PP re-discovery
-	wanIfindex  int              // for the B4 source re-query
-	identity    hb46ppIdentity   // HB46PP client identity for re-discovery
-	aftrDynamic bool             // AFTR was discovered (has refresh semantics), vs. a static -aftr
-	wanChange   <-chan struct{}  // WAN-address change signal from watchB4; nil for a static B4
-	// fallbackDNS is the resolver set to hand HB46PP on a re-discovery whose
-	// Information-Request goes unanswered, mirroring startup (see
-	// discoverAFTROnce). It's the DHCPv6-PD lease's servers as of startup and
-	// is not refreshed from later renewals -- the same startup-set-wins
-	// simplification the -dns-proxy limitation noted on runAFTRRediscovery has.
-	fallbackDNS []netip.Addr
-
-	current   aftrDiscovery // the AFTR in use plus its refresh pacing/token
-	currentB4 netip.Addr    // the B4 source in use (this goroutine's working copy)
-	// appliedB4 mirrors currentB4 for watchB4 to read (this loop is the only
-	// writer). watchB4 must compare the WAN source against the B4 actually
-	// *applied*, not against its own last-signalled value: if the handler
-	// declines a change (a transient re-query miss, or a SwitchAFTR failure),
-	// appliedB4 stays put, so the watcher keeps re-signalling until the switch
-	// really lands rather than going silent on a change it already reported.
-	appliedB4 *atomic.Pointer[netip.Addr]
-}
-
-// runAFTRRediscovery starts the single-owner endpoint loop and, for a dynamic
-// B4, the WAN-source watcher that feeds it. It runs when the AFTR is dynamic
-// (RFC 4242 periodic re-discovery, applying a *changed* AFTR via the
-// flow-preserving migrateAFTR) and/or the B4 is dynamic (the DS-Lite B4-address
-// change of RFC 7785: on a WAN-address change, hard-switch the softwire source
-// via dp.SwitchAFTR then re-trigger AFTR discovery at once, as the VNE may map
-// the new prefix to a different AFTR). The hard switch breaks in-flight flows:
-// RFC 7785 §4 recommends the AFTR migrate its NAT state to the new B4 instead,
-// but minuteman can't rely on the AFTR doing so, and its own state dies with the
-// address, so a clean cut is the only safe option. A re-discovery that yields
-// the same AFTR is a no-op; a
-// failed or abandoned migration keeps the current AFTR, which still works, and
-// retries sooner. Everything is registered on wg so run() waits for it on
-// shutdown.
-//
-// Known limitations, each tracked in docs/rfc-compliance-backlog.md:
-//   - A VNE that round-robins its AFTR name across several addresses sees a
-//     switch each refresh (the equality check compares a single resolved
-//     address, not set membership) -- benign at day-scale intervals.
-//   - If a re-discovery's DNS servers differ from the startup ones, a running
-//     -dns-proxy keeps forwarding to the startup set (it isn't reconfigured
-//     here).
-func runAFTRRediscovery(ctx context.Context, dp *datapath.Loader, tun *slowpath.Tunnel, b4 netip.Addr, dynamicB4, aftrDynamic bool, wanIface string, wanIfindex uint32, identity hb46ppIdentity, initial aftrDiscovery, fallbackDNS []netip.Addr, wg *sync.WaitGroup) {
-	var wanChange chan struct{}
-	appliedB4 := &atomic.Pointer[netip.Addr]{}
-	appliedB4.Store(&b4)
-	if dynamicB4 {
-		// Size-1 latest-wins: a pending "something changed, go look" already
-		// covers any later change, so watchB4's send coalesces onto it.
-		wanChange = make(chan struct{}, 1)
-		watchB4(ctx, int(wanIfindex), initial.aftr, appliedB4, wanChange, wg)
-	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		r := &rediscovery{
-			dp: dp, tun: tun, wanIface: wanIface, wanIfindex: int(wanIfindex),
-			identity: identity, aftrDynamic: aftrDynamic, wanChange: wanChange,
-			fallbackDNS: fallbackDNS,
-			current:     initial, currentB4: b4, appliedB4: appliedB4,
-		}
-		if dynamicB4 {
-			// The watcher only signals; this loop re-queries the source itself at
-			// handling time (so no stale value rides the channel), which needs its
-			// own socket. A failure here just disables WAN-change re-selection --
-			// periodic AFTR re-discovery, if any, still runs.
-			nl, err := netlink.Open()
-			if err != nil {
-				log.Printf("dynamic B4: cannot open netlink socket to re-select the WAN source: %v (WAN-change re-selection disabled)", err)
-			} else {
-				r.nl = nl
-				defer nl.Close()
-			}
-		}
-
-		immediate := false // re-run AFTR discovery now (set after a WAN switch)
-		for {
-			var refreshC <-chan time.Time
-			var timer *time.Timer
-			if aftrDynamic {
-				wait := nextRefreshWait(r.current.refresh)
-				if immediate {
-					wait = 0
-				}
-				timer = time.NewTimer(wait)
-				refreshC = timer.C
-			}
-			immediate = false
-
-			select {
-			case <-ctx.Done():
-				if timer != nil {
-					timer.Stop()
-				}
-				return
-			case <-wanChange:
-				if timer != nil {
-					timer.Stop()
-				}
-				if r.handleWANChange(false) {
-					immediate = aftrDynamic
-				}
-			case <-refreshC:
-				interrupted, migrationPending := r.rediscover(ctx)
-				if ctx.Err() != nil { // lifetime ctx cancelled -> shutdown
-					return
-				}
-				if interrupted { // a WAN change cut the attempt short
-					if r.handleWANChange(migrationPending) {
-						immediate = aftrDynamic
-					}
-				}
-			}
-		}
-	}()
-}
-
-// rediscover runs one bounded AFTR re-discovery attempt and, on a changed AFTR,
-// the flow-preserving migration. It updates r.current in place.
-//
-// interrupted is true when a WAN-address change (r.wanChange) cut the attempt
-// short -- either during the discovery phase or during migrateAFTR's waits; the
-// caller then hard-switches via handleWANChange. migrationPending distinguishes
-// the two: a migration cut mid-flight leaves the datapath mid-migration (so
-// handleWANChange must end it even if it ends up not switching), whereas an
-// interrupted discovery started no migration. All non-interrupt outcomes
-// (success, no change, discovery failure, a failed/abandoned migration that
-// stays on the working AFTR) return interrupted=false.
-func (r *rediscovery) rediscover(ctx context.Context) (interrupted, migrationPending bool) {
-	// Bound the attempt (see aftrRediscoveryTimeout): it's best-effort and must
-	// not hold the shared DHCPv6 WAN lock indefinitely.
-	attemptCtx, cancel := context.WithTimeout(ctx, aftrRediscoveryTimeout)
-	defer cancel()
-
-	// Run discovery in a goroutine so a WAN-address change interrupts the
-	// (up-to-aftrRediscoveryTimeout) discovery phase too, not just migrateAFTR's
-	// waits -- otherwise a renumbering overlapping a periodic re-discovery would
-	// leave the softwire on a stale B4 for up to that long. resultCh is buffered,
-	// so an abandoned attempt's goroutine still completes its send and never
-	// leaks; the deferred cancel aborts that attempt promptly.
-	type result struct {
-		disc aftrDiscovery
-		err  error
-	}
-	resultCh := make(chan result, 1)
-	wanIface, identity, token, fallbackDNS := r.wanIface, r.identity, r.current.hb46ppToken, r.fallbackDNS
-	go func() {
-		next, err := discoverAFTROnce(attemptCtx, wanIface, identity, token, fallbackDNS)
-		resultCh <- result{next, err}
-	}()
-
-	var res result
-	select {
-	case <-ctx.Done(): // lifetime ctx cancelled -> shutdown
-		return false, false
-	case <-r.wanChange:
-		// A WAN-address change is more urgent than finishing this discovery:
-		// abort it (deferred cancel) and let the caller hard-switch. No migration
-		// has started, so migrationPending is false; discovery is re-triggered
-		// right after the switch.
-		return true, false
-	case res = <-resultCh:
-	}
-
-	if res.err != nil {
-		if ctx.Err() != nil { // lifetime ctx cancelled -> shutdown
-			return false, false
-		}
-		delay := hb46pp.RetryDelay(res.err)
-		log.Printf("AFTR re-discovery failed: %v (keeping %s, retrying in %v)", res.err, r.current.aftr, delay.Round(time.Second))
-		r.current.refresh = delay
-		return false, false
-	}
-	next := res.disc
-
-	if next.aftr == r.current.aftr {
-		log.Printf("AFTR re-discovery: unchanged (%s), next refresh in %v", r.current.aftr, nextRefreshWait(next.refresh).Round(time.Second))
-		r.current = next
-		return false, false
-	}
-
-	// Migrate rather than switch outright: this blocks for the priming window
-	// and the drain that follow, which is fine -- re-discovery runs on a
-	// day-scale refresh, and serialising here is what keeps the datapath's
-	// one-migration-at-a-time rule true. r.wanChange lets a WAN-address change
-	// interrupt even a multi-hour drain.
-	if err := migrateAFTR(ctx, r.dp, r.tun, r.currentB4, r.current.aftr, next.aftr, r.wanChange); err != nil {
-		if ctx.Err() != nil {
-			return false, false
-		}
-		if errors.Is(err, errMigrationInterrupted) {
-			// The datapath is left mid-migration on purpose; handleWANChange's
-			// SwitchAFTR ends it. Don't advance r.current -- the move to next
-			// didn't complete.
-			return true, true
-		}
-		if !errors.Is(err, errMigrationAbandoned) {
-			// migrateAFTR leaves the datapath on the old AFTR, so it is still
-			// working; just try the whole move again later.
-			log.Printf("AFTR migration to %s failed: %v (staying on %s)", next.aftr, err, r.current.aftr)
-		}
-		r.current.refresh = aftrSwitchRetry
-		return false, false
-	}
-	log.Printf("AFTR re-discovery: now on %s (next refresh in %v)", next.aftr, nextRefreshWait(next.refresh).Round(time.Second))
-	r.current = next
-	return false, false
-}
-
-// handleWANChange re-queries the kernel's chosen B4 source toward the current
-// AFTR and, if it genuinely changed, hard-switches the softwire source onto it
-// (dp.SwitchAFTR, which also ends any migration in progress). It re-queries
-// rather than trusting the watcher's signal, so a stale value never rides the
-// channel. It returns true when a switch happened (so the caller re-triggers
-// AFTR discovery).
-//
-// migrationPending is true when this follows a migrateAFTR that bailed for a
-// WAN change: if the authoritative re-query no longer sees a change (a transient
-// WAN blip, or a netlink error), the interrupted migration must still be ended
-// -- otherwise it would leave the datapath mid-migration and block every later
-// one -- so a no-change reset hard-switches onto the current endpoints to force
-// STEADY.
-func (r *rediscovery) handleWANChange(migrationPending bool) (switched bool) {
-	if r.nl == nil { // WAN-change re-selection disabled (socket open failed)
-		return false
-	}
-
-	queried, ok, err := r.nl.SourceForDest(r.wanIfindex, r.current.aftr)
-	if err != nil {
-		log.Printf("dynamic B4: re-selecting the WAN source failed: %v (keeping %s)", err, r.currentB4)
-		ok = false
-	}
-	newB4, changed := nextB4(r.currentB4, queried, ok)
-	if !changed {
-		if migrationPending {
-			if err := r.dp.SwitchAFTR(r.currentB4, r.current.aftr); err != nil {
-				log.Printf("dynamic B4: ending the interrupted migration failed: %v", err)
-			}
-		}
-		return false
-	}
-
-	if err := r.dp.SwitchAFTR(newB4, r.current.aftr); err != nil {
-		log.Printf("dynamic B4: switching softwire source to %s failed: %v (keeping %s)", newB4, err, r.currentB4)
-		return false
-	}
-	// Repoint the fragmentation slow path at the new source. Best-effort: the
-	// fast path already carries whole packets on the new softwire, and only
-	// fragmentation lags if this fails, until the next successful update.
-	if err := r.tun.SetEndpoints(newB4, r.current.aftr); err != nil {
-		log.Printf("dynamic B4: %v", err)
-	}
-	log.Printf("dynamic B4: switched softwire source to %s toward AFTR %s; re-triggering AFTR discovery", newB4, r.current.aftr)
-	r.currentB4 = newB4
-	r.appliedB4.Store(&newB4) // let watchB4 see the new baseline (stops re-signalling)
-	return true
 }
 
 // attachLAN attaches the encap program to spec's interface and configures

@@ -81,9 +81,9 @@ because each has a single caller.
 ## Wiring
 
 `cmd/minuteman` creates the tunnel right after `SetB4Config` for **every** run, static or
-dynamic, and hands it to `runAFTRRediscovery` (the single owner of the live softwire endpoints)
-and to `watchTunnelPMTU`. Its `defer Close()` runs after `bgWG.Wait()` — so the rediscovery
-goroutine that may repoint it has drained — but before `dp.Close()`.
+dynamic, and hands it to `internal/softwirectl` (the single owner of the live softwire endpoints)
+and to `watchTunnelPMTU`. Its `defer Close()` runs after `bgWG.Wait()` — so the softwire control
+tree that may repoint it has stopped — but before `dp.Close()`.
 
 ## Testing
 

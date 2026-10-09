@@ -28,7 +28,7 @@ keeps `dhcpv6.InformationRequest`'s RFC-correct unbounded retry.
 
 `Result.RefreshInterval` is RFC 4242's refresh time (defaulting to §2's 24h when the server sends
 none). It is **reported, not acted on** — periodic re-discovery is a caller-level policy
-decision, and `cmd/minuteman`'s `runAFTRRediscovery` is where it happens. Contrast
+decision, and `internal/softwirectl`'s controller is where it happens. Contrast
 `pkg/prefixdelegation.Maintain`, which does drive its own renewal ladder: a lease that is never
 renewed actually expires and breaks LAN connectivity, whereas a stale AFTR reading merely
 becomes stale.
