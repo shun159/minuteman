@@ -9,7 +9,8 @@ reverse.
 | --- | --- | --- |
 | [`cliconfig`](cliconfig/) | parses flag *values* (`-lan`, `-dns-server`, `-wan-dst-mac`, `-tcp-mss-clamp`) into typed config | — |
 | [`lanprefix`](lanprefix/) | DHCPv6-PD policy: carve one `/64` per LAN interface, assign it, advertise it (On-Link **set**) | `prefixdelegation`, `routeradvert` |
-| [`wanextend`](wanextend/) | NDProxy policy: learn the shared WAN `/64`, advertise it (On-Link **cleared**), maintain `/128` host routes | `ndproxy`, `routeradvert` |
+| [`wanextend`](wanextend/) | NDProxy policy: learn the shared WAN `/64`, advertise it (On-Link **cleared**), the `/128` host routes | `routeradvert` |
+| [`ndppd`](ndppd/) | the RFC 4389 ND proxy: a molecule process owning the WAN's `AF_PACKET` and raw ICMPv6 sockets and each LAN's (`net/socket`), running `pkg/ndproxy.State`, and one owning the host routes | `ndproxy` |
 | [`slowpath`](slowpath/) | the companion `ip6tnl` for softwire reassembly + the fragmentation fallback | `netlink` |
 | [`fragpath`](fragpath/) | the companion veth pairs the in-XDP softwire fragmenter bounces clones through | `netlink`, `datapath` |
 | [`dhcpv4server`](dhcpv4server/) | the LAN DHCPv4 server: a molecule process per `-lan` interface owning its AF_PACKET socket (`net/socket`) and lease pool, answering with `pkg/dhcpv4.Handle` | `dhcpv4` |

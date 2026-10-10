@@ -7,7 +7,7 @@
 // interface with On-Link cleared so LAN clients route everything -- not
 // just off-/64 traffic -- through this CPE, and maintains per-host routes
 // (HostRoutes) so the kernel forwards a target's traffic out the correct
-// LAN interface once pkg/ndproxy.Serve confirms it's actually there.
+// LAN interface once internal/ndppd confirms it's actually there.
 // Serve ties all of this together into the single call cmd/minuteman
 // makes for -ndproxy.
 package wanextend

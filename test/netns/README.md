@@ -34,7 +34,7 @@ How the LAN gets IPv6 reachability is a separate, orthogonal choice, selectable 
   minuteman's `internal/wanextend.DiscoverPrefix` learns `WAN_PREFIX` from; `smoketest.sh` then confirms the
   actual RFC 4389 proxying behavior by having `mm-isp` — L2-adjacent to `mm-cpe`'s WAN link and itself the
   origin of the on-link `WAN_PREFIX` RA there — ping `mm-host`'s SLAAC'd address directly: that only
-  succeeds if minuteman's `pkg/ndproxy` intercepted the resulting Neighbor Solicitation on the WAN link,
+  succeeds if minuteman's `internal/ndppd` intercepted the resulting Neighbor Solicitation on the WAN link,
   actively verified `mm-host` via an LAN-side probe, answered on its behalf, and `internal/wanextend
   .HostRoutes` installed the resulting host route. `setup.sh` also disables RFC 4941 privacy addresses on
   `mm-host` (`use_tempaddr=0`) so there's exactly one deterministic SLAAC address for `smoketest.sh` to
