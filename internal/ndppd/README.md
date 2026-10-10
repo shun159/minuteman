@@ -36,7 +36,7 @@ bound to its interface, both hop limits 255 (RFC 4861 §6.1.2).
 A genserver, pure: its state is `pkg/ndproxy`'s `State`, a `Clone` of which each event that changes
 it is applied to; its sends and socket re-arms are effects; a `sweep` timer every `SweepInterval`
 retransmits the probes due and lets hosts gone quiet expire. The clock the `State` is kept by is
-the injected `now`, which a behaviour has no other way to read. Every socket is `active once`,
+`now`, which molecule fills with the process's (`molecule.Clocked`) and tests set. Every socket is `active once`,
 re-armed after each datagram.
 
 | Message | Then |

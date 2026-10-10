@@ -29,8 +29,8 @@ client's link-layer address, a `syscall.SockaddrLinklayer`. The reply goes out w
 `SendActiveEffect(..., socket.Once)`, which also asks for the next request: one at a time, the rest
 waiting in the kernel. A pool clone costs the size of a home LAN's leases, a few hundred at most.
 
-Leases are kept by the clock, which a behaviour has no way to read: `now` is a field, `time.Now` in
-production and fixed in tests.
+Leases are kept by the clock: `now` is a field, which molecule fills with the process's clock
+(`molecule.Clocked`) -- `time.Now`, or gensim's virtual one -- and tests set.
 
 A failed send is logged (the client retransmits); a failed read stops the server, and its supervisor
 starts it again, with a fresh pool -- in-memory, as the leases always were.
