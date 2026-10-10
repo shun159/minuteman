@@ -98,8 +98,8 @@ Two details worth keeping in mind:
   deliberately isn't sending.
 - **The learned MTU is acted on in two places with two different owners.** Encap clamps its effective MTU
   against it per packet (`tunnel_pmtu_for`), immediately. The fragment size (`b4_config.frag_unit`) and
-  the companion ip6tnl's device MTU are recomputed by userspace instead (`cmd/minuteman`'s
-  `watchTunnelPMTU`, a 2s tick), because `encap_fragment_outer` and the `xdp_softwire_frag<i>` programs
+  the companion ip6tnl's device MTU are recomputed by userspace instead (`internal/tunnelpmtu`,
+  a 2s tick), because `encap_fragment_outer` and the `xdp_softwire_frag<i>` programs
   read `frag_unit` at different moments for the same packet — a value that changed in between would
   produce a fragment set that can never reassemble. In the seconds between the two, an oversized packet
   takes the ip6tnl fallback (`EncapFragSlow`) rather than being fragmented too big. Readings age out after
@@ -209,7 +209,7 @@ constants above rather than from inference about the network.
   other update, RFC 9818 (LAN-side prefix delegation, LPD-1..LPD-10), is out of scope for a single-tier CPE.
 - `internal/wanextend` re-advertises the shared WAN prefix to the LAN with RFC 4861 §6.2.1's *default*
   lifetimes (30 days valid / 7 days preferred, `ra.go`'s `validLifetime`/`preferredLifetime`) because
-  `DiscoverPrefix`/`WatchChanges` read the prefix back from the kernel's address list, and
+  `DiscoverPrefix` and the watch process read the prefix back from the kernel's address list, and
   `pkg/netlink`'s `parseIfAddrMsg` doesn't decode `IFA_CACHEINFO` — so the WAN RA's actual remaining
   lifetimes are unknown to it. The NTT East IPoE spec's 光ネクスト 編 (§2.4.2.1.2) says the network's RA *may* carry
   Preferred Lifetime = 0, so this is reachable in the target deployment, not just in theory: minuteman

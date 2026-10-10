@@ -12,7 +12,7 @@ import (
 // to LAN clients: RFC 4861 §6.2.1's recommended AdvValidLifetime/
 // AdvPreferredLifetime defaults. The WAN-side RA that actually assigned
 // this prefix carries its own (possibly different) lifetimes, but
-// DiscoverPrefix/WatchChanges read the prefix back from the kernel's
+// DiscoverPrefix and the watch read the prefix back from the kernel's
 // address list (pkg/netlink.Socket.Addrs), which doesn't expose
 // IFA_CACHEINFO's remaining lifetimes -- a known simplification, not a
 // protocol requirement.

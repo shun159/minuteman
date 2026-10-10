@@ -13,14 +13,14 @@ alternative models of the same thing, and `cmd/minuteman` rejects both at once b
 starts.
 
 `cmd/minuteman`'s `runNDProxy` starts `internal/ndppd`'s tree, handing it `HostRoutes`, then
-calls `Serve`.
+blocks on `DiscoverPrefix`, has `Config.Extend` advertise the prefix, and starts `Spec`'s watch.
 
 ## Flow
 
 ```
 DiscoverPrefix ──► raManager.sync ──► internal/radvd's advertiser per LAN iface (OnLink: false)
       │
-      └──► WatchChanges ──(renumbering)──► raManager.sync with the new prefix
+      └──► the watch process ──(renumbering)──► raManager.sync with the new prefix
 
 internal/ndppd on the WAN iface (cmd/minuteman starts it, independently)
       ├─ host confirmed ──► HostRoutes.Install  (/128 out the confirming LAN iface)
@@ -38,8 +38,8 @@ network. It has to block: RA/SLAAC lands asynchronously some time after the WAN 
 to extend onto the LAN — NDProxy's whole premise. The poll interval isn't an RFC cadence, just
 "notice quickly without busy-polling".
 
-`WatchChanges(ctx, wanIfindex, current, onChange)` re-polls every **5 minutes** and calls
-`onChange` only for a genuinely different, valid reading. The much slower cadence is
+The watch process (`watch.go`) re-polls every **5 minutes** and re-extends only a genuinely
+different, valid reading. The much slower cadence is
 deliberate: there is no DHCPv6-style T1/T2 ladder to drive here — the kernel manages its own
 address lifetimes off whatever RAs arrive, so this package can only notice a renumbering after
 the fact — and RFC 4861 mandates no cadence for doing so. Five minutes is a CPE-local policy
@@ -76,7 +76,7 @@ lifetimes intact. Advertising the superseded prefix with `PreferredLifetime=0` t
 promptly is RFC 9096 territory and an open item in `docs/rfc-compliance-backlog.md`.
 
 The advertised lifetimes are RFC 4861 §6.2.1's recommended defaults (30 days valid / 7 days
-preferred), **not** the WAN RA's actual remaining lifetimes: `DiscoverPrefix`/`WatchChanges`
+preferred), **not** the WAN RA's actual remaining lifetimes: `DiscoverPrefix` and the watch
 read the prefix back from the kernel's address list, which doesn't expose `IFA_CACHEINFO`. A
 known simplification, not a protocol requirement.
 
@@ -95,25 +95,34 @@ confirmed the target.
 harmless — nothing routes to it once the proxy stops confirming the target — and a later
 reactivation's `Install` overwrites it via `NLM_F_REPLACE` anyway.
 
-### `serve.go` — wiring it together
+### `watch.go` — extending the prefix, and watching it
 
-`Serve(ctx, wanIfindex, lanIfaces, rdnssByIface, adv, wg)` blocks on the initial
-`DiscoverPrefix` (nothing else can usefully start first, the same rationale
-`runPrefixDelegation` applies to its own initial `Acquire`), has `adv` advertise the prefix on
-every LAN interface, then starts the `WatchChanges` goroutine, registered on the caller's
-`sync.WaitGroup` so `cmd/minuteman`'s shutdown waits for it.
+`Config` is what the prefix is extended onto: the WAN interface, the LAN interfaces, their RDNSS
+addresses and the advertisers (`internal/radvd`). `Config.Extend(prefix)` has every LAN
+interface advertise it. `cmd/minuteman` extends the prefix `DiscoverPrefix` found (nothing else
+can usefully start first, the same rationale `runPrefixDelegation` applies to its own initial
+`Acquire`), then starts `Spec`, a molecule tree:
 
-A non-nil return means the initial discovery failed or was cancelled. Past that point `Serve`
-returns nil and leaves the watch running until `ctx` is cancelled.
+```
+wanextend (one_for_one)
+└── wanextend watch   genserver: re-reads the WAN prefix on a timer
+```
 
-`rdnssByIface` is forwarded to every LAN RA worker and carries the same meaning as in
+The watch's state is the prefix extended. Each tick reads the WAN's address list
+(`discoverPrefixOnce`) and, if `nextWatchState` calls it a change, logs and extends it anew. It is
+not pure — the tick is a netlink dump and the advertisers' casts, done as it is handled — the
+decision being `nextWatchState`'s. It reads at once on start: a restarted watch doesn't know what
+its last incarnation extended, so one the WAN has meanwhile been renumbered under extends the
+new prefix straight away.
+
+`Config.RDNSS` is forwarded to every LAN RA worker and carries the same meaning as in
 `internal/lanprefix`: LAN interface → the link-local address `internal/dnsproxy` actually bound
 there, so an RDNSS option is only ever advertised for a resolver that really answers.
 
 ## Testing
 
 ```sh
-go test ./internal/wanextend/          # nextWatchState
+go test ./internal/wanextend/          # nextWatchState, the watch process
 ```
 
 Everything else is socket and netlink I/O, exercised end-to-end by the netns rig with

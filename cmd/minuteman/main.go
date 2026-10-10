@@ -31,7 +31,6 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -46,6 +45,7 @@ import (
 	"github.com/shun159/miniteman/internal/radvd"
 	"github.com/shun159/miniteman/internal/slowpath"
 	"github.com/shun159/miniteman/internal/softwirectl"
+	"github.com/shun159/miniteman/internal/tunnelpmtu"
 	"github.com/shun159/miniteman/internal/wanextend"
 	"github.com/shun159/miniteman/pkg/aftrdiscovery"
 	"github.com/shun159/miniteman/pkg/datapath"
@@ -274,11 +274,11 @@ func run() error {
 	defer fail(nil)
 	// minuteman's supervision trees, started as applications as each is
 	// needed (see startApps). They are stopped, in reverse order, by the
-	// second deferred stopApps further down: after the rest of run's
-	// goroutines, and before what they drive is closed. As they stop in
-	// reverse order, DHCPv6-PD releases its lease through the DHCPv6
-	// client, which, started before it, still runs. This one stops them on
-	// an earlier return.
+	// second deferred stopApps further down, before what they drive -- the
+	// datapath, the tunnel -- is closed. As they stop in reverse order,
+	// DHCPv6-PD releases its lease through the DHCPv6 client, which,
+	// started before it, still runs. This one stops them on an earlier
+	// return.
 	node := proc.NewNode("")
 	apps, stopApps, err := startApps(ctx, fail, node)
 	if err != nil {
@@ -382,7 +382,7 @@ func run() error {
 		fragVeths.Close()
 		return err
 	}
-	// Deferred (device teardown) so it runs after bgWG.Wait but before
+	// Deferred (device teardown) so it runs after stopApps but before
 	// dp.Close (defers are LIFO), the same ordering as tun.Close below. Note
 	// this deletes the mm-frag* devices while dp.Close still holds the
 	// xdp_softwire_frag* links (l.fragLinks) attached to them; that's benign
@@ -431,8 +431,8 @@ func run() error {
 	// datapath dropping (RFC 6333 §5.3). Created here, once the softwire
 	// endpoints are known, for every run -- static or dynamic. Fail-fast: a home
 	// CPE has no other IPv4 path. Its Close (device teardown) is deferred so it
-	// runs after bgWG.Wait but before dp.Close (defers are LIFO), i.e. after the
-	// rediscovery goroutine that may repoint it has drained.
+	// runs after stopApps but before dp.Close (defers are LIFO), i.e. after the
+	// processes that repoint it and set its MTU have stopped.
 	tun, err := slowpath.New(wanNetIface.MTU)
 	if err != nil {
 		return fmt.Errorf("opening softwire slow path: %w", err)
@@ -458,7 +458,6 @@ func run() error {
 		log.Printf("IPv6 software RSS: fanning native-IPv6 forwarding across %d CPUs", len(cpus))
 	}
 
-	var bgWG sync.WaitGroup
 	// Started before runPrefixDelegation/runNDProxy so the exact link-local
 	// addresses it bound can be handed to them as RDNSS entries: an RA must
 	// never promise a DNS server this proxy hasn't actually bound (see
@@ -492,7 +491,7 @@ func run() error {
 		}
 	}
 	if *ndProxy {
-		if err := runNDProxy(ctx, apps, adv, *wanIface, wanIfindex, lans, rdnssByIface, &bgWG); err != nil {
+		if err := runNDProxy(ctx, apps, adv, *wanIface, wanIfindex, lans, rdnssByIface); err != nil {
 			return err
 		}
 	}
@@ -520,9 +519,10 @@ func run() error {
 	// size and the companion ip6tnl (RFC 2473 §8/§6.7). Always on: a narrower
 	// link somewhere along the B4<->AFTR path is not a configuration, and
 	// nothing happens at all until one is actually reported.
-	watchTunnelPMTU(ctx, dp, tun, wanNetIface.MTU, &bgWG)
-	defer stopApps() // runs second: see where apps start
-	defer bgWG.Wait()
+	if err := apps.Start(ctx, app("tunnel PMTU", tunnelpmtu.Spec(tunnelpmtu.Config{Datapath: dp, Tunnel: tun, WANMTU: wanNetIface.MTU}))); err != nil {
+		return err
+	}
+	defer stopApps() // see where apps start
 
 	// Written only now, after every fail-fast startup step above, so the
 	// file's existence means "up", not "starting".
@@ -602,16 +602,16 @@ func runPrefixDelegation(ctx context.Context, apps *application.Running, dhcp dh
 // runNDProxy runs the -ndproxy CPE model: internal/ndppd's tree, started as
 // an application, answering WAN-side Neighbor Solicitations on wanIface for
 // LAN hosts it actively verifies exist and installing their host routes
-// (internal/wanextend.HostRoutes); then internal/wanextend.Serve, learning
-// the WAN interface's own SLAAC /64, re-advertising it on every -lan
-// interface with the On-Link flag cleared (see routeradvert.Config.OnLink's
-// doc) and keeping that advertisement in sync if the WAN prefix later
-// changes. wanextend.Serve registers its watch goroutine on wg, so run()
-// waits for it before returning. rdnssByIface is forwarded to
-// wanextend.Serve (see its own doc) -- it's the map of link-local addresses
-// startDNSProxy actually bound, so RDNSS is advertised only where a DNS
-// proxy is really listening.
-func runNDProxy(ctx context.Context, apps *application.Running, adv radvd.Advertiser, wanIface string, wanIfindex uint32, lans cliconfig.LANSpecList, rdnssByIface map[string]netip.Addr, wg *sync.WaitGroup) error {
+// (internal/wanextend.HostRoutes); then, once internal/wanextend has found
+// the WAN interface's own SLAAC /64 -- blocking, as there's nothing to
+// advertise until it has, the same rationale runPrefixDelegation applies to
+// its own initial Acquire -- re-advertising it on every -lan interface with
+// the On-Link flag cleared (see routeradvert.Config.OnLink's doc), and
+// wanextend's watch, another application, keeping that advertisement in
+// sync if the WAN prefix later changes. rdnssByIface is the map of
+// link-local addresses startDNSProxy actually bound, so RDNSS is advertised
+// only where a DNS proxy is really listening.
+func runNDProxy(ctx context.Context, apps *application.Running, adv radvd.Advertiser, wanIface string, wanIfindex uint32, lans cliconfig.LANSpecList, rdnssByIface map[string]netip.Addr) error {
 	lanIfaces := make([]string, len(lans))
 	for i, spec := range lans {
 		lanIfaces[i] = spec.Iface
@@ -630,7 +630,18 @@ func runNDProxy(ctx context.Context, apps *application.Running, adv radvd.Advert
 	if err := apps.Start(ctx, app("NDProxy", spec)); err != nil {
 		return fmt.Errorf("starting NDProxy: %w", err)
 	}
-	return wanextend.Serve(ctx, int(wanIfindex), lanIfaces, rdnssByIface, adv, wg)
+
+	prefix, err := wanextend.DiscoverPrefix(ctx, int(wanIfindex))
+	if err != nil {
+		return fmt.Errorf("discovering WAN prefix for NDProxy: %w", err)
+	}
+	ext := wanextend.Config{WANIndex: int(wanIfindex), LANs: lanIfaces, RDNSS: rdnssByIface, Adv: adv}
+	log.Printf("NDProxy: extending WAN prefix %s onto %d LAN interface(s)", prefix, len(lanIfaces))
+	ext.Extend(prefix)
+	if err := apps.Start(ctx, app("NDProxy prefix watch", wanextend.Spec(ext, prefix))); err != nil {
+		return fmt.Errorf("starting the WAN prefix watch: %w", err)
+	}
+	return nil
 }
 
 // startDNSProxy starts internal/dnsproxy's supervision tree on every -lan
