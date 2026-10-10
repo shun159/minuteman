@@ -267,7 +267,7 @@ verified passing from a fresh setup for:
 - `MM_PD_ZERO_TIMERS=1` (against `dhcpv6` AFTR discovery + `dhcpv6-pd`): Kea delegating with `T1 = T2 = 0`,
   minuteman deriving 65s/104s from the 130s preferred lifetime and renewing exactly once on that timer
   within an 85s window (Kea logging the single `RENEW`, the prefix unchanged across it). Re-run after the
-  RA in-place-update change (`routeradvert.Updater`) with a `tcpdump` on `mm-host`'s LAN link alongside
+  RA in-place-update change (then `routeradvert.Updater`, now `internal/radvd`) with a `tcpdump` on `mm-host`'s LAN link alongside
   it, since this is the mode where a renewal actually lands inside one run: the renewal drew a single
   immediate RA carrying the refreshed prefix lifetimes at `router lifetime 1800s`, and the only
   `router lifetime 0s` RA in the capture was minuteman's own shutdown one. The smoketest itself doesn't

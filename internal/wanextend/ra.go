@@ -1,10 +1,7 @@
 package wanextend
 
 import (
-	"context"
-	"log"
 	"net/netip"
-	"sync"
 	"time"
 
 	"github.com/shun159/miniteman/pkg/routeradvert"
@@ -24,50 +21,32 @@ const (
 	preferredLifetime = 604800 * time.Second  // 7 days
 )
 
-// raWorker tracks one running routeradvert.Serve goroutine for a single LAN
-// interface, mirroring internal/lanprefix's own raWorker/RAManager shape.
-type raWorker struct {
-	cancel  context.CancelFunc
-	done    chan struct{}
-	updates *routeradvert.Updater
+// Advertiser makes a configuration what an interface advertises in its
+// Router Advertisements, in place: internal/radvd's.
+type Advertiser interface {
+	Advertise(iface string, cfg routeradvert.Config)
 }
 
-// alive reports whether the worker's goroutine is still running -- see
-// internal/lanprefix's identically-shaped raWorker.alive.
-func (w *raWorker) alive() bool {
-	select {
-	case <-w.done:
-		return false
-	default:
-		return true
-	}
-}
-
-// raManager drives one routeradvert.Serve goroutine per LAN interface,
-// broadcasting the same prefix (On-Link cleared) to all of them uniformly
-// -- unlike internal/lanprefix.RAManager, which advertises a distinct
-// subnet per interface, NDProxy extends one shared WAN /64 onto every LAN
-// interface, so there's only ever one prefix to hand out. Not safe for
-// concurrent use.
+// raManager decides what each LAN interface advertises -- the shared WAN
+// prefix -- and hands that to an Advertiser, mirroring
+// internal/lanprefix.RAManager.
 type raManager struct {
-	workers      map[string]*raWorker
+	adv          Advertiser
 	rdnssByIface map[string]netip.Addr
 }
 
 // newRAManager mirrors internal/lanprefix.NewRAManager's rdnssByIface
 // parameter -- see routeradvert.Config.RDNSSAddr's own doc.
-func newRAManager(rdnssByIface map[string]netip.Addr) *raManager {
-	return &raManager{workers: make(map[string]*raWorker), rdnssByIface: rdnssByIface}
+func newRAManager(adv Advertiser, rdnssByIface map[string]netip.Addr) *raManager {
+	return &raManager{adv: adv, rdnssByIface: rdnssByIface}
 }
 
-// sync makes prefix the one every lanIfaces worker advertises, starting a
-// worker (tracked on wg) for an interface that has none yet and updating
-// the running one in place otherwise -- the same reasoning as
-// internal/lanprefix.RAManager.Sync: cancelling a worker is
-// routeradvert.Serve's shutdown path, which announces RouterLifetime=0 (RFC
-// 4861 §6.2.5) before exiting, so restarting on a WAN prefix change would
-// withdraw the default route and the RDNSS server from every LAN client for
-// as long as the replacement takes to announce itself.
+// sync makes prefix the one every lanIfaces interface advertises, the
+// advertiser updating in place -- the same reasoning as
+// internal/lanprefix.RAManager.Sync: an advertiser's shutdown announces
+// RouterLifetime=0 (RFC 4861 §6.2.5), so restarting on a WAN prefix change
+// would withdraw the default route and the RDNSS server from every LAN
+// client for as long as the replacement takes to announce itself.
 //
 // That final RA never deprecated the *old* prefix anyway -- it carries a
 // Prefix Information Option for the outgoing prefix with its lifetimes
@@ -76,20 +55,9 @@ func newRAManager(rdnssByIface map[string]netip.Addr) *raManager {
 // lifetime runs out either way; advertising the superseded prefix with
 // PreferredLifetime=0 to deprecate it promptly is RFC 9096 territory, an
 // open item in docs/rfc-compliance-backlog.md.
-//
-// A worker that exited on its own (Serve returned an error) is replaced by
-// a fresh one.
-func (m *raManager) sync(ctx context.Context, prefix netip.Prefix, lanIfaces []string, wg *sync.WaitGroup) {
+func (m *raManager) sync(prefix netip.Prefix, lanIfaces []string) {
 	for _, iface := range lanIfaces {
-		cfg := m.config(iface, prefix)
-		if w, ok := m.workers[iface]; ok {
-			if w.alive() {
-				w.updates.Set(cfg)
-				continue
-			}
-			m.stop(iface) // dead: release its context, then replace it
-		}
-		m.start(ctx, iface, cfg, wg)
+		m.adv.Advertise(iface, m.config(iface, prefix))
 	}
 }
 
@@ -104,32 +72,4 @@ func (m *raManager) config(iface string, prefix netip.Prefix) routeradvert.Confi
 		PreferredLifetime: preferredLifetime,
 		RDNSSAddr:         m.rdnssByIface[iface],
 	}
-}
-
-// stop cancels and waits for iface's existing worker, if any, so at most
-// one routeradvert.Serve goroutine per interface ever runs.
-func (m *raManager) stop(iface string) {
-	w, ok := m.workers[iface]
-	if !ok {
-		return
-	}
-	w.cancel()
-	<-w.done
-	delete(m.workers, iface)
-}
-
-func (m *raManager) start(ctx context.Context, iface string, cfg routeradvert.Config, wg *sync.WaitGroup) {
-	workerCtx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	updates := routeradvert.NewUpdater()
-	m.workers[iface] = &raWorker{cancel: cancel, done: done, updates: updates}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer close(done)
-		if err := routeradvert.Serve(workerCtx, iface, cfg, updates); err != nil {
-			log.Printf("wanextend: RA serving on %s ended unexpectedly: %v", iface, err)
-		}
-	}()
 }

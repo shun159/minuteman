@@ -70,7 +70,7 @@ func SolicitRouters(ctx context.Context, ifaceName string) error {
 	}
 
 	rs := marshalRouterSolicitation(ifi.HardwareAddr)
-	dst := &unix.SockaddrInet6{Addr: allRoutersMulticast.As16(), ZoneId: uint32(ifi.Index)}
+	dst := &unix.SockaddrInet6{Addr: AllRoutersMulticast.As16(), ZoneId: uint32(ifi.Index)}
 	for i := range maxRtrSolicitations {
 		if i > 0 {
 			select {
@@ -91,7 +91,7 @@ func SolicitRouters(ctx context.Context, ifaceName string) error {
 // which right after a link bounce (an XDP attach, or the caller's own
 // link-state change) resolves itself in about a second -- until it
 // succeeds, another error occurs, or ctx is cancelled. Mirrors Serve's
-// EADDRNOTAVAIL handling (see tentativeRetryInterval in advertise.go).
+// EADDRNOTAVAIL handling (see TentativeRetryInterval in advertise.go).
 func sendRetryingTentative(ctx context.Context, fd int, buf []byte, dst unix.Sockaddr) error {
 	for {
 		err := unix.Sendto(fd, buf, 0, dst)
@@ -104,7 +104,7 @@ func sendRetryingTentative(ctx context.Context, fd int, buf []byte, dst unix.Soc
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(tentativeRetryInterval):
+		case <-time.After(TentativeRetryInterval):
 		}
 	}
 }

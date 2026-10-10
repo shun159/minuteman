@@ -77,13 +77,13 @@ func (ra *RouterAdvertisement) Marshal() []byte {
 	return b
 }
 
-// isRouterSolicitation reports whether b (an ICMPv6 message payload, as
+// IsRouterSolicitation reports whether b (an ICMPv6 message payload, as
 // delivered by a raw IPPROTO_ICMPV6 socket without an IPv6 header) is a
 // Router Solicitation (RFC 4861 §4.1). Only the ICMPv6 Type is checked --
 // this package never needs to decode a Solicitation's body, since an RS
 // carries nothing it needs (its optional Source Link-Layer Address option
 // is solely an optimization for the router's own Neighbor Cache, which this
 // package doesn't maintain).
-func isRouterSolicitation(b []byte) bool {
+func IsRouterSolicitation(b []byte) bool {
 	return len(b) >= 1 && b[0] == icmpTypeRouterSolicit
 }

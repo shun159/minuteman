@@ -5,96 +5,37 @@ import (
 	"net"
 	"net/netip"
 
-	"github.com/shun159/miniteman/pkg/internal/pollfd"
 	"golang.org/x/sys/unix"
 )
 
-// allNodesMulticast and allRoutersMulticast are the well-known link-local
+// AllNodesMulticast and AllRoutersMulticast are the well-known link-local
 // scope multicast addresses NDP routers send Advertisements to and listen
 // for Solicitations on, respectively (RFC 4861 §4.1/§4.2).
 var (
-	allNodesMulticast   = netip.MustParseAddr("ff02::1")
-	allRoutersMulticast = netip.MustParseAddr("ff02::2")
+	AllNodesMulticast   = netip.MustParseAddr("ff02::1")
+	AllRoutersMulticast = netip.MustParseAddr("ff02::2")
 )
 
-// icmp6Filter is Linux's ICMP6_FILTER sockopt name (<netinet/icmp6.h>), not
+// ICMP6Filter is Linux's ICMP6_FILTER sockopt name (<netinet/icmp6.h>), not
 // exported by golang.org/x/sys/unix for Linux -- vendored here the same way
 // bpf/uapi/linux/*.h vendors constants missing from the generated
 // bpf/vmlinux.h.
-const icmp6Filter = 1
+const ICMP6Filter = 1
 
-// Conn is a raw ICMPv6 socket bound to one interface, used to send Router
-// Advertisements and receive Router Solicitations on it. Not safe for
-// concurrent use except Close, which may be called from another goroutine
-// to unblock a blocked Solicitations reader: the socket goes through the
-// runtime's poller (pkg/internal/pollfd), as close(2) alone would not.
-type Conn struct {
-	fd      *pollfd.FD
-	ifIndex int
-}
-
-// Listen opens a raw ICMPv6 socket bound to iface: joins the All-Routers
-// multicast group (so multicast Router Solicitations reach it at all),
-// sets both hop limits to 255 (RFC 4861 §6.1.2 requires this on every NDP
-// packet, so receivers can detect off-link spoofing), and installs an
-// ICMP6_FILTER that passes only Router Solicitation, so the read loop isn't
-// woken by unrelated ICMPv6 traffic (echo, NS/NA, MLD).
-func Listen(iface string) (*Conn, error) {
-	ifi, err := net.InterfaceByName(iface)
-	if err != nil {
-		return nil, fmt.Errorf("routeradvert: looking up interface %s: %w", iface, err)
-	}
-
-	fd, err := unix.Socket(unix.AF_INET6, unix.SOCK_RAW|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, unix.IPPROTO_ICMPV6)
-	if err != nil {
-		return nil, fmt.Errorf("routeradvert: opening raw ICMPv6 socket: %w", err)
-	}
-
-	if err := unix.BindToDevice(fd, iface); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("routeradvert: binding to %s: %w", iface, err)
-	}
-
-	mreq := &unix.IPv6Mreq{Multiaddr: allRoutersMulticast.As16(), Interface: uint32(ifi.Index)}
-	if err := unix.SetsockoptIPv6Mreq(fd, unix.IPPROTO_IPV6, unix.IPV6_JOIN_GROUP, mreq); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("routeradvert: joining all-routers multicast group on %s: %w", iface, err)
-	}
-
-	if err := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_MULTICAST_HOPS, 255); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("routeradvert: setting multicast hop limit on %s: %w", iface, err)
-	}
-	if err := unix.SetsockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_UNICAST_HOPS, 255); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("routeradvert: setting unicast hop limit on %s: %w", iface, err)
-	}
-
+// SolicitationFilter is the ICMP6_FILTER an advertiser's raw ICMPv6 socket
+// sets, passing only Router Solicitations, so it isn't woken by unrelated
+// ICMPv6 traffic (echo, NS/NA, MLD).
+func SolicitationFilter() *unix.ICMPv6Filter {
 	var filt unix.ICMPv6Filter
 	for i := range filt.Data {
 		filt.Data[i] = 0xffffffff // block everything...
 	}
 	filt.Data[icmpTypeRouterSolicit/32] &^= 1 << (icmpTypeRouterSolicit % 32) // ...except Router Solicitation
-	if err := unix.SetsockoptICMPv6Filter(fd, unix.SOL_ICMPV6, icmp6Filter, &filt); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("routeradvert: setting ICMPv6 filter on %s: %w", iface, err)
-	}
-
-	p, err := pollfd.New(fd, "routeradvert "+iface)
-	if err != nil {
-		return nil, fmt.Errorf("routeradvert: polling raw ICMPv6 socket on %s: %w", iface, err)
-	}
-	return &Conn{fd: p, ifIndex: ifi.Index}, nil
+	return &filt
 }
 
-// Close closes the underlying socket, unblocking any goroutine currently
-// reading from Solicitations.
-func (c *Conn) Close() error {
-	return c.fd.Close()
-}
-
-// LinkLocalAddr returns iface's own fe80::/10 unicast address (the one this
-// package's own RA sends are sourced from -- see Listen's BindToDevice),
+// LinkLocalAddr returns iface's own fe80::/10 unicast address (the one an
+// advertiser bound to iface sends its RAs from),
 // zoned with iface. Its caller (cmd/minuteman) binds a DNS proxy to it and
 // passes it back in as Config.RDNSSAddr (see NewRDNSS's own doc): a router's
 // link-local address is explicitly a valid RDNSS entry per RFC 8106 §5.1,
@@ -127,41 +68,4 @@ func LinkLocalAddr(iface string) (netip.Addr, error) {
 		return addr.WithZone(iface), nil
 	}
 	return netip.Addr{}, fmt.Errorf("routeradvert: %s has no link-local IPv6 address", iface)
-}
-
-// Solicitations returns a channel that receives a value each time a Router
-// Solicitation arrives. It's closed when the underlying socket is closed
-// (whether via Close or a real read error) -- ending a range/select loop
-// over it is how a caller notices the Conn is done. Sends are non-blocking
-// and coalesced: a burst of Solicitations arriving faster than the
-// receiver drains the channel collapses to a single pending signal, which
-// is fine since a caller only ever needs to know "at least one RS arrived
-// since I last checked", not how many.
-func (c *Conn) Solicitations() <-chan struct{} {
-	ch := make(chan struct{}, 1)
-	go func() {
-		defer close(ch)
-		buf := make([]byte, 512)
-		for {
-			n, _, err := c.fd.Recvfrom(buf)
-			if err != nil {
-				return
-			}
-			if !isRouterSolicitation(buf[:n]) {
-				continue // shouldn't happen given the ICMP6_FILTER, but harmless if it does
-			}
-			select {
-			case ch <- struct{}{}:
-			default:
-			}
-		}
-	}()
-	return ch
-}
-
-// SendAdvertisement sends ra to the All-Nodes multicast address (RFC 4861
-// §4.2: both unsolicited and solicited Advertisements may be multicast).
-func (c *Conn) SendAdvertisement(ra *RouterAdvertisement) error {
-	dst := &unix.SockaddrInet6{Addr: allNodesMulticast.As16(), ZoneId: uint32(c.ifIndex)}
-	return c.fd.Sendto(ra.Marshal(), dst)
 }

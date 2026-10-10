@@ -56,36 +56,26 @@ baseline to retry from.
 through (taken from the IA_PD Prefix option, not derived here) so `ra.go` can advertise
 lifetimes that track the actual upstream delegation.
 
-### `ra.go` — one Router Advertisement worker per LAN interface
+### `ra.go` — what each LAN interface advertises
 
-`RAManager` drives one `pkg/routeradvert.Serve` goroutine per LAN interface, advertising that
-interface's currently-assigned `/64` with **`OnLink: true`** — a PD delegation really is
-distinct and on-link per interface, unlike `internal/wanextend`'s shared-WAN-prefix model,
-which must clear that flag.
+`RAManager` decides each LAN interface's Router Advertisement configuration -- its
+currently-assigned `/64` with **`OnLink: true`**, a PD delegation really being distinct and
+on-link per interface, unlike `internal/wanextend`'s shared-WAN-prefix model, which must clear
+that flag -- and hands it to an `Advertiser`: `internal/radvd`'s advertiser of that interface.
 
-`Sync` updates a running worker **in place** through a `routeradvert.Updater` instead of
-restarting it. This is load-bearing, not an optimization. A DHCPv6-PD Renew resets the
-lifetimes on every lease change, so `Sync` is reached once per T1 interval even when nothing
-about the subnet moved. Restarting the worker would deliver the refreshed lifetimes too — but
-cancellation is `routeradvert.Serve`'s *shutdown* path, which first sends RFC 4861 §6.2.5's
-`RouterLifetime=0` advertisement (and, since the RDNSS option's lifetime tracks it, withdraws
-the DNS server as well). Every LAN client would therefore see its default route and resolver
-withdrawn once per renewal and reinstated a moment later. That flap was a real bug; it is
-§1 of `docs/rfc-compliance-backlog.md`, now resolved.
+The advertiser takes a new configuration **in place**, never restarting. This is load-bearing,
+not an optimization. A DHCPv6-PD Renew resets the lifetimes on every lease change, so `Sync` is
+reached once per T1 interval even when nothing about the subnet moved. Restarting the advertiser
+would deliver the refreshed lifetimes too -- but its shutdown sends RFC 4861 §6.2.5's
+`RouterLifetime=0` advertisement (and, since the RDNSS option's lifetime tracks it, withdraws the
+DNS server as well). Every LAN client would therefore see its default route and resolver
+withdrawn once per renewal and reinstated a moment later. That flap was a real bug; it is §1 of
+`docs/rfc-compliance-backlog.md`, now resolved.
 
-Two smaller rules in `Sync`:
-
-- A worker that exited on its own (`Serve` returned a socket error) is replaced by a fresh
-  one, so a transient failure doesn't leave an interface silently unadvertised until restart.
-- An `Assignment` with an invalid `Subnet` (its `Reconcile` failed) is skipped, leaving any
-  already-running worker alone rather than tearing down a working advertisement over a
-  transient error.
-
-`NewRAManager(rdnssByIface)` takes the map `cmd/minuteman`'s `startDNSProxy` returns: LAN
-interface → the link-local address `internal/dnsproxy` *actually bound* there. Only those addresses
-are advertised as an RFC 8106 RDNSS option (RFC 7084 §L-11), so an IPv6-only SLAAC client is
-never pointed at a DNS server nothing answers on. An interface absent from the map, or a nil
-map, simply gets no RDNSS option.
+An `Assignment` with an invalid `Subnet` (its `Reconcile` failed) is skipped, leaving the
+interface advertising what it did rather than tearing it down over a transient error. An
+advertiser whose socket fails is restarted by its supervisor, idle until the next `Sync` -- the
+next PD renewal -- as a failed worker used to be replaced only at the next `Sync`.
 
 ## Testing
 

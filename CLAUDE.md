@@ -551,30 +551,19 @@ orphaned the running kernel's module directory — reboot to fix that).
   are the wire codec (manual byte-slice framing, matching `pkg/dhcpv6`'s style) for the RA fixed header and
   the two NDP options this package builds, `PrefixInformation` (§4.6.2) and `SourceLinkLayerAddress`
   (§4.6.1); Marshal-only, since this package never needs to decode an RA or an RS's body, only detect that
-  an RS arrived (`isRouterSolicitation`). `transport.go`'s `Conn` hand-rolls a raw `AF_INET6`/`SOCK_RAW`/
-  `IPPROTO_ICMPV6` socket (`golang.org/x/sys/unix`, no `golang.org/x/net/icmp` — same no-external-library
-  philosophy as `pkg/netlink`), joining the All-Routers multicast group so it
-  actually receives Router Solicitations, setting both hop limits to 255 (RFC 4861 §6.1.2's anti-spoofing
-  requirement), and installing an `ICMP6_FILTER` so its read loop only wakes for Router Solicitation
-  traffic (`ICMP6_FILTER`'s sockopt-name constant isn't exported by `x/sys/unix` on Linux, so it's vendored
-  locally, the same rationale as `bpf/uapi/linux/*.h`). `advertise.go`'s `Serve(ctx, iface, cfg, updates)`
-  is the
-  actual RFC 4861 §6.2/§10 timing — a fast initial burst of RAs, settling into a jittered periodic
-  cadence, plus rate-limited replies to inbound Router Solicitations — ending with a best-effort final
-  `RouterLifetime=0` RA when `ctx` is cancelled (§6.2.5's graceful-shutdown signal), mirroring
-  `prefixdelegation.Maintain`'s blocks-until-cancelled shape. `updates` (an `*Updater`, nil for a
-  never-changing config) is how a caller replaces `cfg` *without* restarting the goroutine: a size-1
-  latest-wins channel of `Config`s, each applied in place and — if it differs from the current one —
-  advertised promptly rather than at the next scheduled RA, subject to §6.2.4's `MIN_DELAY_BETWEEN_RAS`
-  floor. It exists because cancel-then-restart is not a neutral way to change what's advertised:
-  cancellation is the *shutdown* path above, so a restart tells every LAN client the router (and, since
-  the RDNSS option's lifetime tracks `RouterLifetime`, its DNS server) is going away moments before the
-  replacement worker re-announces both — a flap `internal/lanprefix` used to inflict on every DHCPv6-PD
-  Renew. A send failing with `EADDRNOTAVAIL` is
-  retried on DAD's ~1s timescale (`tentativeRetryInterval`) rather than treated as fatal: it means the
-  interface's link-local source is still tentative, which genuinely happens in minuteman's startup
-  sequence (XDP attach can bounce the link, and the LAN address assignment lands immediately before
-  `Serve` starts) and used to kill the RA worker for good, leaving LAN clients with no SLAAC.
+  an RS arrived (`IsRouterSolicitation`). The package holds no LAN socket: `advertise.go`'s `BuildRA` builds
+  an RA from a `Config`, and `NextUnsolicitedInterval`/`ReplyDelay`/`MinDelayBetweenRAs`/
+  `TentativeRetryInterval` are RFC 4861 §6.2/§10's timing, drawing from a `*rand.Rand` they're given;
+  `transport.go` has what an advertiser's raw ICMPv6 socket needs (the multicast addresses, the
+  `SolicitationFilter` ICMP6_FILTER -- its sockopt-name constant vendored, as `x/sys/unix` doesn't export it on
+  Linux -- and `LinkLocalAddr`). Sending is `internal/radvd`'s: a molecule process per LAN interface owning
+  its socket (All-Routers joined, both hop limits 255, filtered to RS), every §6.2/§10 wait a timer -- a fast
+  initial burst then the jittered cadence, Solicitations answered after up to 500ms and never within
+  `MinDelayBetweenRAs` of another RA, a changed `Config` taken *in place* and advertised promptly (a
+  restart's `RouterLifetime=0` RA would flap every LAN client's default route and RDNSS server, as
+  `internal/lanprefix` used to on every Renew), `EADDRNOTAVAIL` (link-local still DAD-tentative after an XDP
+  attach bounces the link) retried on DAD's ~1s timescale, and a final `RouterLifetime=0` RA from
+  `Terminate` on shutdown (§6.2.5).
   `SolicitRouters` (`solicit.go`) shares this same retry (`sendRetryingTentative`) for exactly the same
   reason — it's fired right after `AttachWAN`'s own forwarding-flip, which can itself still have the WAN
   link's address tentative. `Config.OnLink` sets the Prefix Information Option's L flag: true for
@@ -810,7 +799,7 @@ orphaned the running kernel's module directory — reboot to fix that).
   out simply stops being reported. When `-dhcpv6-pd` is set, `runPrefixDelegation()` similarly blocks
   on `pkg/prefixdelegation.Acquire`, then applies the initial LAN assignment via
   `internal/lanprefix.Reconcile` synchronously (before the datapath is considered "up"), syncs an
-  `internal/lanprefix.RAManager` against the result (starting one `pkg/routeradvert.Serve` goroutine per
+  `internal/lanprefix.RAManager` against the result (handing each LAN interface's configuration to its `internal/radvd` advertiser per
   `-lan` interface, also tracked on the same `sync.WaitGroup`), then starts `pkg/prefixdelegation.Maintain`
   in a background goroutine (tracked on that `sync.WaitGroup` that `run()` waits on before returning, so a
   shutdown's best-effort `Release` and every RA worker's best-effort final advertisement all get a chance
@@ -853,15 +842,13 @@ orphaned the running kernel's module directory — reboot to fix that).
   have, then assigning the new one (`AddAddr`, `NLM_F_REPLACE`-idempotent) — skipping both calls entirely
   when the subnet is unchanged since the last `Reconcile`, to avoid transient route churn — and also returns
   each interface's `ValidLifetime`/`PreferredLifetime` (taken from the delegated prefix, not derived) on the
-  resulting `Assignment` for `ra.go` to consume. `ra.go`'s `RAManager` drives one `pkg/routeradvert.Serve`
-  goroutine per LAN interface from those `Assignment`s (`OnLink: true`, since a PD delegation really is
-  distinct per LAN interface): `Sync()` pushes each interface's new `Config` into its already-running
-  worker via `routeradvert.Updater` (starting one only where none runs yet, or where a previous one died
-  of a socket error), since a Renew resets the lifetimes even when the subnet itself doesn't change and a
-  long-running `Serve` goroutine has no other way to pick that up. It used to cancel-and-restart the
-  worker for that, which is *not* the cheap operation the old comment here claimed: cancellation is
-  `Serve`'s shutdown path, so every Renew flapped each LAN client's default route and RDNSS server via a
-  `RouterLifetime=0` RA (the resolved §1 of `docs/rfc-compliance-backlog.md`).
+  resulting `Assignment` for `ra.go` to consume. `ra.go`'s `RAManager` turns those `Assignment`s into each LAN
+  interface's `routeradvert.Config` (`OnLink: true`, since a PD delegation really is distinct per LAN
+  interface) and `Sync()` hands it to that interface's `internal/radvd` advertiser, which takes it in
+  place, since a Renew resets the lifetimes even when the subnet itself doesn't change. Restarting the
+  advertiser for that is *not* cheap: its shutdown sends a `RouterLifetime=0` RA, so every Renew used to
+  flap each LAN client's default route and RDNSS server (the resolved §1 of
+  `docs/rfc-compliance-backlog.md`).
 - **`internal/wanextend`** — the NDProxy *policy* layer, mirroring `internal/lanprefix`'s split from its
   protocol client (`pkg/ndproxy`) but for the single-shared-WAN-`/64` model instead of a distinct PD
   delegation. `discover.go`'s `DiscoverPrefix(ctx, wanIfindex)` blocks, polling `pkg/netlink.Socket.Addrs`
@@ -879,12 +866,12 @@ orphaned the running kernel's module directory — reboot to fix that).
   (`discover_test.go`) — the same rationale `pkg/ndproxy`'s `proxyState` takes an explicit `now` instead of
   reading the clock. Neither `DiscoverPrefix` nor `WatchChanges` track `IFA_CACHEINFO`'s remaining
   lifetimes, so `ra.go` re-advertises to the LAN with RFC 4861 §6.2.1's recommended default lifetimes
-  rather than the WAN RA's actual ones — a known simplification. `ra.go`'s `raManager` drives one
-  `pkg/routeradvert.Serve` goroutine per LAN interface, all broadcasting the same prefix (`OnLink: false`)
+  rather than the WAN RA's actual ones — a known simplification. `ra.go`'s `raManager` has every LAN
+  interface's `internal/radvd` advertiser broadcast the same prefix (`OnLink: false`)
   — unlike `internal/lanprefix.RAManager`, which advertises a distinct subnet per interface from an
   `Assignment` list, NDProxy extends one shared prefix onto every LAN interface uniformly, so `sync()` takes
-  a single `netip.Prefix` rather than a per-interface list; like `RAManager.Sync` it updates each running
-  worker in place through a `routeradvert.Updater` rather than restarting it — the final
+  a single `netip.Prefix` rather than a per-interface list; like `RAManager.Sync` the advertisers take it
+  in place rather than restarting — the final
   `RouterLifetime=0` RA a restart emits never deprecated the outgoing prefix anyway (that PIO still
   carries its lifetimes intact), so restarting only cost LAN clients their default route and RDNSS server
   for the length of the changeover. `hostroutes.go`'s

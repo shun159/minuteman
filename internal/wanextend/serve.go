@@ -14,21 +14,21 @@ import (
 // initial DiscoverPrefix (there's nothing to start until at least one WAN
 // prefix is known, the same rationale cmd/minuteman's runPrefixDelegation
 // applies to its own initial Acquire), then starts every background
-// goroutine -- the LAN Router Advertisement senders (raManager, one per
-// lanIfaces interface), a WatchChanges loop that restarts them if the WAN
-// prefix later changes, and pkg/ndproxy.Serve itself on wanIface with a
-// HostRoutes-backed OnActive/OnInactive -- registering each on wg so the
-// caller can wait for shutdown's best-effort cleanup (final RAs, ndproxy's
-// socket closes) to finish before returning. A non-nil return means the
+// goroutine -- a WatchChanges loop that has adv advertise the new prefix if
+// the WAN prefix later changes, and pkg/ndproxy.Serve itself on wanIface
+// with a HostRoutes-backed OnActive/OnInactive -- registering each on wg so
+// the caller can wait for shutdown's best-effort cleanup (ndproxy's socket
+// closes) to finish before returning. The LAN Router Advertisements are
+// adv's, an advertiser per lanIfaces interface (internal/radvd). A non-nil return means the
 // initial discovery failed or was cancelled; once past that point, Serve
 // itself always returns nil and leaves its goroutines running until ctx is
 // cancelled.
 //
-// rdnssByIface is forwarded to every LAN RA worker's routeradvert.Config
+// rdnssByIface is forwarded to every LAN interface's routeradvert.Config
 // (see its RDNSSAddr doc) -- it maps a -lan interface to the DNS-server
 // address a DNS proxy actually bound there, so it's non-empty only when the
 // caller also runs a DNS proxy on those interfaces' link-local addresses.
-func Serve(ctx context.Context, wanIface string, wanIfindex int, lanIfaces []string, rdnssByIface map[string]netip.Addr, wg *sync.WaitGroup) error {
+func Serve(ctx context.Context, wanIface string, wanIfindex int, lanIfaces []string, rdnssByIface map[string]netip.Addr, adv Advertiser, wg *sync.WaitGroup) error {
 	prefix, err := DiscoverPrefix(ctx, wanIfindex)
 	if err != nil {
 		return fmt.Errorf("discovering WAN prefix for NDProxy: %w", err)
@@ -58,16 +58,16 @@ func Serve(ctx context.Context, wanIface string, wanIfindex int, lanIfaces []str
 		}
 	}()
 
-	ra := newRAManager(rdnssByIface)
+	ra := newRAManager(adv, rdnssByIface)
 	log.Printf("NDProxy: extending WAN prefix %s onto %d LAN interface(s)", prefix, len(lanIfaces))
-	ra.sync(ctx, prefix, lanIfaces, wg)
+	ra.sync(prefix, lanIfaces)
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		err := WatchChanges(ctx, wanIfindex, prefix, func(next netip.Prefix) {
 			log.Printf("NDProxy: WAN prefix changed to %s, re-extending onto %d LAN interface(s)", next, len(lanIfaces))
-			ra.sync(ctx, next, lanIfaces, wg)
+			ra.sync(next, lanIfaces)
 		})
 		if err != nil {
 			log.Printf("NDProxy: WAN prefix watch on ifindex %d ended unexpectedly: %v", wanIfindex, err)
