@@ -98,7 +98,7 @@ All of the above has been verified end-to-end against the netns rig (see Testing
 
 `internal/` holds `cliconfig` (CLI flag parsing), `lanprefix` (DHCPv6-PD LAN policy, including RA
 serving), `wanextend` (NDProxy LAN policy, including RA serving and host-route management), `ndppd`
-(the ND proxy itself), `slowpath`
+(the ND proxy itself), `pdlease` (the DHCPv6-PD lease kept), `slowpath`
 (the DS-Lite companion `ip6tnl` lifecycle for softwire reassembly + fragmentation fallback), and
 `fragpath` (the companion veth pairs the in-XDP softwire fragmenter bounces its clones through);
 `pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/`pkg/prefixdelegation`/`pkg/routeradvert`/`pkg/ndproxy`/
@@ -527,10 +527,11 @@ orphaned the running kernel's module directory — reboot to fix that).
   the server declining rather than the question going unasked. `acquire.go`'s `Acquire()` drives the full
   Solicit→Advertise→Request→Reply exchange (blocks,
   retrying, until it succeeds or ctx is cancelled — same rationale as `aftrdiscovery.Discover`).
-  `maintain.go`'s `Maintain()` is the part `aftrdiscovery` deliberately leaves as future work for its own
-  refresh interval: a lease that's never renewed actually expires and breaks LAN connectivity, so this
-  drives RFC 3315's full renewal ladder (Renew at T1 → Rebind at T2 on failure → fresh `Acquire` on failure)
-  indefinitely, calling back into the caller on every change, and sends a best-effort `Release` on shutdown.
+  `renew.go` is the part `aftrdiscovery` deliberately leaves to the caller for its own refresh interval: a
+  lease that's never renewed actually expires and breaks LAN connectivity, so this has the exchanges of
+  RFC 3315's full renewal ladder — `Renew` (deadline T2) → `Rebind` on failure (deadline the shortest valid
+  lifetime) → fresh `Acquire` on failure — and its times (`Lease.RenewAt`/`RebindAt`/`ExpiresAt`), plus
+  `Release`; `internal/pdlease` climbs it.
   The T1/T2 that ladder runs on are not necessarily the server's: `timers.go`'s `effectiveTimers` resolves
   a delegated 0 — RFC 9915 §21.21's way of leaving the renewal timing to the requesting router, which
   §14.2 then requires to choose times that avoid message storms and in particular *not* transmit
@@ -762,7 +763,7 @@ orphaned the running kernel's module directory — reboot to fix that).
   `prefixdelegation.Acquire` **before** `resolveAFTR`, and hands the lease's DNS servers (via
   `pdDNSServers`) to AFTR discovery, to `startSoftwireControl` (re-discovery), and — as a last fallback behind
   `-dns-server` and the discovery-learned set — to `-dns-proxy`'s upstreams. The rest of the PD setup
-  (LAN address assignment, RA workers, `Maintain`) still runs in its old position, with `runPrefixDelegation`
+  (LAN address assignment, RA workers, lease maintenance) still runs in its old position, with `runPrefixDelegation`
   now taking the already-acquired lease. Both exchanges go through the WAN's one DHCPv6 client
   (`internal/dhcpv6client`), which runs them one at a time, so only their order changed, not their concurrency.
   `resolveAFTR()` returns `-aftr` parsed directly if given (in which case its second return, the DNS
@@ -798,10 +799,9 @@ orphaned the running kernel's module directory — reboot to fix that).
   on `pkg/prefixdelegation.Acquire`, then applies the initial LAN assignment via
   `internal/lanprefix.Reconcile` synchronously (before the datapath is considered "up"), syncs an
   `internal/lanprefix.RAManager` against the result (handing each LAN interface's configuration to its `internal/radvd` advertiser per
-  `-lan` interface, also tracked on the same `sync.WaitGroup`), then starts `pkg/prefixdelegation.Maintain`
-  in a background goroutine (tracked on that `sync.WaitGroup` that `run()` waits on before returning, so a
-  shutdown's best-effort `Release` and every RA worker's best-effort final advertisement all get a chance
-  to finish) with that same `Reconcile`+`RAManager.Sync` pair as its `onLeaseChange` callback. When
+  `-lan` interface), then starts `internal/pdlease`'s tree as the `DHCPv6-PD` application with that same
+  `Reconcile`+`RAManager.Sync` pair as its `Apply` — stopped before the DHCPv6 client app (reverse start
+  order), so its shutdown `Release` still has a client to go through. When
   `-ndproxy` is set instead, `runNDProxy()` starts `internal/ndppd`'s tree as the `NDProxy` application on
   the WAN and `-lan` interfaces, its routes `internal/wanextend.HostRoutes`, then hands the `-lan` interface
   names to `internal/wanextend.Serve`, which owns the prefix flow (see that package's own entry below) and
@@ -858,6 +858,16 @@ orphaned the running kernel's module directory — reboot to fix that).
   `sweep` timer every `SweepInterval`; a confirmed host is a `Cast` to the routes process. rest_for_one
   because the proxy tells the routes process what to do: a restarted routes process takes the proxy with
   it, which starts afresh, re-confirming hosts as the WAN asks for them. `cmd/minuteman` starts it as the `NDProxy` application.
+- **`internal/pdlease`** — keeps the DHCPv6-PD lease as a molecule supervision tree (`dhcpv6-pd`,
+  one_for_one): the `dhcpv6-pd apply` genserver, impure, calling the caller's `Apply` for each new lease it
+  is cast (netlink and RAs, kept out of the lease process so its timers aren't held up), and the
+  `dhcpv6-pd lease` genstatem climbing `pkg/prefixdelegation`'s ladder: `Bound` (a state timeout at
+  `RenewAt`, absolute, so the behaviour never reads a clock) → `Renewing` → `Rebinding` → `Soliciting`, each
+  exchange a `molecule.Async` (they block, retransmitting to their deadlines) whose outcome moves it up or
+  down. Pure; the exchanges and the release are injectable for `lease_test.go`. It traps exits: on shutdown
+  `Terminate` releases the lease (bounded 5s), unless it expired (`Soliciting`); a crash doesn't, and the
+  restarted process starts from the lease cmd acquired again — before its T1 still current, past it renewed
+  (or rebound, or re-acquired) at once.
 - **`internal/wanextend`** — the NDProxy *policy* layer, mirroring `internal/lanprefix`'s split from its
   protocol client (`pkg/ndproxy`) but for the single-shared-WAN-`/64` model instead of a distinct PD
   delegation. `discover.go`'s `DiscoverPrefix(ctx, wanIfindex)` blocks, polling `pkg/netlink.Socket.Addrs`

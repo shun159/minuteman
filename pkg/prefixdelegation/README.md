@@ -4,10 +4,9 @@ DHCPv6 Prefix Delegation (RFC 3633 / RFC 9915) on top of `pkg/dhcpv6`'s stateful
 acquire a delegated IPv6 prefix and keep it alive, in-process, with no external DHCP client.
 
 It mirrors `pkg/aftrdiscovery`'s shape — RFC-specific option decoding plus an orchestration
-entry point over a generic client — with one significant addition: this package also **maintains**
-the lease. `aftrdiscovery` reports its refresh interval and leaves acting on it to the caller,
-because a stale AFTR reading is merely stale; a lease that is never renewed actually expires and
-breaks LAN connectivity.
+entry point over a generic client — with one addition: the exchanges that **maintain** the lease
+(`Renew`, `Rebind`, `Release`) and the times of its renewal ladder. Climbing the ladder — waiting
+for each step, applying each new lease — is `internal/pdlease`'s, a molecule process.
 
 What to *do* with the delegated prefix — carving a `/64` per LAN interface, assigning it,
 advertising it — is `internal/lanprefix`, not this package.
@@ -19,7 +18,7 @@ advertising it — is `internal/lanprefix`, not this package.
 | `options.go` | `IA_PD` / `IAPREFIX` / `STATUS_CODE` codec (package doc lives here) |
 | `lease.go` | `Lease`, `clientIAID`, the outgoing IA_PD rebuild |
 | `acquire.go` | `Acquire`, `usableIAPD` validation, the ORO |
-| `maintain.go` | `Maintain` — the Renew → Rebind → re-Acquire ladder |
+| `renew.go` | `Renew`, `Rebind`, `Release`, and the ladder's times: `RenewAt`, `RebindAt`, `ExpiresAt` |
 | `timers.go` | `effectiveTimers` — what to do when the server sends T1/T2 = 0 |
 
 `options.go` decodes IA_PD's nested suboptions with `dhcpv6.ParseSubOptions`, since the nested
@@ -60,28 +59,25 @@ Consequently a *renewal* takes its DNS servers from its own Reply rather than in
 previous lease's: the ORO went out with it too, so silence there is the server declining to
 answer a question it was asked, not a question that went unasked.
 
-## `Maintain` — the renewal ladder
+## The renewal ladder (`renew.go`)
 
 ```
-sleep until T1 ──► Renew  (deadline: T2)
-                     ├─ ok ──► onLeaseChange, loop
-                     └─ fail ──► Rebind  (deadline: shortest remaining valid lifetime)
-                                    ├─ ok ──► onLeaseChange, loop
-                                    └─ fail ──► Acquire (blocks) ──► onLeaseChange, loop
+RenewAt (T1) ──► Renew  (deadline: RebindAt, T2)
+                   ├─ ok ──► the new lease
+                   └─ fail ──► Rebind  (deadline: ExpiresAt, the shortest valid lifetime)
+                                  ├─ ok ──► the new lease
+                                  └─ fail ──► Acquire (blocks) ──► the new lease
 ```
 
 Each stage's deadline is the point the RFC says that stage stops being valid: Renew until T2
 (§18.1.3), Rebind until the binding's shortest valid lifetime (§18.1.4). `pkg/dhcpv6` deliberately
-doesn't know about lease timing, so these deadlines are applied here as `ctx` deadlines.
+doesn't know about lease timing, so `Renew` and `Rebind` apply these deadlines themselves, as
+`ctx` deadlines. Each is one exchange; the ladder around them, and what a new lease means for the
+LAN, are `internal/pdlease`'s (and `internal/lanprefix`'s).
 
-`onLeaseChange` fires on every actual change but **not** for the lease passed in — the caller is
-expected to have applied that one already. `cmd/minuteman` passes `internal/lanprefix`'s
-`Reconcile` + `RAManager.Sync` pair.
-
-Blocks until `ctx` is cancelled, then sends a best-effort `Release` (§18.1.6) on a **fresh**
-context — inheriting the already-cancelled one would mean never getting a single attempt out.
-Failures are logged, not returned: a client stops using a binding locally whether or not the
-server ever acknowledges, and shutdown must not block on it.
+`Release` (§18.1.6) is bounded by its `ctx` only: a client stops using a binding locally whether
+or not the server ever acknowledges, so a caller shutting down bounds it short and logs a failure
+rather than waiting it out.
 
 ## `effectiveTimers` — the T1/T2 = 0 problem
 

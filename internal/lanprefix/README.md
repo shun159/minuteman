@@ -13,8 +13,8 @@ The split is deliberate and mirrors `internal/wanextend`'s split from `pkg/ndpro
 
 `cmd/minuteman`'s `runPrefixDelegation` is the only caller, and it uses this package twice:
 once synchronously at startup (so the datapath isn't reported "up" before the LAN addresses
-exist) and then as `prefixdelegation.Maintain`'s `onLeaseChange` callback, so every renewal
-runs the same `Reconcile` + `RAManager.Sync` pair.
+exist) and then as `internal/pdlease`'s `Apply`, so every renewal runs the same `Reconcile` +
+`RAManager.Sync` pair.
 
 ## Files
 

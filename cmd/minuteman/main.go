@@ -42,6 +42,7 @@ import (
 	"github.com/shun159/miniteman/internal/fragpath"
 	"github.com/shun159/miniteman/internal/lanprefix"
 	"github.com/shun159/miniteman/internal/ndppd"
+	"github.com/shun159/miniteman/internal/pdlease"
 	"github.com/shun159/miniteman/internal/radvd"
 	"github.com/shun159/miniteman/internal/slowpath"
 	"github.com/shun159/miniteman/internal/softwirectl"
@@ -274,9 +275,10 @@ func run() error {
 	// minuteman's supervision trees, started as applications as each is
 	// needed (see startApps). They are stopped, in reverse order, by the
 	// second deferred stopApps further down: after the rest of run's
-	// goroutines -- the DHCPv6-PD maintenance releases its lease through
-	// the DHCPv6 client on its way out -- and before what they drive is
-	// closed. This one stops them on an earlier return.
+	// goroutines, and before what they drive is closed. As they stop in
+	// reverse order, DHCPv6-PD releases its lease through the DHCPv6
+	// client, which, started before it, still runs. This one stops them on
+	// an earlier return.
 	node := proc.NewNode("")
 	apps, stopApps, err := startApps(ctx, fail, node)
 	if err != nil {
@@ -485,7 +487,7 @@ func run() error {
 		adv = radvd.NewAdvertiser(node)
 	}
 	if *requestPD {
-		if err := runPrefixDelegation(ctx, dhcp, adv, *wanIface, pdLease, lans, rdnssByIface, &bgWG); err != nil {
+		if err := runPrefixDelegation(ctx, apps, dhcp, adv, *wanIface, pdLease, lans, rdnssByIface); err != nil {
 			return err
 		}
 	}
@@ -553,15 +555,14 @@ func pdDNSServers(lease *prefixdelegation.Lease) []netip.Addr {
 // early, before AFTR discovery, so its DNS servers can feed the HB46PP
 // fallback -- see the call site), assigns the LAN addresses it carves from
 // it and starts advertising each carved /64 to LAN clients via Router
-// Advertisements (see reconcileAndLog), and starts the background
-// lease-maintenance goroutine that keeps renewing it, registering that
-// goroutine on wg so callers can wait for its shutdown-triggered Release
-// (and every RA worker's shutdown-triggered final RouterLifetime=0
-// advertisement) to finish before exiting. rdnssByIface is forwarded to
-// lanprefix.NewRAManager (see its own doc) -- it's the map of link-local
-// addresses startDNSProxy actually bound, so RDNSS is advertised only where
-// a DNS proxy is really listening.
-func runPrefixDelegation(ctx context.Context, dhcp dhcpv6.Exchanger, adv radvd.Advertiser, wanIface string, lease *prefixdelegation.Lease, lans cliconfig.LANSpecList, rdnssByIface map[string]netip.Addr, wg *sync.WaitGroup) error {
+// Advertisements (see reconcileAndLog), and starts internal/pdlease's tree,
+// as an application, keeping the lease: renewing it through dhcp, applying
+// each new one the same way, releasing it when stopped -- before the DHCPv6
+// client it releases through, which was started first. rdnssByIface is
+// forwarded to lanprefix.NewRAManager (see its own doc) -- it's the map of
+// link-local addresses startDNSProxy actually bound, so RDNSS is advertised
+// only where a DNS proxy is really listening.
+func runPrefixDelegation(ctx context.Context, apps *application.Running, dhcp dhcpv6.Exchanger, adv radvd.Advertiser, wanIface string, lease *prefixdelegation.Lease, lans cliconfig.LANSpecList, rdnssByIface map[string]netip.Addr) error {
 	lanIfaces := make([]string, len(lans))
 	for i, spec := range lans {
 		lanIfaces[i] = spec.Iface
@@ -589,13 +590,12 @@ func runPrefixDelegation(ctx context.Context, dhcp dhcpv6.Exchanger, adv radvd.A
 	}
 	reconcileAndLog(lease) // initial assignment, before minuteman is considered "up"
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := prefixdelegation.Maintain(ctx, dhcp, lease, reconcileAndLog); err != nil {
-			log.Printf("DHCPv6-PD maintenance loop ended unexpectedly: %v", err)
-		}
-	}()
+	// reconcileAndLog's assigned outlives a restart of the process applying
+	// the leases: it is what the LAN interfaces really have.
+	spec := pdlease.Spec(pdlease.Config{Exchanger: dhcp, Lease: lease, Apply: reconcileAndLog})
+	if err := apps.Start(ctx, app("DHCPv6-PD", spec)); err != nil {
+		return fmt.Errorf("starting DHCPv6-PD lease maintenance: %w", err)
+	}
 	return nil
 }
 

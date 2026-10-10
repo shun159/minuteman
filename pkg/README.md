@@ -31,9 +31,10 @@ each takes an explicit `now` or plain values rather than reading a clock or a so
 I/O and goroutine orchestration are covered by the netns rig instead (`test/netns/README.md`).
 
 **Policy is reported, not enacted.** `aftrdiscovery` returns RFC 4242's refresh interval and
-`hb46pp` returns a `RetryDelay` window; neither sleeps on it. The exception is
-`prefixdelegation.Maintain`, and for a concrete reason: an unrenewed lease actually expires and
-breaks LAN connectivity, where a stale discovery result is merely stale.
+`hb46pp` returns a `RetryDelay` window; neither sleeps on it. `prefixdelegation`
+goes one step further, with the exchanges and times of a lease's renewal ladder, and for a concrete
+reason: an unrenewed lease actually expires and breaks LAN connectivity, where a stale discovery
+result is merely stale. Climbing it is still the caller's (`internal/pdlease`).
 
 Each package's README covers its own rationale; `CLAUDE.md`'s Architecture section is the
 cross-cutting view.
