@@ -19,9 +19,11 @@ Same pure-vs-I/O split as `pkg/ndproxy`:
 | `message.go` | BOOTP header + magic cookie framing (package doc lives here) | yes |
 | `options.go` | option TLV codec | yes |
 | `lease.go` | `Pool` — the address allocator | yes |
-| `handler.go` | `handle` — request → reply (or silence) | yes |
-| `packet.go` | raw `AF_PACKET` I/O | no |
-| `server.go` | `New`, `Serve`, per-interface goroutines | no |
+| `handler.go` | `Handle` — request → reply (or silence) | yes |
+| `packet.go` | `ParseRequest`, `Frame`: IPv4+UDP in and out of the packet socket; its BPF `Filter` | yes |
+
+The package holds no socket: `internal/dhcpv4server` runs the server, a molecule process per LAN
+interface owning its `AF_PACKET` socket and `Pool`.
 
 `Options.Marshal` splits a value past 255 bytes across repeated option instances per RFC 3396,
 rather than truncating a length byte.
@@ -90,17 +92,6 @@ rejected.
 | `DNSServers` | option 6; normally `ServerIP` itself, so LAN DNS goes to `-dns-proxy` and over IPv6 rather than through the softwire. Empty omits the option — `cmd/minuteman` declines to advertise a resolver that wouldn't answer |
 | `MTU` | option 26; the **DS-Lite-adjusted** MTU — WAN MTU minus the 40-byte tunnel overhead — so clients size packets to fit the softwire. 0 omits it |
 | `LeaseTime` | |
-
-## `New` then `Serve` (`server.go`)
-
-`New([]InterfaceConfig)` validates every pool and opens every socket **synchronously**, so an
-invalid subnet, a missing interface or a socket/filter failure fails minuteman's startup instead
-of surfacing only in a background log line. On any failure every already-opened socket is closed.
-
-`Serve(ctx)` runs one goroutine and one `Pool` per interface. A worker's runtime **read error is
-propagated, not swallowed** — a single interface's DHCP dying is surfaced — while the read errors
-that closing the sockets on shutdown provokes are suppressed via a `shuttingDown` flag. `conn` is
-an interface so a fake can exercise that error handling without a raw socket.
 
 ## Testing
 

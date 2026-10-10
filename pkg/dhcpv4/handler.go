@@ -24,11 +24,11 @@ type InterfaceConfig struct {
 	LeaseTime time.Duration
 }
 
-// handle turns one received request into the reply the server should send,
+// Handle turns one received request into the reply the server should send,
 // or nil to stay silent. It is pure: the only state it mutates is pool, and
 // it reads the clock only through now. The returned message's Flags/CIAddr/
 // YIAddr/CHAddr are what packet.go's destination logic keys off.
-func handle(cfg InterfaceConfig, pool *Pool, req *Message, now time.Time) *Message {
+func Handle(cfg InterfaceConfig, pool *Pool, req *Message, now time.Time) *Message {
 	if req.Op != OpBootRequest {
 		return nil
 	}

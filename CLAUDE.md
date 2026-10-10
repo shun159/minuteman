@@ -683,14 +683,15 @@ orphaned the running kernel's module directory — reboot to fix that).
   returning client's INIT-REBOOT after a restart wiped the pool — gets silence, not an ACK of a free
   address, so independent servers on one segment coexist; the client falls back to DISCOVER), validates the
   server-id on RELEASE/DECLINE, and leaves `siaddr` zero (it's the next-bootstrap-server field, not the
-  server id). All three files are unit-tested with no sockets. `packet.go` is the raw AF_PACKET I/O (a DHCP
-  server can't use an ordinary UDP socket: it must reply to a client that has no IP/ARP entry yet and honour
-  the broadcast flag), building/parsing IPv4+UDP itself (with checksums) and a classic-BPF filter for UDP
-  dport 67, the same cooked-`SOCK_DGRAM` approach `pkg/ndproxy`'s `packet.go` uses. `server.go`'s
-  `New([]InterfaceConfig)` validates every pool and opens every socket *synchronously* (so a bad subnet or a
-  socket failure fails `cmd/minuteman`'s startup instead of surfacing only in a background log line), and the
-  returned `*Server`'s `Serve(ctx)` runs one goroutine + `Pool` per interface, propagating a worker's runtime
-  read error rather than swallowing it (a fake `conn` makes that testable). See the `xdp_dslite_encap`
+  server id). `packet.go` frames and parses for the raw AF_PACKET socket (a DHCP server can't use an
+  ordinary UDP socket: it must reply to a client that has no IP/ARP entry yet and honour the broadcast flag):
+  `ParseRequest`/`Frame` build and parse IPv4+UDP itself (with checksums), and `Filter` is the classic-BPF
+  filter for UDP dport 67, the same cooked-`SOCK_DGRAM` approach `pkg/ndproxy`'s `packet.go` uses. All of it
+  is unit-tested with no sockets; the package holds none. `internal/dhcpv4server` runs the server: a molecule
+  supervision tree, one genserver per LAN interface owning its `net/socket` AF_PACKET socket (read `Once` per
+  request) and its `Pool` (cloned per request, so the behaviour stays pure; the clock is injected), the
+  tree's start validating every pool and opening every socket so a bad subnet or socket failure fails
+  `cmd/minuteman`'s startup. See the `xdp_dslite_encap`
   `is_non_unicast_dst` bypass above for why the datapath had to change before any of this could receive a
   packet.
 - **`pkg/ethtool/`** — minimal hand-rolled `SIOCETHTOOL` client reading exactly one thing: a device's
@@ -830,8 +831,8 @@ orphaned the running kernel's module directory — reboot to fix that).
   immediately. If `-dhcpv4` is set, `runDHCPv4()` builds one `pkg/dhcpv4.InterfaceConfig`
   per `-lan` (subnet from its `/prefixlen`, gateway as router; DNS = `-dhcpv4-dns`, else the gateway when
   `-dns-proxy` runs, else omitted; MTU = the `-lan` MTU or else the WAN MTU minus the 40-byte tunnel
-  overhead, dropped if below the IPv4 minimum) and constructs the server with `pkg/dhcpv4.New` *synchronously*
-  so a bad subnet or socket failure fails startup, then runs it; `run()` also rejects a `-dhcpv4-lease`
+  overhead, dropped if below the IPv4 minimum) and starts `internal/dhcpv4server`'s tree as an application,
+  whose start fails on a bad subnet or socket failure; `run()` also rejects a `-dhcpv4-lease`
   shorter than `minDHCPv4Lease`. All these background goroutines are tracked on the same `sync.WaitGroup`.
   Otherwise `main.go` just orchestrates
   `pkg/datapath.Loader` calls (`Load`/`AttachWAN`/`SetB4Config`/`AttachLAN`+`SetLANConfig` per `-lan`/`Stats`

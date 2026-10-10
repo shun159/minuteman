@@ -219,3 +219,20 @@ func TestNewPoolValidation(t *testing.T) {
 		}
 	}
 }
+
+// A Clone changes independently of its Pool.
+func TestPoolClone(t *testing.T) {
+	p := newTestPool(t)
+	now := time.Now()
+	c := p.Clone()
+	ip, ok := c.Offer("client", netip.Addr{}, now)
+	if !ok {
+		t.Fatal("Offer on the clone failed")
+	}
+	if _, held := p.Binding("client", now); held {
+		t.Error("the original holds the clone's offer")
+	}
+	if got, held := c.Binding("client", now); !held || got != ip {
+		t.Errorf("clone binding %v %v, want %v", got, held, ip)
+	}
+}

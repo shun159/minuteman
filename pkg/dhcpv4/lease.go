@@ -3,6 +3,7 @@ package dhcpv4
 import (
 	"encoding/binary"
 	"fmt"
+	"maps"
 	"net/netip"
 	"time"
 )
@@ -46,8 +47,8 @@ type lease struct {
 // and which are quarantined by a DHCPDECLINE. Like pkg/ndproxy's proxyState
 // it's pure — every method takes an explicit now instead of reading the
 // clock, so it's unit-tested with no timers — and, like the rest of
-// minuteman's state, it's in-memory only. Not safe for concurrent use;
-// server.go drives one Pool from a single per-interface goroutine.
+// minuteman's state, it's in-memory only. Not safe for concurrent use; a
+// caller that must not change a Pool it holds works on a Clone.
 type Pool struct {
 	subnet    netip.Prefix
 	serverIP  netip.Addr
@@ -84,6 +85,15 @@ func NewPool(subnet netip.Prefix, serverIP netip.Addr, duration time.Duration) (
 		byIP:      make(map[netip.Addr]string),
 		declined:  make(map[netip.Addr]time.Time),
 	}, nil
+}
+
+// Clone returns a copy of p, which changes independently of it.
+func (p *Pool) Clone() *Pool {
+	c := *p
+	c.byClient = maps.Clone(p.byClient)
+	c.byIP = maps.Clone(p.byIP)
+	c.declined = maps.Clone(p.declined)
+	return &c
 }
 
 // Offer reserves an address for a DISCOVER from clientID and returns it,

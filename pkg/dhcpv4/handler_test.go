@@ -36,11 +36,11 @@ func clientReq(mt MessageType, opts ...Option) *Message {
 // returns the acquired address.
 func doDORA(t *testing.T, cfg InterfaceConfig, pool *Pool, now time.Time) netip.Addr {
 	t.Helper()
-	offer := handle(cfg, pool, clientReq(Discover), now)
+	offer := Handle(cfg, pool, clientReq(Discover), now)
 	if offer == nil {
 		t.Fatal("no OFFER")
 	}
-	ack := handle(cfg, pool, clientReq(Request,
+	ack := Handle(cfg, pool, clientReq(Request,
 		NewAddr(OptServerID, cfg.ServerIP), NewAddr(OptRequestedIP, offer.YIAddr)), now)
 	if ack == nil {
 		t.Fatal("no ACK")
@@ -53,7 +53,7 @@ func doDORA(t *testing.T, cfg InterfaceConfig, pool *Pool, now time.Time) netip.
 
 func TestHandleDiscoverProducesOffer(t *testing.T) {
 	cfg, pool := testConfig()
-	reply := handle(cfg, pool, clientReq(Discover), time.Now())
+	reply := Handle(cfg, pool, clientReq(Discover), time.Now())
 	if reply == nil {
 		t.Fatal("DISCOVER produced no reply")
 	}
@@ -82,13 +82,13 @@ func TestHandleFullDORA(t *testing.T) {
 func TestHandleRequestForOtherServerCancelsOfferAndIsSilent(t *testing.T) {
 	cfg, pool := testConfig()
 	now := time.Now()
-	offer := handle(cfg, pool, clientReq(Discover), now)
+	offer := Handle(cfg, pool, clientReq(Discover), now)
 
 	req := clientReq(Request,
 		NewAddr(OptServerID, netip.MustParseAddr("192.168.1.254")), // a different server
 		NewAddr(OptRequestedIP, offer.YIAddr),
 	)
-	if reply := handle(cfg, pool, req, now); reply != nil {
+	if reply := Handle(cfg, pool, req, now); reply != nil {
 		t.Fatalf("REQUEST selecting another server: want silence, got %v", reply)
 	}
 	// Our tentative offer must have been released immediately.
@@ -106,7 +106,7 @@ func TestHandleSelectingUnofferedAddressNAKs(t *testing.T) {
 		NewAddr(OptServerID, cfg.ServerIP),
 		NewAddr(OptRequestedIP, netip.MustParseAddr("192.168.1.77")),
 	)
-	reply := handle(cfg, pool, req, now)
+	reply := Handle(cfg, pool, req, now)
 	if reply == nil {
 		t.Fatal("SELECTING for an un-offered address produced no reply, want NAK")
 	}
@@ -121,7 +121,7 @@ func TestHandleUnknownInitRebootIsSilent(t *testing.T) {
 	// server has no record of MUST be silent (RFC 2131 §4.3.2) -- not an ACK
 	// of a free address (the old, non-compliant behavior) and not a NAK.
 	req := clientReq(Request, NewAddr(OptRequestedIP, netip.MustParseAddr("192.168.1.50")))
-	if reply := handle(cfg, pool, req, time.Now()); reply != nil {
+	if reply := Handle(cfg, pool, req, time.Now()); reply != nil {
 		t.Fatalf("unknown INIT-REBOOT: want silence, got %v", reply)
 	}
 }
@@ -137,7 +137,7 @@ func TestHandleInitRebootWrongAddressNAKs(t *testing.T) {
 	if wrong == ip {
 		wrong = netip.MustParseAddr("192.168.1.201")
 	}
-	reply := handle(cfg, pool, clientReq(Request, NewAddr(OptRequestedIP, wrong)), now)
+	reply := Handle(cfg, pool, clientReq(Request, NewAddr(OptRequestedIP, wrong)), now)
 	if reply == nil {
 		t.Fatal("INIT-REBOOT for the wrong held address produced no reply, want NAK")
 	}
@@ -156,7 +156,7 @@ func TestHandleRenewingUsesCiaddr(t *testing.T) {
 
 	renew := clientReq(Request) // no server-id, no requested-ip, ciaddr set
 	renew.CIAddr = ip
-	ack := handle(cfg, pool, renew, now.Add(6*time.Hour))
+	ack := Handle(cfg, pool, renew, now.Add(6*time.Hour))
 	if ack == nil {
 		t.Fatal("RENEW produced no reply")
 	}
@@ -175,7 +175,7 @@ func TestHandleReleaseFreesLease(t *testing.T) {
 
 	rel := clientReq(Release, NewAddr(OptServerID, cfg.ServerIP))
 	rel.CIAddr = ip
-	if reply := handle(cfg, pool, rel, now); reply != nil {
+	if reply := Handle(cfg, pool, rel, now); reply != nil {
 		t.Fatalf("RELEASE should get no reply, got %v", reply)
 	}
 	if _, ok := pool.Binding("52:54:00:aa:bb:cc", now); ok {
@@ -189,13 +189,13 @@ func TestHandleDeclineRequiresServerIDAndOwnership(t *testing.T) {
 	ip := doDORA(t, cfg, pool, now)
 
 	// A DECLINE without a server identifier is ignored (no quarantine).
-	handle(cfg, pool, clientReq(Decline, NewAddr(OptRequestedIP, ip)), now)
+	Handle(cfg, pool, clientReq(Decline, NewAddr(OptRequestedIP, ip)), now)
 	if !pool.allocatable(ip, now) {
 		t.Fatal("DECLINE without server-id quarantined the address anyway")
 	}
 
 	// A DECLINE naming another server is ignored.
-	handle(cfg, pool, clientReq(Decline,
+	Handle(cfg, pool, clientReq(Decline,
 		NewAddr(OptServerID, netip.MustParseAddr("192.168.1.254")),
 		NewAddr(OptRequestedIP, ip)), now)
 	if !pool.allocatable(ip, now) {
@@ -203,7 +203,7 @@ func TestHandleDeclineRequiresServerIDAndOwnership(t *testing.T) {
 	}
 
 	// A well-formed DECLINE from the owning client quarantines it.
-	handle(cfg, pool, clientReq(Decline,
+	Handle(cfg, pool, clientReq(Decline,
 		NewAddr(OptServerID, cfg.ServerIP),
 		NewAddr(OptRequestedIP, ip)), now)
 	if pool.allocatable(ip, now) {
@@ -215,7 +215,7 @@ func TestHandleRejectsRelayedRequest(t *testing.T) {
 	cfg, pool := testConfig()
 	req := clientReq(Discover)
 	req.GIAddr = netip.MustParseAddr("10.0.0.1") // came via a BOOTP relay
-	if reply := handle(cfg, pool, req, time.Now()); reply != nil {
+	if reply := Handle(cfg, pool, req, time.Now()); reply != nil {
 		t.Fatalf("relayed (giaddr!=0) request: want silence (relay unsupported), got %v", reply)
 	}
 }
@@ -223,7 +223,7 @@ func TestHandleRejectsRelayedRequest(t *testing.T) {
 func TestRepliesLeaveSiaddrZero(t *testing.T) {
 	cfg, pool := testConfig()
 	now := time.Now()
-	offer := handle(cfg, pool, clientReq(Discover), now)
+	offer := Handle(cfg, pool, clientReq(Discover), now)
 	// siaddr (next bootstrap server) must be 0.0.0.0: it's not the server id,
 	// and a non-zero value could make a PXE client treat this CPE as a boot
 	// server.
@@ -236,7 +236,7 @@ func TestHandleInformReturnsConfigWithoutLease(t *testing.T) {
 	cfg, pool := testConfig()
 	inform := clientReq(Inform)
 	inform.CIAddr = netip.MustParseAddr("192.168.1.200")
-	ack := handle(cfg, pool, inform, time.Now())
+	ack := Handle(cfg, pool, inform, time.Now())
 	if ack == nil {
 		t.Fatal("INFORM produced no reply")
 	}
@@ -256,7 +256,7 @@ func TestHandleInformReturnsConfigWithoutLease(t *testing.T) {
 
 func TestHandleIgnoresServerMessageTypes(t *testing.T) {
 	cfg, pool := testConfig()
-	if reply := handle(cfg, pool, clientReq(ACK), time.Now()); reply != nil {
+	if reply := Handle(cfg, pool, clientReq(ACK), time.Now()); reply != nil {
 		t.Errorf("a client sending ACK should be ignored, got %v", reply)
 	}
 }

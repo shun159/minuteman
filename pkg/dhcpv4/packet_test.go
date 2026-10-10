@@ -99,3 +99,29 @@ func TestDestinationBroadcastVsUnicast(t *testing.T) {
 		}
 	})
 }
+
+// ParseRequest takes a DHCP request as the packet socket delivers it, and
+// Frame frames the reply to it.
+func TestParseRequestAndFrame(t *testing.T) {
+	req := &Message{Op: OpBootRequest, HType: 1, HLen: 6, XID: 0x1234,
+		CHAddr: net.HardwareAddr{2, 0, 0, 0, 0, 9}, Options: Options{{Code: OptMessageType, Data: []byte{byte(Discover)}}}}
+	server := netip.MustParseAddr("192.168.1.1")
+	packet := buildFrame(netip.IPv4Unspecified(), netip.MustParseAddr("255.255.255.255"), req.Marshal())
+	packet[20], packet[21], packet[22], packet[23] = 0, 68, 0, 67 // client port to server port
+	got, ok := ParseRequest(packet)
+	if !ok || got.XID != req.XID || !bytes.Equal(got.CHAddr, req.CHAddr) {
+		t.Fatalf("ParseRequest = %+v, %v", got, ok)
+	}
+	if _, ok := ParseRequest(packet[:20]); ok {
+		t.Error("ParseRequest took a truncated packet")
+	}
+
+	reply := &Message{Op: OpBootReply, XID: req.XID, Flags: 0x8000, CHAddr: req.CHAddr}
+	frame, mac := Frame(server, reply)
+	if !bytes.Equal(mac, net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}) {
+		t.Errorf("broadcast reply to %v", mac)
+	}
+	if !bytes.Equal(frame[12:16], server.AsSlice()) || !bytes.Equal(frame[16:20], []byte{255, 255, 255, 255}) {
+		t.Errorf("frame %v -> %v", frame[12:16], frame[16:20])
+	}
+}
