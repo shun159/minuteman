@@ -132,7 +132,7 @@ func TestEffectiveTimers(t *testing.T) {
 // TestEffectiveTimersNeverImmediateOrInverted covers RFC 9915 §14.2's two
 // hard requirements over a spread of server inputs -- the client never
 // transmits immediately (T1 > 0), and the Renew-then-Rebind ladder stays
-// ordered so Maintain's renew deadline (T2) is always after its renew
+// ordered so Renew's deadline (T2) is always after its renew
 // time (T1) -- plus the ceiling that keeps a derived timer inside the
 // binding's own life.
 func TestEffectiveTimersNeverImmediateOrInverted(t *testing.T) {

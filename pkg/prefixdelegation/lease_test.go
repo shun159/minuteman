@@ -68,3 +68,25 @@ func TestNewLeaseResolvesTimers(t *testing.T) {
 		t.Fatalf("got %d prefixes, want 1", len(lease.Prefixes))
 	}
 }
+
+func TestLeaseLadderTimes(t *testing.T) {
+	at := time.Date(2026, 10, 10, 0, 0, 0, 0, time.UTC)
+	lease := &Lease{
+		Prefixes: []IAPrefix{
+			{ValidLifetime: 7200 * time.Second, Prefix: netip.MustParsePrefix("2001:db8:1::/56")},
+			{ValidLifetime: 3600 * time.Second, Prefix: netip.MustParsePrefix("2001:db8:2::/56")},
+		},
+		T1:         1800 * time.Second,
+		T2:         2880 * time.Second,
+		AcquiredAt: at,
+	}
+	if got := lease.RenewAt(); !got.Equal(at.Add(30 * time.Minute)) {
+		t.Errorf("RenewAt() = %v, want T1 after AcquiredAt", got)
+	}
+	if got := lease.RebindAt(); !got.Equal(at.Add(48 * time.Minute)) {
+		t.Errorf("RebindAt() = %v, want T2 after AcquiredAt", got)
+	}
+	if got := lease.ExpiresAt(); !got.Equal(at.Add(time.Hour)) {
+		t.Errorf("ExpiresAt() = %v, want the shortest valid lifetime after AcquiredAt", got)
+	}
+}

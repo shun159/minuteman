@@ -31,7 +31,7 @@ const minDerivedT1 = time.Minute
 // recommended ones -- 0.5 and 0.8 times the shortest preferred lifetime
 // of the delegated prefixes, the ratios that section recommends to a
 // server picking T1/T2 -- floored by minDerivedT1 and kept ordered
-// T1 <= T2 so Maintain's Renew-then-Rebind ladder stays meaningful.
+// T1 <= T2 so the Renew-then-Rebind ladder (renew.go) stays meaningful.
 //
 // Both derived values are additionally kept inside the lease's own life:
 // the binding is gone at the shortest valid lifetime, and a Renew
@@ -79,8 +79,8 @@ func effectiveTimers(iapd *IAPD) (t1, t2 time.Duration) {
 		}
 		if valid > t1 && t2 > valid {
 			// Renewing beyond the binding's own valid lifetime is
-			// pointless -- that instant is where Maintain gives up on it
-			// anyway (tryRebind's deadline) -- so stop the Renew stage
+			// pointless -- that instant is where the ladder gives up on it
+			// anyway (Rebind's deadline) -- so stop the Renew stage
 			// there. Guarded on valid > t1 so a server T1 already past
 			// the lifetime can't invert the ladder.
 			t2 = valid

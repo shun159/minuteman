@@ -153,7 +153,7 @@ resolvers to work with:
 - **`run()` acquires the PD lease before AFTR discovery**, and hands its servers to `resolveAFTR`,
   the re-discovery of `internal/softwirectl`, and (behind `-dns-server` and the discovery-learned set) `-dns-proxy`'s upstreams.
   Only the `Acquire` call moved; `runPrefixDelegation` now takes the already-acquired lease and does the
-  LAN assignment, RA workers and `Maintain` in its old position. Both exchanges go through the WAN's one
+  LAN assignment, RA workers and lease maintenance (now `internal/pdlease`) in its old position. Both exchanges go through the WAN's one
   DHCPv6 client (`internal/dhcpv6client`), which runs them one at a time, so their concurrency is unchanged.
 
 One judgement call worth recording: a failure reached *through* `ErrNoReply` has its retry delay capped at
