@@ -73,7 +73,7 @@ further down — this is just the index of what exists and which flag turns it o
   quoted (`handle_tunnel_icmpv6`, RFC 7915 §5.3's type table, sourced from `192.0.0.2`), and a Packet Too
   Big also records a softwire path MTU the encap side's own `bpf_check_mtu` can never see — it only knows
   the local WAN device. Encap clamps against that reading per packet; the fragment size and the companion
-  ip6tnl's MTU are re-derived from it by userspace (`cmd/minuteman`'s `watchTunnelPMTU`), because the
+  ip6tnl's MTU are re-derived from it by userspace (`internal/tunnelpmtu`), because the
   fragmenter's two halves read `frag_unit` at different moments and a value that changed in between would
   produce an unreassemblable fragment set. A Packet Too Big about a *non-DF* packet is consumed rather than
   relayed: the answer there is to fragment at the learned MTU, not to push the problem back.
@@ -98,7 +98,7 @@ All of the above has been verified end-to-end against the netns rig (see Testing
 
 `internal/` holds `cliconfig` (CLI flag parsing), `lanprefix` (DHCPv6-PD LAN policy, including RA
 serving), `wanextend` (NDProxy LAN policy, including RA serving and host-route management), `ndppd`
-(the ND proxy itself), `pdlease` (the DHCPv6-PD lease kept), `slowpath`
+(the ND proxy itself), `pdlease` (the DHCPv6-PD lease kept), `tunnelpmtu` (the learned softwire path MTU applied), `slowpath`
 (the DS-Lite companion `ip6tnl` lifecycle for softwire reassembly + fragmentation fallback), and
 `fragpath` (the companion veth pairs the in-XDP softwire fragmenter bounces its clones through);
 `pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/`pkg/prefixdelegation`/`pkg/routeradvert`/`pkg/ndproxy`/
@@ -792,7 +792,7 @@ orphaned the running kernel's module directory — reboot to fix that).
   cleanly) then re-triggers AFTR discovery. A switch can happen in any phase, so a WAN change interrupts
   even a multi-hour drain; it bumps a generation that makes every response still in flight stale. The
   datapath, tunnel and netlink calls are made by the tree's `softwire` server, discovery in a
-  `molecule.Async` of the controller's; see `internal/softwirectl/README.md`. `watchTunnelPMTU()` (always started, `pmtu.go`) polls the path MTU the datapath learns from inbound
+  `molecule.Async` of the controller's; see `internal/softwirectl/README.md`. `internal/tunnelpmtu`'s tree (always started, the `tunnel PMTU` application) polls the path MTU the datapath learns from inbound
   ICMPv6 Packet Too Big messages and applies it to the two things userspace owns — the fragmenter's
   `frag_unit` and the companion ip6tnl's MTU — including the widening direction, since a reading that ages
   out simply stops being reported. When `-dhcpv6-pd` is set, `runPrefixDelegation()` similarly blocks
@@ -803,9 +803,9 @@ orphaned the running kernel's module directory — reboot to fix that).
   `Reconcile`+`RAManager.Sync` pair as its `Apply` — stopped before the DHCPv6 client app (reverse start
   order), so its shutdown `Release` still has a client to go through. When
   `-ndproxy` is set instead, `runNDProxy()` starts `internal/ndppd`'s tree as the `NDProxy` application on
-  the WAN and `-lan` interfaces, its routes `internal/wanextend.HostRoutes`, then hands the `-lan` interface
-  names to `internal/wanextend.Serve`, which owns the prefix flow (see that package's own entry below) and
-  registers its watch goroutine on the same `sync.WaitGroup` as the `-dhcpv6-pd` path. If `-dns-proxy` is set, `startDNSProxy()` starts `internal/dnsproxy`'s
+  the WAN and `-lan` interfaces, its routes `internal/wanextend.HostRoutes`, then blocks on
+  `internal/wanextend.DiscoverPrefix`, has `wanextend.Config.Extend` advertise the prefix, and starts the
+  `NDProxy prefix watch` application (`wanextend.Spec`; see that package's own entry below). If `-dns-proxy` is set, `startDNSProxy()` starts `internal/dnsproxy`'s
   supervision tree (its start returns once every listener is bound, so a bind failure fails `run()`) listening on every `-lan`
   interface's IPv4 gateway IP *and* its own link-local IPv6 address, forwarding to `-dns-server` if any
   were given or else the DNS servers `resolveAFTR()` returned; `run()` fails fast before any of this if
@@ -820,7 +820,7 @@ orphaned the running kernel's module directory — reboot to fix that).
   `-dns-proxy` runs, else omitted; MTU = the `-lan` MTU or else the WAN MTU minus the 40-byte tunnel
   overhead, dropped if below the IPv4 minimum) and starts `internal/dhcpv4server`'s tree as an application,
   whose start fails on a bad subnet or socket failure; `run()` also rejects a `-dhcpv4-lease`
-  shorter than `minDHCPv4Lease`. All these background goroutines are tracked on the same `sync.WaitGroup`.
+  shorter than `minDHCPv4Lease`. Every one of these runs as an application, stopped before what it drives is closed.
   Otherwise `main.go` just orchestrates
   `pkg/datapath.Loader` calls (`Load`/`AttachWAN`/`SetB4Config`/`AttachLAN`+`SetLANConfig` per `-lan`/`Stats`
   on a timer) — it never touches `cilium/ebpf` or BPF map layouts directly.
@@ -867,6 +867,13 @@ orphaned the running kernel's module directory — reboot to fix that).
   `Terminate` releases the lease (bounded 5s), unless it expired (`Soliciting`); a crash doesn't, and the
   restarted process starts from the lease cmd acquired again — before its T1 still current, past it renewed
   (or rebound, or re-acquired) at once.
+- **`internal/tunnelpmtu`** — keeps the fragmenter's `frag_unit` (`datapath.SetSoftwireMTU`) and the
+  companion ip6tnl's MTU (`slowpath.Tunnel.SetSoftwireMTU`) in step with the softwire path MTU the datapath
+  learns from Packet Too Big (`datapath.TunnelPMTU`), as a molecule tree of one genserver polling every
+  `PollInterval` (2s): impure — a map lookup per tick, a write of what changed — with the decision
+  (`effective`) pure. Each target is tracked apart, so a failure on one is retried next tick without
+  re-applying the other; a (re)started process knows neither, and applies the effective MTU on its first
+  tick, logging only a change from the WAN MTU. Behind interfaces (`Datapath`, `Tunnel`) for its tests.
 - **`internal/wanextend`** — the NDProxy *policy* layer, mirroring `internal/lanprefix`'s split from its
   protocol client (`pkg/ndproxy`) but for the single-shared-WAN-`/64` model instead of a distinct PD
   delegation. `discover.go`'s `DiscoverPrefix(ctx, wanIfindex)` blocks, polling `pkg/netlink.Socket.Addrs`
@@ -874,15 +881,16 @@ orphaned the running kernel's module directory — reboot to fix that).
   its network) — RA/SLAAC lands asynchronously sometime after `AttachWAN`/`SolicitRouters`, and there's
   nothing to extend onto the LAN until it does. Unlike `internal/lanprefix`'s delegated prefix,
   there's no DHCPv6-style T1/T2 renewal ladder to drive here — the kernel just manages its own address
-  lifetimes off whatever RAs happen to arrive — so re-learning is `WatchChanges(ctx, wanIfindex, current,
-  onChange)` instead: it re-polls every `watchPollInterval` (5 minutes, a CPE-local policy choice — WAN
-  renumbering is rare and RFC 4861 mandates no cadence for noticing it) and calls `onChange` only when a
-  reading is a genuine, valid difference from `current`; a transient read error or a momentarily-absent
+  lifetimes off whatever RAs happen to arrive — so re-learning is `watch.go`'s watch process instead
+  (`Spec`, a molecule genserver, impure: a netlink dump per tick): it re-polls every `watchPollInterval` (5
+  minutes, a CPE-local policy choice — WAN renumbering is rare and RFC 4861 mandates no cadence for noticing
+  it), reading at once on (re)start, and re-extends only a reading that is a genuine, valid difference from
+  the prefix extended; a transient read error or a momentarily-absent
   global address (expected mid-renumbering) is not itself reported, so the last-known prefix keeps being
   advertised until a real replacement is confirmed. That change/no-change decision is `nextWatchState`, split
   out as a pure function precisely so it's unit-tested without a real clock or netlink socket
   (`discover_test.go`) — the same rationale `pkg/ndproxy`'s `State` takes an explicit `now` instead of
-  reading the clock. Neither `DiscoverPrefix` nor `WatchChanges` track `IFA_CACHEINFO`'s remaining
+  reading the clock. Neither `DiscoverPrefix` nor the watch track `IFA_CACHEINFO`'s remaining
   lifetimes, so `ra.go` re-advertises to the LAN with RFC 4861 §6.2.1's recommended default lifetimes
   rather than the WAN RA's actual ones — a known simplification. `ra.go`'s `raManager` has every LAN
   interface's `internal/radvd` advertiser broadcast the same prefix (`OnLink: false`)
@@ -899,11 +907,10 @@ orphaned the running kernel's module directory — reboot to fix that).
   interface when there's more than one — without it, WAN-side proxying alone doesn't tell the kernel which
   LAN interface to actually forward through); `Remove` deletes it best-effort, logging rather than propagating a failure, since a route that outlives its target
   is stale but harmless and gets overwritten (`NLM_F_REPLACE`) the next time `Install` runs for it.
-  `serve.go`'s `Serve(ctx, wanIfindex, lanIfaces, rdnssByIface, adv, wg)` is what `cmd/minuteman` calls
-  for `-ndproxy` once it has started `internal/ndppd`: blocks on the initial `DiscoverPrefix` (nothing
-  else can usefully start before then, the same rationale `runPrefixDelegation` applies to its own initial
-  `Acquire`), then the initial `raManager.sync`, and a `WatchChanges` goroutine whose `onChange` re-runs
-  `raManager.sync` with the new prefix, registered on the caller's `wg`.
+  `watch.go`'s `Config` (WAN index, LANs, RDNSS map, advertisers) has `Extend(prefix)`, the `raManager.sync`
+  `cmd/minuteman` runs on the prefix `DiscoverPrefix` found (nothing else can usefully start before then,
+  the same rationale `runPrefixDelegation` applies to its own initial `Acquire`) and the watch on each
+  change.
 - **`internal/slowpath`** — owns the kernel companion `ip6tnl` that gives the datapath softwire
   *reassembly* (RFC 6333 §5.3's inbound half) plus the *fallback* for what the in-XDP fragmenter can't
   take: the cases the XDP fast path `XDP_PASS`es rather than dropping — a fragmented softwire IPv6 packet
@@ -923,8 +930,8 @@ orphaned the running kernel's module directory — reboot to fix that).
   (same best-effort stance), and `Close()`
   deletes it best-effort on shutdown. `cmd/minuteman` creates it right after `SetB4Config` for every run
   (static or dynamic) and hands it to `startSoftwireControl` so the single endpoint owner can repoint it;
-  its `defer Close()` runs after `bgWG.Wait()` (so the softwire control tree has stopped) but before
-  `dp.Close()`.
+  its `defer Close()` runs after the applications stop (so the softwire control and tunnel PMTU trees
+  have) but before `dp.Close()`.
 - **`internal/fragpath`** — owns the companion veth pairs the in-XDP softwire fragmenter bounces its
   broadcast clones through (see the `bpf/datapath.bpf.c` fragmenter bullet for the two kernel constraints
   — devmap-enqueue MTU pre-check, per-device egress-program batching — that make one large-MTU pair *per

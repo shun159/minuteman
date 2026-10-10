@@ -68,8 +68,8 @@ the socket. A device that outlives the process is replaced by the next run's `En
 ## Concurrency
 
 The mutating methods serialize against each other under a mutex. Two independent goroutines
-legitimately drive this device: `cmd/minuteman`'s rediscovery owner repoints its endpoints, and
-`watchTunnelPMTU` resizes it. The netlink socket underneath is a single-writer request/reply
+legitimately drive this device: `internal/softwirectl` repoints its endpoints, and
+`internal/tunnelpmtu` resizes it. The netlink socket underneath is a single-writer request/reply
 channel (one `Send`, one `Recvfrom`, matched by an incrementing sequence number), so
 unsynchronized callers would consume each other's ACKs and report failures for requests that in
 fact succeeded.
@@ -82,8 +82,8 @@ because each has a single caller.
 
 `cmd/minuteman` creates the tunnel right after `SetB4Config` for **every** run, static or
 dynamic, and hands it to `internal/softwirectl` (the single owner of the live softwire endpoints)
-and to `watchTunnelPMTU`. Its `defer Close()` runs after `bgWG.Wait()` — so the softwire control
-tree that may repoint it has stopped — but before `dp.Close()`.
+and to `internal/tunnelpmtu`. Its `defer Close()` runs after the applications stop — so the
+processes that repoint and resize it have stopped — but before `dp.Close()`.
 
 ## Testing
 

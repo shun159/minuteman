@@ -2,14 +2,12 @@
 // Neighbor Discovery Proxy: when an ISP hands out a single on-link /64 on
 // the WAN interface with no DHCPv6-PD delegation (see internal/lanprefix
 // for the alternative, distinct-delegation model), this package learns
-// that /64 (DiscoverPrefix), keeps watching for it changing (WatchChanges
-// -- an ISP renumbering the WAN link), re-advertises it on every LAN
+// that /64 (DiscoverPrefix), keeps watching for it changing (Spec's watch
+// process -- an ISP renumbering the WAN link), re-advertises it on every LAN
 // interface with On-Link cleared so LAN clients route everything -- not
 // just off-/64 traffic -- through this CPE, and maintains per-host routes
 // (HostRoutes) so the kernel forwards a target's traffic out the correct
 // LAN interface once internal/ndppd confirms it's actually there.
-// Serve ties all of this together into the single call cmd/minuteman
-// makes for -ndproxy.
 package wanextend
 
 import (
@@ -29,7 +27,7 @@ import (
 // quickly without busy-polling.
 const prefixPollInterval = 2 * time.Second
 
-// watchPollInterval is how often WatchChanges re-checks the WAN interface's
+// watchPollInterval is how often the watch process re-checks the WAN interface's
 // address for a renumbering, once the initial prefix is already known.
 // Unlike prefixPollInterval, there's no "just came up" urgency here -- an
 // ISP renumbering a WAN /64 is rare and RFC 4861 attaches no cadence a CPE
@@ -82,41 +80,14 @@ func discoverPrefixOnce(wanIfindex int) (netip.Prefix, error) {
 	return addrs[0].Masked(), nil
 }
 
-// WatchChanges blocks until ctx is cancelled, polling every
-// watchPollInterval and calling onChange whenever wanIfindex's
-// global-scope SLAAC prefix differs from current -- e.g. after the ISP
-// renumbers the WAN link. current is the caller's already-known baseline
-// (typically DiscoverPrefix's own return value): onChange never fires for
-// it, only for a later, different reading. A read that errors or comes
-// back empty (the WAN briefly having no global address mid-renumbering,
-// or a transient netlink failure) is not itself reported -- current is
-// kept and re-advertised until a genuinely different prefix is confirmed,
-// the same conservative choice pkg/routeradvert's EADDRNOTAVAIL retry
-// makes for a tentative address, rather than tearing down a working
-// advertisement over a one-tick blip.
-func WatchChanges(ctx context.Context, wanIfindex int, current netip.Prefix, onChange func(netip.Prefix)) error {
-	ticker := time.NewTicker(watchPollInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			next, err := discoverPrefixOnce(wanIfindex)
-			if updated, changed := nextWatchState(current, next, err); changed {
-				current = updated
-				onChange(current)
-			}
-		}
-	}
-}
-
-// nextWatchState is WatchChanges' per-tick decision, split out so it's
-// tested without a real clock or netlink socket: given the currently
-// known prefix and one fresh reading (next, err, exactly as
+// nextWatchState is the watch process's per-tick decision: given the
+// currently known prefix and one fresh reading (next, err, exactly as
 // discoverPrefixOnce returns them), report whether that reading is a real,
-// reportable change.
+// reportable change. A read that errors or comes back empty (the WAN
+// briefly having no global address mid-renumbering, or a transient netlink
+// failure) is not itself one -- current is kept and re-advertised until a
+// genuinely different prefix is confirmed, rather than tearing down a
+// working advertisement over a one-tick blip.
 func nextWatchState(current, next netip.Prefix, err error) (updated netip.Prefix, changed bool) {
 	if err != nil || !next.IsValid() || next == current {
 		return current, false
