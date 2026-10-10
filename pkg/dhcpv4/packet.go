@@ -1,12 +1,9 @@
 package dhcpv4
 
 import (
-	"fmt"
-	"math/bits"
 	"net"
 	"net/netip"
 
-	"github.com/shun159/miniteman/pkg/internal/pollfd"
 	"golang.org/x/sys/unix"
 )
 
@@ -22,26 +19,18 @@ const (
 // resolve), honouring the client's broadcast flag, and it must know which
 // LAN interface a broadcast arrived on. So, like pkg/ndproxy, it uses a
 // cooked AF_PACKET socket (SOCK_DGRAM, payload starting at the IP header)
-// bound to one interface: received frames are parsed as IPv4/UDP in Go, and
-// replies are built as raw IPv4+UDP and sent with an explicit destination
-// MAC (the client's chaddr, or broadcast) via sendto -- the kernel supplies
-// the Ethernet header from the sockaddr_ll. A classic-BPF filter keeps all
-// non-DHCP traffic out of userspace.
+// bound to one interface: received frames are parsed as IPv4/UDP in Go
+// (ParseRequest), and replies are built as raw IPv4+UDP (Frame) and sent
+// with an explicit destination MAC (the client's chaddr, or broadcast) via
+// sendto -- the kernel supplies the Ethernet header from the sockaddr_ll.
+// A classic-BPF filter (Filter) keeps all non-DHCP traffic out of
+// userspace. The socket itself is internal/dhcpv4server's.
 
-// packetConn receives and sends DHCPv4 on one interface. Close may be called
-// from another goroutine to unblock a blocked recv: the socket goes through
-// the runtime's poller (pkg/internal/pollfd), as close(2) alone would not.
-type packetConn struct {
-	fd      *pollfd.FD
-	ifindex int
-	srcIP   netip.Addr // the server's own IPv4 on this link, used as the reply source
-}
-
-// dhcpFilter is the classic-BPF program attached to the packet socket:
+// Filter is the classic-BPF program to attach to the packet socket:
 // accept only IPv4/UDP packets whose destination port is 67 (the DHCP
 // server port). Offsets are relative to the IPv4 header, since a cooked
 // (SOCK_DGRAM) packet socket delivers from the network header on.
-var dhcpFilter = []unix.SockFilter{
+var Filter = []unix.SockFilter{
 	{Code: unix.BPF_LD | unix.BPF_B | unix.BPF_ABS, K: 9},                               // IPv4 protocol
 	{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: unix.IPPROTO_UDP, Jf: 4},        // != UDP -> drop
 	{Code: unix.BPF_LDX | unix.BPF_B | unix.BPF_MSH, K: 0},                              // X = IPv4 header length (4*(IHL))
@@ -51,73 +40,27 @@ var dhcpFilter = []unix.SockFilter{
 	{Code: unix.BPF_RET | unix.BPF_K, K: 0},                                             // drop
 }
 
-// listenPacket opens the DHCP packet socket on iface, with srcIP as the
-// source address for replies sent through it.
-func listenPacket(iface string, srcIP netip.Addr) (*packetConn, error) {
-	ifi, err := net.InterfaceByName(iface)
+// ParseRequest parses packet, as the packet socket delivers it (from the
+// IPv4 header on), as a DHCP request: ok is false for anything that is not
+// IPv4/UDP to the DHCP server port carrying a valid DHCP message.
+func ParseRequest(packet []byte) (msg *Message, ok bool) {
+	payload, ok := parseUDPToBOOTP(packet)
+	if !ok {
+		return nil, false
+	}
+	msg, err := Parse(payload)
 	if err != nil {
-		return nil, fmt.Errorf("dhcpv4: looking up interface %s: %w", iface, err)
+		return nil, false // slipped the filter but isn't valid DHCP
 	}
-
-	proto := bits.ReverseBytes16(unix.ETH_P_IP) // network byte order, as AF_PACKET requires
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_DGRAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, int(proto))
-	if err != nil {
-		return nil, fmt.Errorf("dhcpv4: opening packet socket: %w", err)
-	}
-
-	// Attach the filter before bind so no unfiltered packet is ever queued.
-	prog := unix.SockFprog{Len: uint16(len(dhcpFilter)), Filter: &dhcpFilter[0]}
-	if err := unix.SetsockoptSockFprog(fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &prog); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("dhcpv4: attaching DHCP filter on %s: %w", iface, err)
-	}
-	if err := unix.Bind(fd, &unix.SockaddrLinklayer{Protocol: proto, Ifindex: ifi.Index}); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("dhcpv4: binding packet socket to %s: %w", iface, err)
-	}
-	p, err := pollfd.New(fd, "dhcpv4 "+iface)
-	if err != nil {
-		return nil, fmt.Errorf("dhcpv4: polling packet socket on %s: %w", iface, err)
-	}
-	return &packetConn{fd: p, ifindex: ifi.Index, srcIP: srcIP}, nil
+	return msg, true
 }
 
-func (c *packetConn) Close() error { return c.fd.Close() }
-
-// recv blocks until a well-formed DHCP request arrives (skipping anything
-// that slips through the filter but fails to parse as IPv4/UDP/DHCP) or the
-// socket is closed, in which case it returns the read error.
-func (c *packetConn) recv() (*Message, error) {
-	buf := make([]byte, 1500)
-	for {
-		n, _, err := c.fd.Recvfrom(buf)
-		if err != nil {
-			return nil, err
-		}
-		payload, ok := parseUDPToBOOTP(buf[:n])
-		if !ok {
-			continue
-		}
-		msg, err := Parse(payload)
-		if err != nil {
-			continue // slipped the filter but isn't valid DHCP
-		}
-		return msg, nil
-	}
-}
-
-// send transmits reply to dstMAC/dstIP: it frames reply as IPv4+UDP (source
-// c.srcIP:67, destination dstIP:68) and hands it to the kernel with dstMAC
-// as the link-layer destination.
-func (c *packetConn) send(reply *Message, dstIP netip.Addr, dstMAC net.HardwareAddr) error {
-	frame := buildFrame(c.srcIP, dstIP, reply.Marshal())
-	sll := &unix.SockaddrLinklayer{
-		Protocol: bits.ReverseBytes16(unix.ETH_P_IP),
-		Ifindex:  c.ifindex,
-		Halen:    uint8(len(dstMAC)),
-	}
-	copy(sll.Addr[:], dstMAC)
-	return c.fd.Sendto(frame, sll)
+// Frame frames reply as IPv4+UDP from srcIP:67 to its destination's port
+// 68 (see destination), and returns it with the link-layer address to send
+// it to: the client's chaddr, or broadcast.
+func Frame(srcIP netip.Addr, reply *Message) (frame []byte, dstMAC net.HardwareAddr) {
+	dstIP, dstMAC := destination(reply)
+	return buildFrame(srcIP, dstIP, reply.Marshal()), dstMAC
 }
 
 // parseUDPToBOOTP extracts the UDP payload of an IPv4/UDP packet destined

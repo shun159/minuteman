@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/shun159/miniteman/internal/cliconfig"
+	"github.com/shun159/miniteman/internal/dhcpv4server"
 	"github.com/shun159/miniteman/internal/dhcpv6client"
 	"github.com/shun159/miniteman/internal/dnsproxy"
 	"github.com/shun159/miniteman/internal/fragpath"
@@ -478,7 +479,7 @@ func run() error {
 		}
 	}
 	if *dhcpv4On {
-		if err := runDHCPv4(ctx, lans, dhcpv4DNSFlag, *dnsProxyOn, wanNetIface.MTU, *dhcpv4Lease, &bgWG); err != nil {
+		if err := runDHCPv4(ctx, apps, lans, dhcpv4DNSFlag, *dnsProxyOn, wanNetIface.MTU, *dhcpv4Lease); err != nil {
 			return err
 		}
 	}
@@ -609,8 +610,7 @@ func runNDProxy(ctx context.Context, wanIface string, wanIfindex uint32, lans cl
 // those advertise exactly the addresses in that returned map as RDNSS entries
 // (RFC 8106), so an RA can never promise a DNS server the proxy didn't
 // actually bind -- the tree's start returns only once every listener has
-// bound (fail-fast), mirroring pkg/dhcpv4.New's own synchronous-failure
-// rationale. A LAN link-local still DAD-tentative is waited out by the
+// bound (fail-fast), as internal/dhcpv4server's does. A LAN link-local still DAD-tentative is waited out by the
 // listener itself (see internal/dnsproxy). A -lan interface with no
 // link-local address at all is logged and left out of the map (no RDNSS for
 // it), while its IPv4 listener still starts.
@@ -639,9 +639,9 @@ func startDNSProxy(ctx context.Context, apps *application.Running, lans cliconfi
 }
 
 // runDHCPv4 builds a pkg/dhcpv4.InterfaceConfig for every -lan interface,
-// constructs the server synchronously (so an invalid subnet or a socket
-// failure fails run() rather than surfacing only in a log line), and starts
-// it on wg. Each interface serves its own subnet (from -lan's /prefixlen),
+// and starts internal/dhcpv4server's tree as an application of apps; the
+// start validates every pool and opens every socket, so an invalid subnet or
+// a socket failure fails run() rather than surfacing only in a log line. Each interface serves its own subnet (from -lan's /prefixlen),
 // offers its gateway IP as router, and advertises an interface MTU sized for
 // the DS-Lite softwire: the -lan MTU if set, else the WAN MTU minus the
 // 40-byte tunnel overhead (dropped if that falls below the IPv4 minimum). A
@@ -651,7 +651,7 @@ func startDNSProxy(ctx context.Context, apps *application.Running, lans cliconfi
 // else this CPE's gateway when -dns-proxy is running to answer at it; with
 // neither, no DNS is advertised at all rather than pointing clients at a port
 // nothing listens on.
-func runDHCPv4(ctx context.Context, lans cliconfig.LANSpecList, dnsOverride []netip.Addr, dnsProxyOn bool, wanMTU int, lease time.Duration, wg *sync.WaitGroup) error {
+func runDHCPv4(ctx context.Context, apps *application.Running, lans cliconfig.LANSpecList, dnsOverride []netip.Addr, dnsProxyOn bool, wanMTU int, lease time.Duration) error {
 	var cfgs []dhcpv4.InterfaceConfig
 	for _, spec := range lans {
 		if !spec.Subnet.IsValid() || !spec.Subnet.Addr().Is4() {
@@ -689,18 +689,13 @@ func runDHCPv4(ctx context.Context, lans cliconfig.LANSpecList, dnsOverride []ne
 			spec.Subnet, spec.Iface, spec.GatewayIP, dns, lease, mtu)
 	}
 
-	srv, err := dhcpv4.New(cfgs)
+	spec, err := dhcpv4server.Spec(cfgs)
 	if err != nil {
+		return err
+	}
+	if err := apps.Start(ctx, app("DHCPv4 server", spec)); err != nil {
 		return fmt.Errorf("starting DHCPv4 server: %w", err)
 	}
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		if err := srv.Serve(ctx); err != nil {
-			log.Printf("DHCPv4 server ended unexpectedly: %v", err)
-		}
-	}()
 	return nil
 }
 

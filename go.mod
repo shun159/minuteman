@@ -4,7 +4,7 @@ go 1.27.0
 
 require (
 	github.com/cilium/ebpf v0.22.0
-	github.com/shun159/molecule v0.3.0
+	github.com/shun159/molecule v0.4.0
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/sys v0.47.0
 )

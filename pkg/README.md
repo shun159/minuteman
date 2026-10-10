@@ -30,9 +30,6 @@ what BTF-derived `vmlinux.h` lacks.
 each takes an explicit `now` or plain values rather than reading a clock or a socket. Raw-socket
 I/O and goroutine orchestration are covered by the netns rig instead (`test/netns/README.md`).
 
-**Open synchronously, serve in the background.** `dhcpv4.New`/`Serve` splits binding from running,
-so a bind failure fails `cmd/minuteman`'s startup instead of appearing later in a log line.
-
 **Policy is reported, not enacted.** `aftrdiscovery` returns RFC 4242's refresh interval and
 `hb46pp` returns a `RetryDelay` window; neither sleeps on it. The exception is
 `prefixdelegation.Maintain`, and for a concrete reason: an unrenewed lease actually expires and
