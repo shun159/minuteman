@@ -1,64 +1,55 @@
 package routeradvert
 
 import (
+	"math/rand/v2"
+	"net"
 	"net/netip"
 	"testing"
 	"time"
 )
 
-// Serve itself needs a raw ICMPv6 socket, so only Updater's queueing
-// behaviour is unit-tested here -- the rest of this file's logic is
-// exercised by test/netns, like the package's other socket-bound code.
+func TestNextUnsolicitedInterval(t *testing.T) {
+	r := rand.New(rand.NewPCG(1, 2))
+	for sent := range 10 {
+		lo, hi := time.Duration(0), maxInitialRtrAdvertInterval
+		if sent >= maxInitialRtrAdvertisements {
+			lo, hi = minRtrAdvInterval, maxRtrAdvInterval
+		}
+		for range 100 {
+			if d := NextUnsolicitedInterval(sent, r); d < lo || d > hi {
+				t.Fatalf("NextUnsolicitedInterval(%d) = %v, want in [%v, %v]", sent, d, lo, hi)
+			}
+		}
+	}
+}
 
-func testConfig(preferred time.Duration) Config {
-	return Config{
+func TestReplyDelay(t *testing.T) {
+	r := rand.New(rand.NewPCG(1, 2))
+	for range 100 {
+		if d := ReplyDelay(r); d < 0 || d > maxRADelayTime {
+			t.Fatalf("ReplyDelay = %v", d)
+		}
+	}
+}
+
+// The RDNSS server is withdrawn with the router: its lifetime is the RA's.
+func TestBuildRA(t *testing.T) {
+	cfg := Config{
 		Prefix:            netip.MustParsePrefix("2001:db8:1::/64"),
 		OnLink:            true,
-		ValidLifetime:     2 * preferred,
-		PreferredLifetime: preferred,
+		ValidLifetime:     time.Hour,
+		PreferredLifetime: 30 * time.Minute,
+		RDNSSAddr:         netip.MustParseAddr("fe80::1"),
 	}
-}
-
-func TestUpdaterSetDoesNotBlock(t *testing.T) {
-	u := NewUpdater()
-
-	// More Sets than the channel can hold: each must return rather than
-	// wait for a Serve that may not be reading yet (a worker still in its
-	// socket setup, or one that has already exited).
-	for i := range 5 {
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			u.Set(testConfig(time.Duration(i) * time.Second))
-		}()
-		select {
-		case <-done:
-		case <-time.After(time.Second):
-			t.Fatalf("Set #%d blocked", i)
+	mac := net.HardwareAddr{2, 0, 0, 0, 0, 1}
+	for _, lifetime := range []time.Duration{AdvDefaultLifetime, 0} {
+		ra := BuildRA(cfg, lifetime, mac)
+		if ra.RouterLifetime != lifetime || len(ra.Options) != 3 {
+			t.Errorf("RA with lifetime %v: %+v", lifetime, ra)
 		}
 	}
-}
-
-func TestUpdaterSetKeepsLatest(t *testing.T) {
-	u := NewUpdater()
-
-	u.Set(testConfig(time.Second))
-	u.Set(testConfig(2 * time.Second))
-	want := testConfig(3 * time.Second)
-	u.Set(want)
-
-	select {
-	case got := <-u.ch:
-		if got != want {
-			t.Fatalf("got %+v, want the most recent Set %+v", got, want)
-		}
-	default:
-		t.Fatal("no update queued")
-	}
-
-	select {
-	case got := <-u.ch:
-		t.Fatalf("superseded updates were queued too: got %+v", got)
-	default:
+	cfg.RDNSSAddr = netip.Addr{}
+	if ra := BuildRA(cfg, AdvDefaultLifetime, mac); len(ra.Options) != 2 {
+		t.Errorf("RA without RDNSS carries %d options", len(ra.Options))
 	}
 }

@@ -41,6 +41,7 @@ import (
 	"github.com/shun159/miniteman/internal/dnsproxy"
 	"github.com/shun159/miniteman/internal/fragpath"
 	"github.com/shun159/miniteman/internal/lanprefix"
+	"github.com/shun159/miniteman/internal/radvd"
 	"github.com/shun159/miniteman/internal/slowpath"
 	"github.com/shun159/miniteman/internal/softwirectl"
 	"github.com/shun159/miniteman/internal/wanextend"
@@ -468,13 +469,27 @@ func run() error {
 			return fmt.Errorf("-dns-proxy: %w", err)
 		}
 	}
+	// The Router Advertisements of the LAN interfaces, when either model
+	// gives them a prefix to advertise: an advertiser per interface
+	// (internal/radvd), idle until DHCPv6-PD or NDProxy hands it one.
+	var adv radvd.Advertiser
+	if *requestPD || *ndProxy {
+		lanIfaces := make([]string, len(lans))
+		for i, spec := range lans {
+			lanIfaces[i] = spec.Iface
+		}
+		if err := apps.Start(ctx, app("Router Advertisements", radvd.Spec(lanIfaces))); err != nil {
+			return err
+		}
+		adv = radvd.NewAdvertiser(node)
+	}
 	if *requestPD {
-		if err := runPrefixDelegation(ctx, dhcp, *wanIface, pdLease, lans, rdnssByIface, &bgWG); err != nil {
+		if err := runPrefixDelegation(ctx, dhcp, adv, *wanIface, pdLease, lans, rdnssByIface, &bgWG); err != nil {
 			return err
 		}
 	}
 	if *ndProxy {
-		if err := runNDProxy(ctx, *wanIface, wanIfindex, lans, rdnssByIface, &bgWG); err != nil {
+		if err := runNDProxy(ctx, adv, *wanIface, wanIfindex, lans, rdnssByIface, &bgWG); err != nil {
 			return err
 		}
 	}
@@ -545,13 +560,13 @@ func pdDNSServers(lease *prefixdelegation.Lease) []netip.Addr {
 // lanprefix.NewRAManager (see its own doc) -- it's the map of link-local
 // addresses startDNSProxy actually bound, so RDNSS is advertised only where
 // a DNS proxy is really listening.
-func runPrefixDelegation(ctx context.Context, dhcp dhcpv6.Exchanger, wanIface string, lease *prefixdelegation.Lease, lans cliconfig.LANSpecList, rdnssByIface map[string]netip.Addr, wg *sync.WaitGroup) error {
+func runPrefixDelegation(ctx context.Context, dhcp dhcpv6.Exchanger, adv radvd.Advertiser, wanIface string, lease *prefixdelegation.Lease, lans cliconfig.LANSpecList, rdnssByIface map[string]netip.Addr, wg *sync.WaitGroup) error {
 	lanIfaces := make([]string, len(lans))
 	for i, spec := range lans {
 		lanIfaces[i] = spec.Iface
 	}
 
-	raMgr := lanprefix.NewRAManager(rdnssByIface)
+	raMgr := lanprefix.NewRAManager(adv, rdnssByIface)
 	var assigned []lanprefix.Assignment
 	reconcileAndLog := func(l *prefixdelegation.Lease) {
 		var err error
@@ -569,7 +584,7 @@ func runPrefixDelegation(ctx context.Context, dhcp dhcpv6.Exchanger, wanIface st
 		for _, a := range assigned {
 			log.Printf("assigned %s to %s (from delegated prefix %s)", a.Address, a.Iface, l.Prefixes[0].Prefix)
 		}
-		raMgr.Sync(ctx, assigned, wg)
+		raMgr.Sync(assigned)
 	}
 	reconcileAndLog(lease) // initial assignment, before minuteman is considered "up"
 
@@ -595,12 +610,12 @@ func runPrefixDelegation(ctx context.Context, dhcp dhcpv6.Exchanger, wanIface st
 // wanextend.Serve (see its own doc) -- it's the map of link-local addresses
 // startDNSProxy actually bound, so RDNSS is advertised only where a DNS
 // proxy is really listening.
-func runNDProxy(ctx context.Context, wanIface string, wanIfindex uint32, lans cliconfig.LANSpecList, rdnssByIface map[string]netip.Addr, wg *sync.WaitGroup) error {
+func runNDProxy(ctx context.Context, adv radvd.Advertiser, wanIface string, wanIfindex uint32, lans cliconfig.LANSpecList, rdnssByIface map[string]netip.Addr, wg *sync.WaitGroup) error {
 	lanIfaces := make([]string, len(lans))
 	for i, spec := range lans {
 		lanIfaces[i] = spec.Iface
 	}
-	return wanextend.Serve(ctx, wanIface, int(wanIfindex), lanIfaces, rdnssByIface, wg)
+	return wanextend.Serve(ctx, wanIface, int(wanIfindex), lanIfaces, rdnssByIface, adv, wg)
 }
 
 // startDNSProxy starts internal/dnsproxy's supervision tree on every -lan

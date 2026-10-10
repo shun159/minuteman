@@ -57,8 +57,8 @@ func TestIsRouterSolicitation(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := isRouterSolicitation(c.data); got != c.want {
-				t.Errorf("isRouterSolicitation(%v) = %v, want %v", c.data, got, c.want)
+			if got := IsRouterSolicitation(c.data); got != c.want {
+				t.Errorf("IsRouterSolicitation(%v) = %v, want %v", c.data, got, c.want)
 			}
 		})
 	}

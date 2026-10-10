@@ -17,7 +17,7 @@ starts.
 ## Flow
 
 ```
-DiscoverPrefix ──► raManager.sync ──► one routeradvert.Serve per LAN iface (OnLink: false)
+DiscoverPrefix ──► raManager.sync ──► internal/radvd's advertiser per LAN iface (OnLink: false)
       │
       ├──► WatchChanges ──(renumbering)──► raManager.sync with the new prefix
       │
@@ -55,8 +55,8 @@ is unit-testable without a clock or a netlink socket — the same rationale behi
 
 ### `ra.go` — re-advertising the shared prefix, with On-Link cleared
 
-`raManager` drives one `pkg/routeradvert.Serve` goroutine per LAN interface, all advertising
-**the same** prefix — unlike `internal/lanprefix.RAManager`, which advertises a distinct
+`raManager` has `internal/radvd`'s advertiser of every LAN interface advertise **the same**
+prefix — unlike `internal/lanprefix.RAManager`, which advertises a distinct
 subnet per interface, so `sync()` takes a single `netip.Prefix` rather than a per-interface
 list.
 
@@ -65,9 +65,9 @@ believed it were on-link they would try to reach WAN neighbours directly. Cleari
 makes them route *everything*, not just off-prefix traffic, through the CPE — which is what
 lets WAN-side proxying alone deliver reachability, with no LAN-side proxying needed.
 
-Like `lanprefix.RAManager.Sync`, `sync` updates a running worker in place via a
-`routeradvert.Updater` rather than restarting it, for the same reason: cancellation is
-`Serve`'s shutdown path and announces `RouterLifetime=0` first, so a restart on a WAN prefix
+Like `lanprefix.RAManager.Sync`, `sync` has the advertisers take the new prefix in place
+rather than restarting them, for the same reason: an advertiser's shutdown announces
+`RouterLifetime=0` first, so a restart on a WAN prefix
 change would cost every LAN client its default route and RDNSS server for the length of the
 changeover. Nothing about renumbering is lost by not restarting — that final RA never
 deprecated the outgoing prefix anyway, since its Prefix Information Option carries the old

@@ -33,7 +33,7 @@ const maxUDPMessageBytes = 65535
 // bindRetries/bindRetryInterval bound how long a listener waits out an
 // EADDRNOTAVAIL when binding a LAN link-local address: the kernel returns
 // that while the address is still DAD-tentative, which right after XDP
-// attach bounces the LAN link (see routeradvert's tentativeRetryInterval) it
+// attach bounces the LAN link (see routeradvert.TentativeRetryInterval) it
 // briefly is. ~10 * 1s covers several DAD cycles; any *other* bind error
 // (e.g. EADDRINUSE, port 53 already taken) fails at once, so a real
 // misconfiguration surfaces at once.

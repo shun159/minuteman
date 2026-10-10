@@ -33,9 +33,9 @@ Tunnel-originated ICMPv4 (decap-side Time Exceeded plus the RFC 6333 §5.7 well-
 resolved and no longer tracked here, as is the DHCPv6-PD client-chosen-timer gap (a T1/T2 of 0 is now
 resolved through `pkg/prefixdelegation`'s `effectiveTimers` per RFC 9915 §14.2, and an IA_PD with
 T1 > T2 > 0 is discarded per §21.21 — exercised end-to-end by the rig's `MM_PD_ZERO_TIMERS=1` mode), and
-so is the RA-worker restart that misapplied RFC 4861 §6.2.5: `pkg/routeradvert.Serve` now takes config
-changes in place through a `routeradvert.Updater` (a size-1 latest-wins `Config` channel, applied
-promptly but no sooner than §6.2.4's MIN_DELAY_BETWEEN_RAS after the previous RA), and both
+so is the RA-worker restart that misapplied RFC 4861 §6.2.5: the advertiser (now `internal/radvd`'s) takes
+config changes in place (applied promptly but no sooner than §6.2.4's MIN_DELAY_BETWEEN_RAS after the
+previous RA), and both
 `internal/lanprefix.RAManager.Sync` and `internal/wanextend`'s `raManager.sync` push updates instead of
 cancel-and-restart — so a DHCPv6-PD Renew no longer emits the §6.2.5 RouterLifetime=0 (and RDNSS
 Lifetime=0) shutdown RA that withdrew every LAN client's default route and DNS server once per T1
@@ -219,7 +219,7 @@ constants above rather than from inference about the network.
   carry the remaining lifetimes on the discovered prefix, and pass them into the RA config — the same
   values the RFC 9096 L-15/L-16 item above needs for the DHCPv6-PD side, so the two share the plumbing.
 - The WAN-side RA's M/O flags (RFC 4861 §4.2) are never consulted: `pkg/routeradvert`'s codec is
-  Marshal-only (it only detects that a Router Solicitation *arrived*, `isRouterSolicitation`), inbound
+  Marshal-only (it only detects that a Router Solicitation *arrived*, `IsRouterSolicitation`), inbound
   RAs are left entirely to the kernel, and which LAN provisioning model runs is the operator's
   `-dhcpv6-pd`-vs-`-ndproxy` choice. No protocol requirement is broken, but the network signals the model
   minuteman currently has to be told, so this is the one piece of per-deployment configuration that AFTR
