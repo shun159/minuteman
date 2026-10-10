@@ -677,7 +677,7 @@ orphaned the running kernel's module directory — reboot to fix that).
   filter for UDP dport 67, the same cooked-`SOCK_DGRAM` approach `pkg/ndproxy`'s `packet.go` uses. All of it
   is unit-tested with no sockets; the package holds none. `internal/dhcpv4server` runs the server: a molecule
   supervision tree, one genserver per LAN interface owning its `net/socket` AF_PACKET socket (read `Once` per
-  request) and its `Pool` (cloned per request, so the behaviour stays pure; the clock is injected), the
+  request) and its `Pool` (cloned per request, so the behaviour stays pure; the clock given by molecule, `molecule.Clocked`), the
   tree's start validating every pool and opening every socket so a bad subnet or socket failure fails
   `cmd/minuteman`'s startup. See the `xdp_dslite_encap`
   `is_non_unicast_dst` bypass above for why the datapath had to change before any of this could receive a
@@ -853,8 +853,7 @@ orphaned the running kernel's module directory — reboot to fix that).
   proxy` genserver owning the sockets (`net/socket`): the WAN's `AF_PACKET` receiver (`NSFilter`,
   `ALLMULTI`), a raw ICMPv6 socket on the WAN for its Advertisements (filtered to nothing), and one per
   LAN for the probes and their Advertisements, each socket `active once`. The proxy is pure: its state is
-  `*ndproxy.State`, `Clone()`d per event, the clock an injected `now` (a behaviour has no other way to
-  read it), its sends and re-arms effects made by injectable functions so `proxy_test.go` reads them; a
+  `*ndproxy.State`, `Clone()`d per event, the clock `now`, given by molecule (`molecule.Clocked`), its sends and re-arms effects made by injectable functions so `proxy_test.go` reads them; a
   `sweep` timer every `SweepInterval`; a confirmed host is a `Cast` to the routes process. rest_for_one
   because the proxy tells the routes process what to do: a restarted routes process takes the proxy with
   it, which starts afresh, re-confirming hosts as the WAN asks for them. `cmd/minuteman` starts it as the `NDProxy` application.

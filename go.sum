@@ -28,6 +28,8 @@ github.com/shun159/molecule v0.3.0 h1:pbc78a0iXVG9/lbrb2YhxZfdeLiSYVmwHD5s6g08gw
 github.com/shun159/molecule v0.3.0/go.mod h1:rieyaLcWyCi98PmZ6VjkmlWVjC2DA5bHPNDJHSThiL4=
 github.com/shun159/molecule v0.4.0 h1:gUiBL66naAnaJEUvJhpiACJy4I6g8xzDTfPI2M3I+EI=
 github.com/shun159/molecule v0.4.0/go.mod h1:rieyaLcWyCi98PmZ6VjkmlWVjC2DA5bHPNDJHSThiL4=
+github.com/shun159/molecule v0.5.0 h1:l+FebInqEYgggPw6zbwhzH+GmGZqZsDXRpwOSFNkUSI=
+github.com/shun159/molecule v0.5.0/go.mod h1:rieyaLcWyCi98PmZ6VjkmlWVjC2DA5bHPNDJHSThiL4=
 github.com/spf13/cobra v1.10.2 h1:DMTTonx5m65Ic0GOoRY2c16WCbHxOOw6xxezuLaBpcU=
 github.com/spf13/cobra v1.10.2/go.mod h1:7C1pvHqHw5A4vrJfjNwvOdzYu0Gml16OCs2GRiTUUS4=
 github.com/spf13/pflag v1.0.9/go.mod h1:McXfInJRrz4CZXVZOBLb0bTZqETkiAhM9Iw0y3An2Bg=

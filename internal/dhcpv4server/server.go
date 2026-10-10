@@ -76,7 +76,7 @@ func starter(cfg dhcpv4.InterfaceConfig) supervisor.StartFunc {
 		if err != nil {
 			return proc.PID{}, fmt.Errorf("dhcpv4: opening packet socket on %s: %w", cfg.Iface, err)
 		}
-		s := server{cfg: cfg, sock: sock, ifindex: ifi.Index, pool: pool, now: time.Now, logf: log.Printf}
+		s := server{cfg: cfg, sock: sock, ifindex: ifi.Index, pool: pool, logf: log.Printf}
 		pid, err := genserver.Child(s).StartLink(ctx, parent)
 		if err == nil {
 			if err = sock.ControllingProcess(ctx, parent, pid); err == nil {
@@ -98,8 +98,8 @@ func starter(cfg dhcpv4.InterfaceConfig) supervisor.StartFunc {
 // at a time from its socket, answers them with dhcpv4.Handle, and sends the
 // replies framed by dhcpv4.Frame to the client's link-layer address. Its
 // state is the interface's lease pool, a new one for each request that
-// changes it. now is the clock leases are kept by, which a behaviour has no
-// other way to read.
+// changes it. now is the clock leases are kept by: the process's, given by
+// molecule (molecule.Clocked).
 type server struct {
 	genserver.Default[*dhcpv4.Pool]
 	cfg     dhcpv4.InterfaceConfig
@@ -109,6 +109,10 @@ type server struct {
 	now     func() time.Time
 	logf    func(format string, args ...any)
 }
+
+var _ molecule.Clocked = server{}
+
+func (s server) WithClock(now func() time.Time) any { s.now = now; return s }
 
 func (s server) Init(proc.PID) (*dhcpv4.Pool, []molecule.Effect, error) {
 	return s.pool, nil, nil

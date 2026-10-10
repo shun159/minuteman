@@ -31,7 +31,7 @@ type sweep struct{}
 // confirms. Its state is pkg/ndproxy's State, a new one for each event
 // that changes it; it sweeps it every SweepInterval, retransmitting probes
 // and letting hosts gone quiet expire. now is the clock the State is kept
-// by, which a behaviour has no other way to read.
+// by: the process's, given by molecule (molecule.Clocked).
 //
 // Its effects -- datagrams to send, sockets to re-arm -- are made by send
 // and arm, which tests replace.
@@ -47,6 +47,10 @@ type proxy struct {
 	send func(s socket.Socket, to *syscall.SockaddrInet6, b []byte) molecule.Effect
 	arm  func(s socket.Socket) molecule.Effect
 }
+
+var _ molecule.Clocked = proxy{}
+
+func (p proxy) WithClock(now func() time.Time) any { p.now = now; return p }
 
 func (p proxy) Init(proc.PID) (*ndproxy.State, []molecule.Effect, error) {
 	return ndproxy.NewState(), molecule.Do(p.nextSweep()), nil

@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/netip"
 	"syscall"
-	"time"
 
 	"github.com/shun159/miniteman/pkg/ndproxy"
 	"github.com/shun159/molecule"
@@ -115,7 +114,7 @@ func (cfg Config) startProxy(ctx context.Context, parent *proc.Self) (pid proc.P
 
 	p := proxy{
 		wanRX: wanRX, wanTX: wanTX, wanIndex: wan.Index, wanMAC: wan.HardwareAddr,
-		now: time.Now, logf: log.Printf,
+		logf: log.Printf,
 		send: func(s socket.Socket, to *syscall.SockaddrInet6, b []byte) molecule.Effect {
 			return s.SendEffect(to, b)
 		},
