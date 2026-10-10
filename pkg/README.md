@@ -25,7 +25,7 @@ library — and no sidecar processes. Constants the Go ecosystem doesn't export 
 `IFLA_IPTUN_*`, `ETH_SS_STATS`) are vendored locally, the same way `bpf/uapi/linux/*.h` vendors
 what BTF-derived `vmlinux.h` lacks.
 
-**Pure logic separated from I/O, so it can be unit-tested.** `ndproxy`'s `proxyState`, `dhcpv4`'s
+**Pure logic separated from I/O, so it can be unit-tested.** `ndproxy`'s `State`, `dhcpv4`'s
 `Pool` and `handle`, `prefixdelegation`'s `effectiveTimers`, `dhcpv6`'s retransmission formulas —
 each takes an explicit `now` or plain values rather than reading a clock or a socket. Raw-socket
 I/O and goroutine orchestration are covered by the netns rig instead (`test/netns/README.md`).

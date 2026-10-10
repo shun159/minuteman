@@ -6,24 +6,25 @@ prefix to give the LAN, so the WAN's own `/64` is *extended* onto it, and RFC 43
 Discovery Proxy is what makes the upstream router believe the LAN hosts are on its link.
 
 This package is to `pkg/ndproxy` what `internal/lanprefix` is to `pkg/prefixdelegation`: the
-protocol package answers Neighbor Solicitations and knows nothing about CPE topology; this one
-decides where the prefix comes from, how it is advertised, and what a confirmed-active target
-implies for the routing table. `-ndproxy` and `-dhcpv6-pd` are mutually exclusive — they are
+protocol package (run by `internal/ndppd`) answers Neighbor Solicitations and knows nothing about
+CPE topology; this one decides where the prefix comes from, how it is advertised, and what a
+confirmed-active target implies for the routing table. `-ndproxy` and `-dhcpv6-pd` are mutually exclusive — they are
 alternative models of the same thing, and `cmd/minuteman` rejects both at once before anything
 starts.
 
-`Serve` is the single entry point `cmd/minuteman`'s `runNDProxy` calls.
+`cmd/minuteman`'s `runNDProxy` starts `internal/ndppd`'s tree, handing it `HostRoutes`, then
+calls `Serve`.
 
 ## Flow
 
 ```
 DiscoverPrefix ──► raManager.sync ──► internal/radvd's advertiser per LAN iface (OnLink: false)
       │
-      ├──► WatchChanges ──(renumbering)──► raManager.sync with the new prefix
-      │
-      └──► ndproxy.Serve on the WAN iface
-                 ├─ OnActive   ──► HostRoutes.Install  (/128 out the confirming LAN iface)
-                 └─ OnInactive ──► HostRoutes.Remove
+      └──► WatchChanges ──(renumbering)──► raManager.sync with the new prefix
+
+internal/ndppd on the WAN iface (cmd/minuteman starts it, independently)
+      ├─ host confirmed ──► HostRoutes.Install  (/128 out the confirming LAN iface)
+      └─ host expired   ──► HostRoutes.Remove
 ```
 
 ## Files
@@ -51,7 +52,7 @@ worse failure, the same conservative stance `pkg/routeradvert` takes on `EADDRNO
 
 That decision is factored out as the pure `nextWatchState(current, next, err)` precisely so it
 is unit-testable without a clock or a netlink socket — the same rationale behind
-`pkg/ndproxy`'s `proxyState` taking an explicit `now`.
+`pkg/ndproxy`'s `State` taking an explicit `now`.
 
 ### `ra.go` — re-advertising the shared prefix, with On-Link cleared
 
@@ -81,30 +82,29 @@ known simplification, not a protocol requirement.
 
 ### `hostroutes.go` — per-target `/128` routes
 
-`HostRoutes` matches `pkg/ndproxy.Config`'s `OnActive`/`OnInactive` callback shapes and wraps
-one long-lived `pkg/netlink.Socket` for the lifetime of a `ndproxy.Serve` run. No locking:
-`Serve` only ever fires those callbacks from its own single `select` loop.
+`HostRoutes` is `internal/ndppd.Routes`, and wraps one long-lived `pkg/netlink.Socket` for the
+lifetime of `internal/ndppd`'s routes process, opened on its every start. No locking: that one
+process is all that calls it.
 
 The routes exist because the shared-`/64` model gives the kernel no way to know which LAN
 interface a confirmed-active target lives behind — wrong whenever there is more than one LAN
 interface, and unpredictable even with one. `Install` adds the `/128` out the interface that
 confirmed the target.
 
-`Remove` logs rather than returns errors (`OnInactive` has no error return, unlike
-`OnActive`): a route that outlives its target is stale but harmless — nothing routes to it once
-`Serve` stops confirming the target — and a later reactivation's `Install` overwrites it via
-`NLM_F_REPLACE` anyway.
+`Remove` logs rather than returns errors: a route that outlives its target is stale but
+harmless — nothing routes to it once the proxy stops confirming the target — and a later
+reactivation's `Install` overwrites it via `NLM_F_REPLACE` anyway.
 
 ### `serve.go` — wiring it together
 
-`Serve(ctx, wanIface, wanIfindex, lanIfaces, rdnssByIface, wg)` blocks on the initial
+`Serve(ctx, wanIfindex, lanIfaces, rdnssByIface, adv, wg)` blocks on the initial
 `DiscoverPrefix` (nothing else can usefully start first, the same rationale
-`runPrefixDelegation` applies to its own initial `Acquire`), then starts every background
-goroutine and registers each on the caller's `sync.WaitGroup` so `cmd/minuteman`'s shutdown
-can wait for the final RAs and `ndproxy`'s socket closes to finish.
+`runPrefixDelegation` applies to its own initial `Acquire`), has `adv` advertise the prefix on
+every LAN interface, then starts the `WatchChanges` goroutine, registered on the caller's
+`sync.WaitGroup` so `cmd/minuteman`'s shutdown waits for it.
 
 A non-nil return means the initial discovery failed or was cancelled. Past that point `Serve`
-returns nil and leaves its goroutines running until `ctx` is cancelled.
+returns nil and leaves the watch running until `ctx` is cancelled.
 
 `rdnssByIface` is forwarded to every LAN RA worker and carries the same meaning as in
 `internal/lanprefix`: LAN interface → the link-local address `internal/dnsproxy` actually bound
@@ -119,6 +119,6 @@ go test ./internal/wanextend/          # nextWatchState
 Everything else is socket and netlink I/O, exercised end-to-end by the netns rig with
 `MM_WAN_MODEL=ndproxy`. That mode has `mm-isp` — itself the origin of the on-link WAN RA —
 ping `mm-host`'s SLAAC address directly, which only succeeds if the whole chain worked:
-`pkg/ndproxy` intercepted the Neighbor Solicitation on the WAN link, actively verified the
+`internal/ndppd` intercepted the Neighbor Solicitation on the WAN link, actively verified the
 target with a LAN-side probe, answered on its behalf, and `HostRoutes` installed the resulting
 route. See `test/netns/README.md`.

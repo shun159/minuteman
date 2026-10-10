@@ -44,7 +44,7 @@ type lease struct {
 
 // Pool is the address allocator for one LAN subnet: which addresses are
 // free, which client holds which (offered or committed), when those expire,
-// and which are quarantined by a DHCPDECLINE. Like pkg/ndproxy's proxyState
+// and which are quarantined by a DHCPDECLINE. Like pkg/ndproxy's State
 // it's pure — every method takes an explicit now instead of reading the
 // clock, so it's unit-tested with no timers — and, like the rest of
 // minuteman's state, it's in-memory only. Not safe for concurrent use; a

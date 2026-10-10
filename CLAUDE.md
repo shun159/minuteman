@@ -97,11 +97,12 @@ further down — this is just the index of what exists and which flag turns it o
 All of the above has been verified end-to-end against the netns rig (see Testing below).
 
 `internal/` holds `cliconfig` (CLI flag parsing), `lanprefix` (DHCPv6-PD LAN policy, including RA
-serving), `wanextend` (NDProxy LAN policy, including RA serving and host-route management), `slowpath`
+serving), `wanextend` (NDProxy LAN policy, including RA serving and host-route management), `ndppd`
+(the ND proxy itself), `slowpath`
 (the DS-Lite companion `ip6tnl` lifecycle for softwire reassembly + fragmentation fallback), and
 `fragpath` (the companion veth pairs the in-XDP softwire fragmenter bounces its clones through);
 `pkg/dhcpv6`/`pkg/aftrdiscovery`/`pkg/hb46pp`/`pkg/prefixdelegation`/`pkg/routeradvert`/`pkg/ndproxy`/
-`pkg/netlink`/`pkg/dhcpv4`/`pkg/ethtool` are the reusable protocol packages (and `internal/dnsproxy`, all I/O, runs as a molecule supervision tree). Every package under both
+`pkg/netlink`/`pkg/dhcpv4`/`pkg/ethtool` are the reusable protocol packages (and `internal/dnsproxy`, all I/O, runs as a molecule supervision tree, as do `internal/ndppd`, `internal/radvd` and the other socket owners). Every package under both
 trees carries its own `README.md` covering its rationale in more depth than the Architecture section
 below, indexed by `internal/README.md` and `pkg/README.md`.
 
@@ -579,24 +580,21 @@ orphaned the running kernel's module directory — reboot to fix that).
   LAN side, and only a real NA reply makes the proxy answer upstream — the same shape ndppd's "auto" mode
   uses. `message.go` is the NS/NA wire codec (marshal-only for the proxy's own probes/replies, parse-only
   for `Target Address` extraction — options are never decoded, since the proxy never needs a peer's
-  link-layer address). `conn.go` is the LAN-side raw `IPPROTO_ICMPV6` socket (filtered to one message type
-  via `ICMP6_FILTER`, vendored the same way `pkg/routeradvert` vendors it), sending probes and receiving
-  replies; `packet.go` is the WAN-side receiver, which can't use a raw ICMPv6 socket at all — a Neighbor
-  Solicitation is sent to the target's Solicited-Node multicast group, a different group per target
-  address, and the kernel drops multicast for groups never joined before a raw socket ever sees it — so it
-  uses a cooked `AF_PACKET` socket instead (matching ndppd's own approach) with `ALLMULTI` plus a
-  classic-BPF filter (`nsFilter`) so only Neighbor Solicitations ever reach userspace. `state.go`'s
-  `proxyState` is the pure decision logic (no I/O, an explicit `now time.Time` on every method instead of
+  link-layer address). No sockets: `internal/ndppd` owns them, and this package gives them what they
+  send and read. `wire.go` has the proxy's `Solicitation`/`Advertisement` (with §7.2.4's destination)
+  and `ParseAdvertisement`, and `ICMPv6Filter` for the LAN-side raw `IPPROTO_ICMPV6` sockets
+  (`ICMP6_FILTER`, vendored the same way `pkg/routeradvert` vendors it); `packet.go` is for the WAN-side
+  receiver, which can't be a raw ICMPv6 socket at all — a Neighbor Solicitation is sent to the target's
+  Solicited-Node multicast group, a different group per target address, and the kernel drops multicast
+  for groups never joined before a raw socket ever sees it — so it is a cooked `AF_PACKET` socket instead
+  (matching ndppd's own approach) with `ALLMULTI` plus a classic-BPF filter (`NSFilter`) so only Neighbor
+  Solicitations ever reach userspace, parsed by `ParseSolicitationPacket`. `state.go`'s
+  `State` is the pure decision logic (no I/O, an explicit `now time.Time` on every method instead of
   reading the clock, so it's tested without real sockets or timers): which targets are mid-probe, which are
   confirmed active (with a CPE-local `activeTTL`, not RFC-mandated, bounding how long a confirmation is
-  trusted before re-probing), and what `sweep()`'s periodic tick should retransmit, give up on, or expire.
-  `serve.go`'s `Serve(ctx, wanIface, lanIfaces, Config)` wires `conn`/`packetConn`/`proxyState` into a
-  running proxy — one `select` loop over the WAN NS channel, a fanned-in LAN NA channel (tagged with
-  source interface, since `conn` itself doesn't know its own name), and the sweep ticker. `Config.OnActive`/
-  `OnInactive` fire on activation/expiry so a caller can install/remove a host route (`internal/wanextend`
-  does); every channel send in this package is non-blocking/drop-on-full (`select`+`default`, matching
-  `packetConn.readSolicitations`'s original rationale: NDP retransmits, so a dropped message only delays
-  resolution, and a blocking send here would otherwise leak a goroutine past `Serve` returning). Deliberate
+  trusted before re-probing), and what `Sweep()`'s periodic tick (every `SweepInterval`) should
+  retransmit, give up on, or expire; `Clone()` copies it, for a molecule behaviour that must not change
+  the state it was handed. Deliberate
   non-goals vs. full RFC 4389 (documented on the package itself): no cross-link DAD proxying, no
   RA/Redirect proxying (the caller re-advertises the WAN prefix on the LAN with On-Link cleared instead),
   no proxy-loop detection.
@@ -660,7 +658,7 @@ orphaned the running kernel's module directory — reboot to fix that).
   pure-vs-I/O split as `pkg/ndproxy`: `message.go`/`options.go` are the BOOTP + magic-cookie + option TLV
   wire codec (`Options.Marshal` splits a value past 255 bytes across repeated option instances per RFC 3396
   rather than truncating a length byte); `lease.go`'s `Pool` is the address allocator, pure with an explicit
-  `now time.Time` like `ndproxy`'s `proxyState`. The pool distinguishes an *offered* binding (held only for
+  `now time.Time` like `ndproxy`'s `State`. The pool distinguishes an *offered* binding (held only for
   the short `offerHoldTime`, so a DISCOVER that never turns into a REQUEST — a client that chose another
   server, or a spoofed one — can't tie up an address for the full lease) from a *committed* one (`Offer`
   vs. `Commit`), quarantines a DHCPDECLINEd address only if the declining client actually held it and only
@@ -804,10 +802,10 @@ orphaned the running kernel's module directory — reboot to fix that).
   in a background goroutine (tracked on that `sync.WaitGroup` that `run()` waits on before returning, so a
   shutdown's best-effort `Release` and every RA worker's best-effort final advertisement all get a chance
   to finish) with that same `Reconcile`+`RAManager.Sync` pair as its `onLeaseChange` callback. When
-  `-ndproxy` is set instead, `runNDProxy()` is a thin wrapper that hands the `-lan` interface names straight
-  to `internal/wanextend.Serve`, which owns the whole flow itself (see that package's own entry below) and
-  registers every goroutine it starts on the same `sync.WaitGroup` as the `-dhcpv6-pd` path, for the same
-  shutdown-draining reason. If `-dns-proxy` is set, `startDNSProxy()` starts `internal/dnsproxy`'s
+  `-ndproxy` is set instead, `runNDProxy()` starts `internal/ndppd`'s tree as the `NDProxy` application on
+  the WAN and `-lan` interfaces, its routes `internal/wanextend.HostRoutes`, then hands the `-lan` interface
+  names to `internal/wanextend.Serve`, which owns the prefix flow (see that package's own entry below) and
+  registers its watch goroutine on the same `sync.WaitGroup` as the `-dhcpv6-pd` path. If `-dns-proxy` is set, `startDNSProxy()` starts `internal/dnsproxy`'s
   supervision tree (its start returns once every listener is bound, so a bind failure fails `run()`) listening on every `-lan`
   interface's IPv4 gateway IP *and* its own link-local IPv6 address, forwarding to `-dns-server` if any
   were given or else the DNS servers `resolveAFTR()` returned; `run()` fails fast before any of this if
@@ -849,6 +847,17 @@ orphaned the running kernel's module directory — reboot to fix that).
   advertiser for that is *not* cheap: its shutdown sends a `RouterLifetime=0` RA, so every Renew used to
   flap each LAN client's default route and RDNSS server (the resolved §1 of
   `docs/rfc-compliance-backlog.md`).
+- **`internal/ndppd`** — runs `pkg/ndproxy` as a molecule supervision tree (`ndppd`, rest_for_one): an
+  impure `ndppd routes` genserver owning the host routes (`Routes`, which `cmd/minuteman` makes
+  `internal/wanextend.HostRoutes`; installed and removed by casts, a failure logged), then the `ndppd
+  proxy` genserver owning the sockets (`net/socket`): the WAN's `AF_PACKET` receiver (`NSFilter`,
+  `ALLMULTI`), a raw ICMPv6 socket on the WAN for its Advertisements (filtered to nothing), and one per
+  LAN for the probes and their Advertisements, each socket `active once`. The proxy is pure: its state is
+  `*ndproxy.State`, `Clone()`d per event, the clock an injected `now` (a behaviour has no other way to
+  read it), its sends and re-arms effects made by injectable functions so `proxy_test.go` reads them; a
+  `sweep` timer every `SweepInterval`; a confirmed host is a `Cast` to the routes process. rest_for_one
+  because the proxy tells the routes process what to do: a restarted routes process takes the proxy with
+  it, which starts afresh, re-confirming hosts as the WAN asks for them. `cmd/minuteman` starts it as the `NDProxy` application.
 - **`internal/wanextend`** — the NDProxy *policy* layer, mirroring `internal/lanprefix`'s split from its
   protocol client (`pkg/ndproxy`) but for the single-shared-WAN-`/64` model instead of a distinct PD
   delegation. `discover.go`'s `DiscoverPrefix(ctx, wanIfindex)` blocks, polling `pkg/netlink.Socket.Addrs`
@@ -863,7 +872,7 @@ orphaned the running kernel's module directory — reboot to fix that).
   global address (expected mid-renumbering) is not itself reported, so the last-known prefix keeps being
   advertised until a real replacement is confirmed. That change/no-change decision is `nextWatchState`, split
   out as a pure function precisely so it's unit-tested without a real clock or netlink socket
-  (`discover_test.go`) — the same rationale `pkg/ndproxy`'s `proxyState` takes an explicit `now` instead of
+  (`discover_test.go`) — the same rationale `pkg/ndproxy`'s `State` takes an explicit `now` instead of
   reading the clock. Neither `DiscoverPrefix` nor `WatchChanges` track `IFA_CACHEINFO`'s remaining
   lifetimes, so `ra.go` re-advertises to the LAN with RFC 4861 §6.2.1's recommended default lifetimes
   rather than the WAN RA's actual ones — a known simplification. `ra.go`'s `raManager` has every LAN
@@ -875,18 +884,17 @@ orphaned the running kernel's module directory — reboot to fix that).
   `RouterLifetime=0` RA a restart emits never deprecated the outgoing prefix anyway (that PIO still
   carries its lifetimes intact), so restarting only cost LAN clients their default route and RDNSS server
   for the length of the changeover. `hostroutes.go`'s
-  `HostRoutes` wraps a `pkg/netlink.Socket` for the lifetime of one `pkg/ndproxy.Serve` run, matching its
-  `Config.OnActive`/`OnInactive` callback shapes: `Install` adds a `/128` route to a confirmed-active target
+  `HostRoutes` wraps a `pkg/netlink.Socket` for the lifetime of `internal/ndppd`'s routes process, being
+  its `Routes`: `Install` adds a `/128` route to a confirmed-active target
   out its LAN interface (`AddRoute`, so the kernel's own forwarding decision picks the right `-lan`
   interface when there's more than one — without it, WAN-side proxying alone doesn't tell the kernel which
-  LAN interface to actually forward through); `Remove` (`OnInactive` has no error return, unlike `OnActive`)
-  deletes it best-effort, logging rather than propagating a failure, since a route that outlives its target
+  LAN interface to actually forward through); `Remove` deletes it best-effort, logging rather than propagating a failure, since a route that outlives its target
   is stale but harmless and gets overwritten (`NLM_F_REPLACE`) the next time `Install` runs for it.
-  `serve.go`'s `Serve(ctx, wanIface, wanIfindex, lanIfaces, wg)` is the single entry point `cmd/minuteman`
-  calls for `-ndproxy`: blocks on the initial `DiscoverPrefix` (nothing else can usefully start before
-  then, the same rationale `runPrefixDelegation` applies to its own initial `Acquire`), then starts
-  `pkg/ndproxy.Serve`, the initial `raManager.sync`, and a `WatchChanges` goroutine whose `onChange`
-  re-runs `raManager.sync` with the new prefix — every goroutine registered on the caller's `wg`.
+  `serve.go`'s `Serve(ctx, wanIfindex, lanIfaces, rdnssByIface, adv, wg)` is what `cmd/minuteman` calls
+  for `-ndproxy` once it has started `internal/ndppd`: blocks on the initial `DiscoverPrefix` (nothing
+  else can usefully start before then, the same rationale `runPrefixDelegation` applies to its own initial
+  `Acquire`), then the initial `raManager.sync`, and a `WatchChanges` goroutine whose `onChange` re-runs
+  `raManager.sync` with the new prefix, registered on the caller's `wg`.
 - **`internal/slowpath`** — owns the kernel companion `ip6tnl` that gives the datapath softwire
   *reassembly* (RFC 6333 §5.3's inbound half) plus the *fallback* for what the in-XDP fragmenter can't
   take: the cases the XDP fast path `XDP_PASS`es rather than dropping — a fragmented softwire IPv6 packet

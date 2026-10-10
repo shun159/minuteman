@@ -47,7 +47,7 @@ the `sockaddr_ll`. A classic-BPF filter (UDP dport 67) keeps all other traffic o
 ## `Pool` (`lease.go`)
 
 The allocator for one LAN subnet. Pure — every method takes an explicit `now time.Time` instead of
-reading the clock, like `pkg/ndproxy`'s `proxyState` — and in-memory only. `NewPool` excludes the
+reading the clock, like `pkg/ndproxy`'s `State` — and in-memory only. `NewPool` excludes the
 network, broadcast and server addresses from allocation.
 
 Three things it does that a naive pool wouldn't:

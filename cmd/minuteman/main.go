@@ -41,6 +41,7 @@ import (
 	"github.com/shun159/miniteman/internal/dnsproxy"
 	"github.com/shun159/miniteman/internal/fragpath"
 	"github.com/shun159/miniteman/internal/lanprefix"
+	"github.com/shun159/miniteman/internal/ndppd"
 	"github.com/shun159/miniteman/internal/radvd"
 	"github.com/shun159/miniteman/internal/slowpath"
 	"github.com/shun159/miniteman/internal/softwirectl"
@@ -489,7 +490,7 @@ func run() error {
 		}
 	}
 	if *ndProxy {
-		if err := runNDProxy(ctx, adv, *wanIface, wanIfindex, lans, rdnssByIface, &bgWG); err != nil {
+		if err := runNDProxy(ctx, apps, adv, *wanIface, wanIfindex, lans, rdnssByIface, &bgWG); err != nil {
 			return err
 		}
 	}
@@ -598,24 +599,38 @@ func runPrefixDelegation(ctx context.Context, dhcp dhcpv6.Exchanger, adv radvd.A
 	return nil
 }
 
-// runNDProxy delegates the whole -ndproxy CPE policy to
-// internal/wanextend.Serve: learning the WAN interface's own SLAAC /64,
-// re-advertising it on every -lan interface with the On-Link flag cleared
-// (see routeradvert.Config.OnLink's doc) and keeping that advertisement in
-// sync if the WAN prefix later changes, and running pkg/ndproxy.Serve on
-// wanIface to answer WAN-side Neighbor Solicitations for LAN hosts it
-// actively verifies exist. wanextend.Serve registers every goroutine it
-// starts on wg, so run() waits for their shutdown-triggered final RAs and
-// socket cleanup before returning. rdnssByIface is forwarded to
+// runNDProxy runs the -ndproxy CPE model: internal/ndppd's tree, started as
+// an application, answering WAN-side Neighbor Solicitations on wanIface for
+// LAN hosts it actively verifies exist and installing their host routes
+// (internal/wanextend.HostRoutes); then internal/wanextend.Serve, learning
+// the WAN interface's own SLAAC /64, re-advertising it on every -lan
+// interface with the On-Link flag cleared (see routeradvert.Config.OnLink's
+// doc) and keeping that advertisement in sync if the WAN prefix later
+// changes. wanextend.Serve registers its watch goroutine on wg, so run()
+// waits for it before returning. rdnssByIface is forwarded to
 // wanextend.Serve (see its own doc) -- it's the map of link-local addresses
 // startDNSProxy actually bound, so RDNSS is advertised only where a DNS
 // proxy is really listening.
-func runNDProxy(ctx context.Context, adv radvd.Advertiser, wanIface string, wanIfindex uint32, lans cliconfig.LANSpecList, rdnssByIface map[string]netip.Addr, wg *sync.WaitGroup) error {
+func runNDProxy(ctx context.Context, apps *application.Running, adv radvd.Advertiser, wanIface string, wanIfindex uint32, lans cliconfig.LANSpecList, rdnssByIface map[string]netip.Addr, wg *sync.WaitGroup) error {
 	lanIfaces := make([]string, len(lans))
 	for i, spec := range lans {
 		lanIfaces[i] = spec.Iface
 	}
-	return wanextend.Serve(ctx, wanIface, int(wanIfindex), lanIfaces, rdnssByIface, adv, wg)
+	spec := ndppd.Spec(ndppd.Config{
+		WAN:  wanIface,
+		LANs: lanIfaces,
+		OpenRoutes: func() (ndppd.Routes, error) {
+			r, err := wanextend.NewHostRoutes()
+			if err != nil {
+				return nil, err
+			}
+			return r, nil
+		},
+	})
+	if err := apps.Start(ctx, app("NDProxy", spec)); err != nil {
+		return fmt.Errorf("starting NDProxy: %w", err)
+	}
+	return wanextend.Serve(ctx, int(wanIfindex), lanIfaces, rdnssByIface, adv, wg)
 }
 
 // startDNSProxy starts internal/dnsproxy's supervision tree on every -lan

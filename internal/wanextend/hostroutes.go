@@ -10,7 +10,7 @@ import (
 )
 
 // HostRoutes installs and removes per-LAN-host /128 routes via
-// pkg/netlink, matching pkg/ndproxy.Config's OnActive/OnInactive callback
+// pkg/netlink, matching internal/ndppd.Routes, which the proxy's routes process
 // shapes. A route is needed at all only because NDProxy's model shares one
 // /64 across the WAN and every LAN interface: without one, the kernel has
 // no way to know which LAN interface a confirmed-active target lives
@@ -22,7 +22,7 @@ type HostRoutes struct {
 }
 
 // NewHostRoutes opens the netlink socket HostRoutes uses for the lifetime
-// of the caller's pkg/ndproxy.Serve run. Not safe for concurrent use, but
+// of that process. Not safe for concurrent use, but
 // Serve only ever calls OnActive/OnInactive from its own single select
 // loop, so a shared *netlink.Socket needs no locking here.
 func NewHostRoutes() (*HostRoutes, error) {
@@ -38,7 +38,7 @@ func (h *HostRoutes) Close() error {
 	return h.sock.Close()
 }
 
-// Install adds a /128 route to target out iface -- pkg/ndproxy.Config's
+// Install adds a /128 route to target out iface -- what internal/ndppd does on
 // OnActive.
 func (h *HostRoutes) Install(target netip.Addr, iface string) error {
 	ifi, err := net.InterfaceByName(iface)
@@ -52,7 +52,7 @@ func (h *HostRoutes) Install(target netip.Addr, iface string) error {
 }
 
 // Remove deletes the /128 route to target installed by Install --
-// pkg/ndproxy.Config's OnInactive. Errors are logged, not returned:
+// internal/ndppd's expiry of a target. Errors are logged, not returned:
 // OnInactive has no error return (unlike OnActive), since a route that
 // fails to be removed is stale but harmless -- nothing routes to it once
 // Serve stops confirming target active, and a future reactivation's
