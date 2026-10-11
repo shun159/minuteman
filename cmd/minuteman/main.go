@@ -28,6 +28,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
@@ -211,6 +212,7 @@ func run() error {
 		hb46ppVendorID = flag.String("hb46pp-vendor-id", defaultHB46PPVendorID, "HB46PP vendorid query parameter sent during provisioning discovery fallback (vendor OUI, optionally -suffix)")
 		hb46ppProduct  = flag.String("hb46pp-product", defaultHB46PPProduct, "HB46PP product query parameter sent during provisioning discovery fallback")
 		hb46ppVersion  = flag.String("hb46pp-version", defaultHB46PPVersion, "HB46PP version query parameter sent during provisioning discovery fallback (digits/underscores only)")
+		stateDir       = flag.String("state-dir", "", "directory of the state kept across restarts: with -dhcpv4, each -lan interface's DHCPv4 leases (in dhcpv4/<iface>), so that a client rebooting keeps its address at once; with none, nothing is kept")
 		pidFile        = flag.String("pidfile", "", "write our PID to this file once startup completes and remove it on exit, for a supervisor or test rig to track the instance")
 		lans           cliconfig.LANSpecList
 		dnsServersFlag cliconfig.AddrList
@@ -496,9 +498,11 @@ func run() error {
 		}
 	}
 	if *dhcpv4On {
-		if err := runDHCPv4(ctx, apps, lans, dhcpv4DNSFlag, *dnsProxyOn, wanNetIface.MTU, *dhcpv4Lease); err != nil {
+		closeLeases, err := runDHCPv4(ctx, apps, lans, dhcpv4DNSFlag, *dnsProxyOn, wanNetIface.MTU, *dhcpv4Lease, *stateDir)
+		if err != nil {
 			return err
 		}
+		defer func() { stopApps(); closeLeases() }() // the leases outlive the tree using them
 	}
 	// The single owner of the live softwire endpoints (see
 	// startSoftwireControl). It runs when the AFTR is dynamic (RFC 4242
@@ -692,11 +696,15 @@ func startDNSProxy(ctx context.Context, apps *application.Running, lans cliconfi
 // else this CPE's gateway when -dns-proxy is running to answer at it; with
 // neither, no DNS is advertised at all rather than pointing clients at a port
 // nothing listens on.
-func runDHCPv4(ctx context.Context, apps *application.Running, lans cliconfig.LANSpecList, dnsOverride []netip.Addr, dnsProxyOn bool, wanMTU int, lease time.Duration) error {
+//
+// With stateDir (-state-dir), each interface's leases are kept in a kvs table
+// in stateDir/dhcpv4/<iface>; the closer returned closes them, for run to call
+// once the tree has stopped.
+func runDHCPv4(ctx context.Context, apps *application.Running, lans cliconfig.LANSpecList, dnsOverride []netip.Addr, dnsProxyOn bool, wanMTU int, lease time.Duration, stateDir string) (func(), error) {
 	var cfgs []dhcpv4.InterfaceConfig
 	for _, spec := range lans {
 		if !spec.Subnet.IsValid() || !spec.Subnet.Addr().Is4() {
-			return fmt.Errorf("-dhcpv4: LAN interface %s has no IPv4 subnet (its -lan gateway %s is not IPv4)", spec.Iface, spec.GatewayIP)
+			return nil, fmt.Errorf("-dhcpv4: LAN interface %s has no IPv4 subnet (its -lan gateway %s is not IPv4)", spec.Iface, spec.GatewayIP)
 		}
 
 		dns := dnsOverride
@@ -730,14 +738,35 @@ func runDHCPv4(ctx context.Context, apps *application.Running, lans cliconfig.LA
 			spec.Subnet, spec.Iface, spec.GatewayIP, dns, lease, mtu)
 	}
 
-	spec, err := dhcpv4server.Spec(cfgs)
+	leases := make(map[string]*dhcpv4server.Leases)
+	closeLeases := func() {
+		for iface, l := range leases {
+			if err := l.Close(); err != nil {
+				log.Printf("DHCPv4: closing the leases of %s: %v", iface, err)
+			}
+		}
+	}
+	if stateDir != "" {
+		for _, cfg := range cfgs {
+			dir := filepath.Join(stateDir, "dhcpv4", cfg.Iface)
+			l, err := dhcpv4server.OpenLeases(dir)
+			if err != nil {
+				closeLeases()
+				return nil, fmt.Errorf("-state-dir: opening the DHCPv4 leases of %s: %w", cfg.Iface, err)
+			}
+			leases[cfg.Iface] = l
+			log.Printf("DHCPv4: keeping the leases of %s in %s (%d kept)", cfg.Iface, dir, l.Len())
+		}
+	}
+	spec, err := dhcpv4server.Spec(cfgs, leases)
+	if err == nil {
+		err = apps.Start(ctx, app("DHCPv4 server", spec))
+	}
 	if err != nil {
-		return err
+		closeLeases()
+		return nil, fmt.Errorf("starting DHCPv4 server: %w", err)
 	}
-	if err := apps.Start(ctx, app("DHCPv4 server", spec)); err != nil {
-		return fmt.Errorf("starting DHCPv4 server: %w", err)
-	}
-	return nil
+	return closeLeases, nil
 }
 
 // aftrDiscovery is one AFTR discovery outcome, carrying what the periodic

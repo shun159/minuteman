@@ -129,9 +129,8 @@ func handleRequest(cfg InterfaceConfig, pool *Pool, req *Message, clientID strin
 		// No record of this client. RFC 2131 §4.3.2 requires silence here so
 		// independent DHCP servers on one segment coexist; the client times
 		// out and falls back to DISCOVER, recovering its address through a
-		// fresh lease (this server keeps no state across restarts, so a
-		// returning client's INIT-REBOOT for its cached address is exactly
-		// this "no record" case).
+		// fresh lease. A returning client's INIT-REBOOT after a restart is
+		// this case too, unless the caller kept the leases (Pool.Restore).
 		return nil
 	}
 	if bound != target {

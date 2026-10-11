@@ -236,3 +236,49 @@ func TestPoolClone(t *testing.T) {
 		t.Errorf("clone binding %v %v, want %v", got, held, ip)
 	}
 }
+
+// A committed lease comes back from Committed and goes into another pool
+// with Restore; an offer, an expired lease, an address outside the pool or
+// taken by another client does not.
+func TestCommittedRestore(t *testing.T) {
+	subnet := netip.MustParsePrefix("192.168.7.0/24")
+	server := netip.MustParseAddr("192.168.7.1")
+	now := time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC)
+	p, err := NewPool(subnet, server, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ip, _ := p.Offer("a", netip.Addr{}, now)
+	if _, ok := p.Committed("a", now); ok {
+		t.Fatal("an offer is committed")
+	}
+	p.Commit("a", ip, now)
+	l, ok := p.Committed("a", now)
+	if !ok || l.IP != ip || !l.Expiry.Equal(now.Add(time.Hour)) {
+		t.Fatalf("Committed = %+v %v", l, ok)
+	}
+	if _, ok := p.Committed("a", now.Add(time.Hour)); ok {
+		t.Fatal("an expired lease is committed")
+	}
+
+	q, _ := NewPool(subnet, server, time.Hour)
+	later := now.Add(10 * time.Minute)
+	if !q.Restore("a", l, later) {
+		t.Fatal("Restore refused a live lease")
+	}
+	if got, ok := q.Binding("a", later); !ok || got != ip {
+		t.Fatalf("restored binding %v %v", got, ok)
+	}
+	if q.Restore("b", l, later) {
+		t.Fatal("Restore gave a held address to another client")
+	}
+	if q.Restore("c", Lease{IP: netip.MustParseAddr("10.0.0.5"), Expiry: l.Expiry}, later) {
+		t.Fatal("Restore took an address outside the subnet")
+	}
+	if q.Restore("d", Lease{IP: netip.MustParseAddr("192.168.7.9"), Expiry: now}, later) {
+		t.Fatal("Restore took an expired lease")
+	}
+	if got, _ := q.Offer("e", netip.Addr{}, later); got == ip {
+		t.Fatal("a restored address offered to another client")
+	}
+}
