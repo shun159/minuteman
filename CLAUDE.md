@@ -46,7 +46,7 @@ further down — this is just the index of what exists and which flag turns it o
   with a DS-Lite-adjusted MTU (option 26). Needed a datapath change (see `xdp_dslite_encap` below) so
   broadcast DISCOVER/REQUEST traffic isn't wrapped into the softwire before reaching the server. With
   `-state-dir`, leases are kept across restarts in a molecule `kvs` table, each ACK sent once its lease
-  is on disk.
+  is on disk, and the expired ones are deleted from it every minute.
 - **Native-IPv6 forwarding fastpath** (always on) — transit IPv6 that used to fall to the kernel slow
   path (`XDP_PASS`) is now routed directly in XDP, with in-datapath ICMPv6 Packet Too Big and an optional
   software-RSS cpumap stage (`-ipv6-sw-rss`, off by default — for NICs without capable hardware RSS).
