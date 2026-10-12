@@ -52,6 +52,10 @@ table open.
   meanwhile, until the `kvs.Durable` of the put arrives: an ACK is never lost to a restart that
   would forget it. A put that fails is logged and the reply sent all the same -- a client
   answered matters more than a lease remembered.
+- **Expiry**: the table knows each lease's expiry (`Expires`), and every minute the server deletes
+  the expired ones with `ExpireEffect`, by its own clock. The pool frees an expired lease by
+  itself; this keeps the table from growing with the leases of clients long gone. A lease renewed
+  meanwhile stays.
 
 A client rebooting after the CPE did gets its INIT-REBOOT ACKed at once, rather than silence and a
 fresh DISCOVER.

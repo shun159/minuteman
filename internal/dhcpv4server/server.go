@@ -56,10 +56,21 @@ func Spec(cfgs []dhcpv4.InterfaceConfig, leases map[string]*Leases) (supervisor.
 type Leases = kvs.Table[string, dhcpv4.Lease]
 
 // OpenLeases opens the lease table kept in dir, made if missing. A lease is
-// on disk before the ACK granting it goes out (kvs.SyncEach).
+// on disk before the ACK granting it goes out (kvs.SyncEach). The table
+// knows when each lease expires, for the server to delete those expired.
 func OpenLeases(dir string) (*Leases, error) {
-	return kvs.Open(dir, kvs.Options[string, dhcpv4.Lease]{})
+	return kvs.Open(dir, kvs.Options[string, dhcpv4.Lease]{
+		Expires: func(l dhcpv4.Lease) time.Time { return l.Expiry },
+	})
 }
+
+// expireEvery is how often the server deletes the expired leases from its
+// table. The pool frees an expired lease at once by itself; the table only
+// keeps it from growing with the leases of clients long gone.
+const expireEvery = time.Minute
+
+// expire is the message of the timer deleting the expired leases.
+type expire struct{}
 
 // restore puts the leases kept in leases back into pool, and deletes those
 // it no longer takes: expired, or no longer in the pool.
@@ -141,7 +152,8 @@ func starter(cfg dhcpv4.InterfaceConfig, leases *Leases) supervisor.StartFunc {
 //
 // With leases, a request changing a client's committed lease writes it to
 // the table, and a reply granting it waits until it is on disk: an ACK is
-// never lost to a restart that would forget it.
+// never lost to a restart that would forget it. Every expireEvery, the
+// leases expired by the server's clock are deleted from the table.
 type server struct {
 	genserver.Default[*dhcpv4.Pool]
 	cfg     dhcpv4.InterfaceConfig
@@ -164,7 +176,14 @@ var _ molecule.Clocked = server{}
 func (s server) WithClock(now func() time.Time) any { s.now = now; return s }
 
 func (s server) Init(proc.PID) (*dhcpv4.Pool, []molecule.Effect, error) {
-	return s.pool, nil, nil
+	if s.leases == nil {
+		return s.pool, nil, nil
+	}
+	return s.pool, molecule.Do(nextExpire()), nil
+}
+
+func nextExpire() molecule.Effect {
+	return molecule.StartTimer{Key: expire{}, After: expireEvery, Msg: expire{}}
 }
 
 func (s server) HandleInfo(pool *dhcpv4.Pool, msg any) (*dhcpv4.Pool, []molecule.Effect) {
@@ -188,6 +207,8 @@ func (s server) HandleInfo(pool *dhcpv4.Pool, msg any) (*dhcpv4.Pool, []molecule
 		}
 		h := m.Tag.(*held)
 		return pool, molecule.Do(s.sock.SendEffect(h.to, h.frame))
+	case expire:
+		return pool, molecule.Do(s.leases.ExpireEffect(s.now(), nil), nextExpire())
 	case socket.SendErrorMsg:
 		s.logf("dhcpv4: sending a reply on %s: %v", s.cfg.Iface, m.Err)
 	case socket.ErrorMsg:

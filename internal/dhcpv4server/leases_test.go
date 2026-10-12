@@ -160,6 +160,49 @@ func TestLeaseKeptAcrossRestart(t *testing.T) {
 	}
 }
 
+// The server deletes a lease from the table once it expires, by its clock,
+// and keeps one renewed.
+func TestLeaseExpires(t *testing.T) {
+	leases := openLeases(t, t.TempDir())
+	sim := gensim.New(1)
+	rec, err := gensim.Spawn(sim, genserver.Gen(recorder{}), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, pool := newServer(t)
+	s.pool, s.leases, s.sock = pool, leases, socket.Socket{PID: rec}
+	pid, err := gensim.Spawn(sim, genserver.Gen(s), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant := func() netip.Addr {
+		t.Helper()
+		sim.Send(pid, socket.DataMsg{Bytes: request(discover())})
+		sim.RunUntilIdle()
+		r := sent(t, sim, rec)
+		ip := r[len(r)-1].YIAddr
+		sim.Send(pid, socket.DataMsg{Bytes: request(selecting(ip))})
+		sim.RunUntilIdle()
+		if _, ok := leases.Get(string(clientHW)); !ok {
+			t.Fatal("no lease in the table")
+		}
+		return ip
+	}
+	grant()
+
+	// Renewed halfway, the lease outlives its first expiry.
+	sim.Advance(cfg.LeaseTime / 2)
+	grant()
+	sim.Advance(cfg.LeaseTime/2 + 2*expireEvery)
+	if _, ok := leases.Get(string(clientHW)); !ok {
+		t.Fatal("a renewed lease deleted")
+	}
+	sim.Advance(cfg.LeaseTime / 2)
+	if l, ok := leases.Get(string(clientHW)); ok {
+		t.Fatalf("a lease kept past its expiry: %+v", l)
+	}
+}
+
 // Restoring drops the leases that expired while the CPE was down.
 func TestRestoreDropsExpired(t *testing.T) {
 	leases := openLeases(t, t.TempDir())
