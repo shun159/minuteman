@@ -7,8 +7,8 @@ softwire that actually moves that traffic.
 Server only, and only the case a home CPE serves: directly attached, one subnet per interface.
 Deliberately **not** supported — a BOOTP relay request (`giaddr != 0`) is rejected rather than
 mis-answered, since a relayed reply must go back to the relay agent on the server port; no
-multi-subnet shared networks; no persistence across restarts (an in-memory pool, like the rest of
-minuteman's state).
+multi-subnet shared networks. The pool is in memory; keeping leases across restarts is the caller's
+(`Committed` / `Restore`), as `internal/dhcpv4server` does with `-state-dir`.
 
 ## Files
 
@@ -48,7 +48,9 @@ the `sockaddr_ll`. A classic-BPF filter (UDP dport 67) keeps all other traffic o
 
 The allocator for one LAN subnet. Pure — every method takes an explicit `now time.Time` instead of
 reading the clock, like `pkg/ndproxy`'s `State` — and in-memory only. `NewPool` excludes the
-network, broadcast and server addresses from allocation.
+network, broadcast and server addresses from allocation. `Committed` returns a client's committed
+lease as a `Lease` (address, expiry) for a caller to keep, and `Restore` commits one again in a new
+pool, refusing a lease expired, outside the pool, or on an address another client holds.
 
 Three things it does that a naive pool wouldn't:
 
@@ -74,8 +76,8 @@ requested-IP / `ciaddr` the client set, and validates the server-id on RELEASE a
 
 The important rule: **a REQUEST is ACKed only for an address this server actually offered or
 leased to that client.** A REQUEST from a client it has no record of — including a returning
-client's INIT-REBOOT after a restart wiped the in-memory pool — gets *silence*, not an ACK of a
-free address. That is what lets independent DHCP servers coexist on one segment; the client falls
+client's INIT-REBOOT after a restart wiped the pool, unless its leases were restored — gets
+*silence*, not an ACK of a free address. That is what lets independent DHCP servers coexist on one segment; the client falls
 back to DISCOVER and gets a proper offer.
 
 `siaddr` is deliberately left zero: it is the next-bootstrap-server field, not the server

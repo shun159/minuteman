@@ -46,9 +46,10 @@ type lease struct {
 // free, which client holds which (offered or committed), when those expire,
 // and which are quarantined by a DHCPDECLINE. Like pkg/ndproxy's State
 // it's pure — every method takes an explicit now instead of reading the
-// clock, so it's unit-tested with no timers — and, like the rest of
-// minuteman's state, it's in-memory only. Not safe for concurrent use; a
-// caller that must not change a Pool it holds works on a Clone.
+// clock, so it's unit-tested with no timers — and in-memory only: a caller
+// keeping leases across restarts stores what Committed returns and gives it
+// back to Restore. Not safe for concurrent use; a caller that must not
+// change a Pool it holds works on a Clone.
 type Pool struct {
 	subnet    netip.Prefix
 	serverIP  netip.Addr
@@ -166,6 +167,38 @@ func (p *Pool) Decline(clientID string, ip netip.Addr, now time.Time) {
 	}
 	p.declined[ip] = now.Add(declineQuarantine)
 	p.clear(clientID)
+}
+
+// Lease is a committed binding as a caller keeps it across restarts: the
+// address, and when the lease ends. Offers are not kept: they last
+// offerHoldTime, less than a restart takes.
+type Lease struct {
+	IP     netip.Addr
+	Expiry time.Time
+}
+
+// Committed returns clientID's committed lease, if it holds one that hasn't
+// expired.
+func (p *Pool) Committed(clientID string, now time.Time) (Lease, bool) {
+	l, ok := p.byClient[clientID]
+	if !ok || l.state != bindingCommitted || p.expired(l, now) {
+		return Lease{}, false
+	}
+	return Lease{IP: l.ip, Expiry: l.expiry}, true
+}
+
+// Restore commits l to clientID again, as kept from an earlier run, and
+// reports whether it did: not for a lease expired, an address this pool may
+// not hand out (the subnet or server address changed since), or one already
+// held by another client.
+func (p *Pool) Restore(clientID string, l Lease, now time.Time) bool {
+	if !now.Before(l.Expiry) || !p.allocatable(l.IP, now) || !p.isFree(l.IP, clientID, now) {
+		return false
+	}
+	p.clear(clientID)
+	p.byClient[clientID] = lease{ip: l.IP, expiry: l.Expiry, state: bindingCommitted}
+	p.byIP[l.IP] = clientID
+	return true
 }
 
 // LeaseDuration is the pool's fixed lease length, exposed so the handler can

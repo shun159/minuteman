@@ -61,7 +61,7 @@ func newServer(t *testing.T) (server, *dhcpv4.Pool) {
 // link-layer address it asked for; the pool given is left as it was.
 func TestAnswerDiscover(t *testing.T) {
 	s, pool := newServer(t)
-	next, to, frame := s.answer(pool, request(discover()))
+	next, to, frame, _ := s.answer(pool, request(discover()))
 	if frame == nil {
 		t.Fatal("no reply to a DISCOVER")
 	}
@@ -91,13 +91,13 @@ func TestAnswerNotDHCP(t *testing.T) {
 	s, pool := newServer(t)
 	packet := request(discover())
 	packet[22], packet[23] = 0, 53 // to another port
-	if next, to, frame := s.answer(pool, packet); next != pool || to != nil || frame != nil {
+	if next, to, frame, _ := s.answer(pool, packet); next != pool || to != nil || frame != nil {
 		t.Errorf("answered %v %v", to, frame)
 	}
 }
 
 func TestSpecNoInterfaces(t *testing.T) {
-	if _, err := Spec(nil); err == nil {
+	if _, err := Spec(nil, nil); err == nil {
 		t.Error("Spec without interfaces succeeded")
 	}
 }
@@ -107,7 +107,7 @@ func TestStartInvalidSubnet(t *testing.T) {
 	bad := cfg
 	bad.Subnet = netip.MustParsePrefix("2001:db8::/64")
 	bad.ServerIP = netip.MustParseAddr("2001:db8::1")
-	spec, err := Spec([]dhcpv4.InterfaceConfig{bad})
+	spec, err := Spec([]dhcpv4.InterfaceConfig{bad}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

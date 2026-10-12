@@ -44,7 +44,9 @@ further down — this is just the index of what exists and which flag turns it o
   structurally bypassing the softwire (an ordinary native-IPv6 socket from the CPE's own process).
 - **DHCPv4 server** (`-dhcpv4`, RFC 2131/2132) — hands LAN clients the private IPv4 the softwire carries,
   with a DS-Lite-adjusted MTU (option 26). Needed a datapath change (see `xdp_dslite_encap` below) so
-  broadcast DISCOVER/REQUEST traffic isn't wrapped into the softwire before reaching the server.
+  broadcast DISCOVER/REQUEST traffic isn't wrapped into the softwire before reaching the server. With
+  `-state-dir`, leases are kept across restarts in a molecule `kvs` table, each ACK sent once its lease
+  is on disk.
 - **Native-IPv6 forwarding fastpath** (always on) — transit IPv6 that used to fall to the kernel slow
   path (`XDP_PASS`) is now routed directly in XDP, with in-datapath ICMPv6 Packet Too Big and an optional
   software-RSS cpumap stage (`-ipv6-sw-rss`, off by default — for NICs without capable hardware RSS).
@@ -655,7 +657,8 @@ orphaned the running kernel's module directory — reboot to fix that).
 - **`pkg/dhcpv4/`** — the LAN-side DHCPv4 *server* (RFC 2131/2132) minuteman runs behind `-dhcpv4` to hand
   its LAN clients the private IPv4 the DS-Lite softwire carries. Server only, and only the directly-attached
   single-subnet-per-interface case a home CPE serves (no BOOTP relay — a `giaddr != 0` request is rejected,
-  not mis-answered — no shared networks, no restart persistence: an in-memory pool). Follows the same
+  not mis-answered — no shared networks; the pool is in memory, with `Committed`/`Restore` for a caller
+  keeping leases). Follows the same
   pure-vs-I/O split as `pkg/ndproxy`: `message.go`/`options.go` are the BOOTP + magic-cookie + option TLV
   wire codec (`Options.Marshal` splits a value past 255 bytes across repeated option instances per RFC 3396
   rather than truncating a length byte); `lease.go`'s `Pool` is the address allocator, pure with an explicit
@@ -679,7 +682,9 @@ orphaned the running kernel's module directory — reboot to fix that).
   supervision tree, one genserver per LAN interface owning its `net/socket` AF_PACKET socket (read `Once` per
   request) and its `Pool` (cloned per request, so the behaviour stays pure; the clock given by molecule, `molecule.Clocked`), the
   tree's start validating every pool and opening every socket so a bad subnet or socket failure fails
-  `cmd/minuteman`'s startup. See the `xdp_dslite_encap`
+  `cmd/minuteman`'s startup. With `-state-dir` it keeps each interface's committed leases in a kvs table
+  (restored into the pool at start, written with `PutEffect`/`DeleteEffect`, an ACK held until its
+  lease's `kvs.Durable`). See the `xdp_dslite_encap`
   `is_non_unicast_dst` bypass above for why the datapath had to change before any of this could receive a
   packet.
 - **`pkg/ethtool/`** — minimal hand-rolled `SIOCETHTOOL` client reading exactly one thing: a device's
@@ -712,7 +717,8 @@ orphaned the running kernel's module directory — reboot to fix that).
   (opt-in prefix delegation), `-ndproxy` (opt-in RFC 4389 proxying, mutually exclusive with `-dhcpv6-pd` —
   validated in `run()` before anything else happens), `-dns-proxy` (opt-in DNS proxy, orthogonal to both
   IPv6-provisioning flags) with repeatable `-dns-server` to override its upstreams, `-dhcpv4` (opt-in DHCPv4
-  server, orthogonal to everything else) with `-dhcpv4-lease` and repeatable `-dhcpv4-dns`,
+  server, orthogonal to everything else) with `-dhcpv4-lease` and repeatable `-dhcpv4-dns`, `-state-dir`
+  (state kept across restarts: the DHCPv4 leases; none if unset),
   `-tcp-mss-clamp` (`auto` by default — track the softwire MTU; `off`, or an explicit MSS in bytes; parsed
   by `internal/cliconfig.ParseMSSClamp` into the `datapath.B4Config.TCPMSSClamp` policy),
   `-ipv6-sw-rss` (opt-in native-IPv6 software-RSS cpumap fanout — off by default, for NICs whose hardware
@@ -818,7 +824,8 @@ orphaned the running kernel's module directory — reboot to fix that).
   immediately. If `-dhcpv4` is set, `runDHCPv4()` builds one `pkg/dhcpv4.InterfaceConfig`
   per `-lan` (subnet from its `/prefixlen`, gateway as router; DNS = `-dhcpv4-dns`, else the gateway when
   `-dns-proxy` runs, else omitted; MTU = the `-lan` MTU or else the WAN MTU minus the 40-byte tunnel
-  overhead, dropped if below the IPv4 minimum) and starts `internal/dhcpv4server`'s tree as an application,
+  overhead, dropped if below the IPv4 minimum), opens each interface's lease table under `-state-dir` if
+  given (closed after the tree stops), and starts `internal/dhcpv4server`'s tree as an application,
   whose start fails on a bad subnet or socket failure; `run()` also rejects a `-dhcpv4-lease`
   shorter than `minDHCPv4Lease`. Every one of these runs as an application, stopped before what it drives is closed.
   Otherwise `main.go` just orchestrates

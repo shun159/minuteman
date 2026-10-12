@@ -30,6 +30,10 @@ github.com/shun159/molecule v0.4.0 h1:gUiBL66naAnaJEUvJhpiACJy4I6g8xzDTfPI2M3I+E
 github.com/shun159/molecule v0.4.0/go.mod h1:rieyaLcWyCi98PmZ6VjkmlWVjC2DA5bHPNDJHSThiL4=
 github.com/shun159/molecule v0.5.0 h1:l+FebInqEYgggPw6zbwhzH+GmGZqZsDXRpwOSFNkUSI=
 github.com/shun159/molecule v0.5.0/go.mod h1:rieyaLcWyCi98PmZ6VjkmlWVjC2DA5bHPNDJHSThiL4=
+github.com/shun159/molecule v0.5.1-0.20261011182428-002adf99bf55 h1:1rLWMxqEtCzEfafzcQ185tQEjLNw7BnjNo0oFE+7Hbk=
+github.com/shun159/molecule v0.5.1-0.20261011182428-002adf99bf55/go.mod h1:rieyaLcWyCi98PmZ6VjkmlWVjC2DA5bHPNDJHSThiL4=
+github.com/shun159/molecule v0.6.0 h1:umpL/o887LQsnQtCTzIijuo2C+fkh9fZM4aARVkddd0=
+github.com/shun159/molecule v0.6.0/go.mod h1:rieyaLcWyCi98PmZ6VjkmlWVjC2DA5bHPNDJHSThiL4=
 github.com/spf13/cobra v1.10.2 h1:DMTTonx5m65Ic0GOoRY2c16WCbHxOOw6xxezuLaBpcU=
 github.com/spf13/cobra v1.10.2/go.mod h1:7C1pvHqHw5A4vrJfjNwvOdzYu0Gml16OCs2GRiTUUS4=
 github.com/spf13/pflag v1.0.9/go.mod h1:McXfInJRrz4CZXVZOBLb0bTZqETkiAhM9Iw0y3An2Bg=
