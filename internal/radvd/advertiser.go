@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/shun159/miniteman/pkg/routeradvert"
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/genserver"
 	"github.com/shun159/molecule/net/socket"
 	"github.com/shun159/molecule/proc"
@@ -37,8 +37,8 @@ type advertiser struct {
 	iface  string
 	mac    net.HardwareAddr
 	seed   [2]uint64
-	sendRA func(ra []byte) molecule.Effect // to all nodes on the interface
-	armRS  molecule.Effect                 // asks the socket for the next Solicitation
+	sendRA func(ra []byte) actor.Effect // to all nodes on the interface
+	armRS  actor.Effect                 // asks the socket for the next Solicitation
 }
 
 // state is the advertiser's state.
@@ -54,19 +54,19 @@ type state struct {
 	replying bool // a Solicitation's answer is due
 }
 
-func (a advertiser) Init(proc.PID) (state, []molecule.Effect, error) {
-	return state{rng: *rand.NewPCG(a.seed[0], a.seed[1])}, molecule.Do(molecule.TrapExit{On: true}), nil
+func (a advertiser) Init(proc.PID) (state, []actor.Effect, error) {
+	return state{rng: *rand.NewPCG(a.seed[0], a.seed[1])}, actor.Do(actor.TrapExit{On: true}), nil
 }
 
-func (a advertiser) HandleCall(s state, _ genserver.None, _ genserver.From[genserver.None]) (state, []molecule.Effect) {
+func (a advertiser) HandleCall(s state, _ genserver.None, _ genserver.From[genserver.None]) (state, []actor.Effect) {
 	return s, nil
 }
 
-func (a advertiser) HandleCast(s state, msg advertise) (state, []molecule.Effect) {
+func (a advertiser) HandleCast(s state, msg advertise) (state, []actor.Effect) {
 	switch {
 	case !s.configured:
 		s.cfg, s.configured = msg.Cfg, true
-		return s, molecule.Do(sendNow())
+		return s, actor.Do(sendNow())
 	case msg.Cfg == s.cfg:
 		return s, nil // nothing a client would see differently
 	}
@@ -77,33 +77,33 @@ func (a advertiser) HandleCast(s state, msg advertise) (state, []molecule.Effect
 		s.pending = true
 		return s, nil
 	}
-	return s, molecule.Do(sendNow())
+	return s, actor.Do(sendNow())
 }
 
-func (a advertiser) HandleInfo(s state, msg any) (state, []molecule.Effect) {
+func (a advertiser) HandleInfo(s state, msg any) (state, []actor.Effect) {
 	switch m := msg.(type) {
 	case unsolicited:
 		s.sent++
 		next := routeradvert.NextUnsolicitedInterval(s.sent, rand.New(&s.rng))
-		var effs []molecule.Effect
+		var effs []actor.Effect
 		s, effs = a.send(s)
-		return s, append(effs, molecule.StartTimer{Key: unsolicited{}, After: next, Msg: unsolicited{}})
+		return s, append(effs, actor.StartTimer{Key: unsolicited{}, After: next, Msg: unsolicited{}})
 
 	case quiet:
 		s.recent = false
 		if s.pending {
 			s.pending = false
-			return s, molecule.Do(sendNow())
+			return s, actor.Do(sendNow())
 		}
 
 	case socket.DataMsg:
-		effs := molecule.Do(a.armRS)
+		effs := actor.Do(a.armRS)
 		if !s.configured || s.recent || s.replying || !routeradvert.IsRouterSolicitation(m.Bytes) {
 			return s, effs // a recent RA already answers it
 		}
 		s.replying = true
 		after := routeradvert.ReplyDelay(rand.New(&s.rng))
-		return s, append(effs, molecule.StartTimer{Key: reply{}, After: after, Msg: reply{}})
+		return s, append(effs, actor.StartTimer{Key: reply{}, After: after, Msg: reply{}})
 
 	case reply:
 		s.replying = false
@@ -116,33 +116,33 @@ func (a advertiser) HandleInfo(s state, msg any) (state, []molecule.Effect) {
 			// The link-local source is still DAD-tentative: try again
 			// soon, the RA not counted as sent.
 			s.sent = max(0, s.sent-1)
-			return s, molecule.Do(molecule.StartTimer{Key: unsolicited{}, After: routeradvert.TentativeRetryInterval, Msg: unsolicited{}})
+			return s, actor.Do(actor.StartTimer{Key: unsolicited{}, After: routeradvert.TentativeRetryInterval, Msg: unsolicited{}})
 		}
-		return s, molecule.Do(molecule.Stop{Reason: fmt.Errorf("radvd: sending on %s: %w", a.iface, m.Err)})
+		return s, actor.Do(actor.Stop{Reason: fmt.Errorf("radvd: sending on %s: %w", a.iface, m.Err)})
 
 	case socket.ErrorMsg:
-		return s, molecule.Do(molecule.Stop{Reason: fmt.Errorf("radvd: reading on %s: %w", a.iface, m.Err)})
+		return s, actor.Do(actor.Stop{Reason: fmt.Errorf("radvd: reading on %s: %w", a.iface, m.Err)})
 	case socket.ClosedMsg:
-		return s, molecule.Do(molecule.Stop{Reason: fmt.Errorf("radvd: socket on %s closed", a.iface)})
+		return s, actor.Do(actor.Stop{Reason: fmt.Errorf("radvd: socket on %s closed", a.iface)})
 	}
 	return s, nil
 }
 
 // Terminate withdraws the router on the way out, best-effort.
-func (a advertiser) Terminate(s state, _ error) []molecule.Effect {
+func (a advertiser) Terminate(s state, _ error) []actor.Effect {
 	if !s.configured {
 		return nil
 	}
-	return molecule.Do(a.sendRA(a.ra(s.cfg, 0)))
+	return actor.Do(a.sendRA(a.ra(s.cfg, 0)))
 }
 
 // send sends an RA of the current Config, and holds off the next for
 // MinDelayBetweenRAs.
-func (a advertiser) send(s state) (state, []molecule.Effect) {
+func (a advertiser) send(s state) (state, []actor.Effect) {
 	s.recent = true
-	return s, molecule.Do(
+	return s, actor.Do(
 		a.sendRA(a.ra(s.cfg, routeradvert.AdvDefaultLifetime)),
-		molecule.StartTimer{Key: quiet{}, After: routeradvert.MinDelayBetweenRAs, Msg: quiet{}},
+		actor.StartTimer{Key: quiet{}, After: routeradvert.MinDelayBetweenRAs, Msg: quiet{}},
 	)
 }
 
@@ -151,6 +151,6 @@ func (a advertiser) ra(cfg routeradvert.Config, lifetime time.Duration) []byte {
 }
 
 // sendNow has the next unsolicited RA go out at once.
-func sendNow() molecule.Effect {
-	return molecule.StartTimer{Key: unsolicited{}, After: 0, Msg: unsolicited{}}
+func sendNow() actor.Effect {
+	return actor.StartTimer{Key: unsolicited{}, After: 0, Msg: unsolicited{}}
 }

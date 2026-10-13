@@ -3,7 +3,7 @@ package ndppd
 import (
 	"net/netip"
 
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/genserver"
 	"github.com/shun159/molecule/proc"
 )
@@ -32,16 +32,16 @@ type routes struct {
 	logf func(format string, args ...any)
 }
 
-func (r routes) Init(proc.PID) (Routes, []molecule.Effect, error) {
+func (r routes) Init(proc.PID) (Routes, []actor.Effect, error) {
 	rs, err := r.open()
 	if err != nil {
 		return nil, nil, err
 	}
 	// Trapping exits, so that Terminate closes the routes on shutdown.
-	return rs, molecule.Do(molecule.TrapExit{On: true}), nil
+	return rs, actor.Do(actor.TrapExit{On: true}), nil
 }
 
-func (r routes) HandleCast(rs Routes, msg any) (Routes, []molecule.Effect) {
+func (r routes) HandleCast(rs Routes, msg any) (Routes, []actor.Effect) {
 	switch m := msg.(type) {
 	case install:
 		r.logf("NDProxy: %s confirmed active behind %s", m.Target, m.Iface)
@@ -55,7 +55,7 @@ func (r routes) HandleCast(rs Routes, msg any) (Routes, []molecule.Effect) {
 	return rs, nil
 }
 
-func (r routes) Terminate(rs Routes, _ error) []molecule.Effect {
+func (r routes) Terminate(rs Routes, _ error) []actor.Effect {
 	rs.Close()
 	return nil
 }

@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/shun159/miniteman/pkg/prefixdelegation"
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/genstatem"
 	"github.com/shun159/molecule/proc"
 )
@@ -59,19 +59,19 @@ func newRig(t *testing.T, initial *prefixdelegation.Lease) *rig {
 
 // run runs the exchange among effs, as molecule would, and returns its
 // outcome as the process gets it.
-func (r *rig) run(t *testing.T, effs []molecule.Effect) genstatem.Event {
+func (r *rig) run(t *testing.T, effs []actor.Effect) genstatem.Event {
 	t.Helper()
 	for _, e := range effs {
-		if a, ok := e.(molecule.Async); ok {
+		if a, ok := e.(actor.Async); ok {
 			v, err := a.Run(context.Background())
-			return genstatem.Info{Msg: molecule.AsyncResult{Key: a.Key, Value: v, Err: err}}
+			return genstatem.Info{Msg: actor.AsyncResult{Key: a.Key, Value: v, Err: err}}
 		}
 	}
 	t.Fatalf("no exchange among %v", effs)
 	return nil
 }
 
-func renewsAt(effs []molecule.Effect) time.Time {
+func renewsAt(effs []actor.Effect) time.Time {
 	for _, e := range effs {
 		if s, ok := e.(genstatem.StartStateTimeout); ok && s.Msg == (renewNow{}) {
 			return s.At
@@ -80,10 +80,10 @@ func renewsAt(effs []molecule.Effect) time.Time {
 	return time.Time{}
 }
 
-func applies(effs []molecule.Effect) []*prefixdelegation.Lease {
+func applies(effs []actor.Effect) []*prefixdelegation.Lease {
 	var ls []*prefixdelegation.Lease
 	for _, e := range effs {
-		if c, ok := e.(molecule.Cast); ok && c.To == ApplyName {
+		if c, ok := e.(actor.Cast); ok && c.To == ApplyName {
 			ls = append(ls, c.Req.(applied).Lease)
 		}
 	}
@@ -183,8 +183,8 @@ func TestRebound(t *testing.T) {
 func TestSolicitCrash(t *testing.T) {
 	r := newRig(t, lease("2001:db8:1::/56", t0))
 	boom := errors.New("boom")
-	_, _, effs := r.l.HandleEvent(Soliciting, r.l.initial, genstatem.Info{Msg: molecule.AsyncResult{Key: exchangeKey{}, Err: boom}})
-	if len(effs) != 1 || effs[0] != (molecule.Stop{Reason: boom}) {
+	_, _, effs := r.l.HandleEvent(Soliciting, r.l.initial, genstatem.Info{Msg: actor.AsyncResult{Key: exchangeKey{}, Err: boom}})
+	if len(effs) != 1 || effs[0] != (actor.Stop{Reason: boom}) {
 		t.Errorf("%v, want a stop", effs)
 	}
 }

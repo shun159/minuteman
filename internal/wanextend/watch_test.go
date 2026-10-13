@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/shun159/miniteman/pkg/routeradvert"
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/supervisor"
 	"github.com/shun159/molecule/gensim"
 	"github.com/shun159/molecule/proc"
@@ -41,12 +41,12 @@ func TestWatch(t *testing.T) {
 		logf:    t.Logf,
 	}
 	st, effs, _ := w.Init(proc.PID{})
-	if timer, ok := effs[0].(molecule.StartTimer); !ok || timer.After != 0 {
+	if timer, ok := effs[0].(actor.StartTimer); !ok || timer.After != 0 {
 		t.Errorf("Init: %v, want a read at once", effs)
 	}
 
 	st, effs = w.HandleInfo(st, tick{})
-	if timer := effs[0].(molecule.StartTimer); timer.After != watchPollInterval {
+	if timer := effs[0].(actor.StartTimer); timer.After != watchPollInterval {
 		t.Errorf("next read after %v", timer.After)
 	}
 	readErr = errors.New("netlink")

@@ -14,7 +14,7 @@ import (
 	"syscall"
 
 	"github.com/shun159/miniteman/pkg/routeradvert"
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/genserver"
 	"github.com/shun159/molecule/behaviours/supervisor"
 	"github.com/shun159/molecule/net/socket"
@@ -23,7 +23,7 @@ import (
 )
 
 // Name is the name of the advertiser of iface.
-func Name(iface string) molecule.Local { return molecule.Local("radvd " + iface) }
+func Name(iface string) actor.Local { return actor.Local("radvd " + iface) }
 
 // Spec is the supervision tree of the advertisers of ifaces:
 //
@@ -41,7 +41,7 @@ func Spec(ifaces []string) supervisor.Spec {
 			Start: supervisor.StartFunc(starter(iface)),
 		})
 	}
-	return supervisor.Spec{Name: molecule.Local("radvd"), Strategy: supervisor.OneForOne, Children: children}
+	return supervisor.Spec{Name: actor.Local("radvd"), Strategy: supervisor.OneForOne, Children: children}
 }
 
 // Advertiser is a handle on the advertisers of a node, for the policies
@@ -57,7 +57,7 @@ func NewAdvertiser(node *proc.Node) Advertiser { return Advertiser{node: node} }
 // differs -- in place, never withdrawing the router in between, as a restart
 // would (RouterLifetime=0 is for shutdown). It does not wait.
 func (a Advertiser) Advertise(iface string, cfg routeradvert.Config) {
-	molecule.SendCast(a.node, Name(iface), advertise{cfg})
+	actor.SendCast(a.node, Name(iface), advertise{cfg})
 }
 
 // starter starts the advertiser of iface, with its socket: raw ICMPv6,
@@ -94,10 +94,10 @@ func starter(iface string) supervisor.StartFunc {
 			iface:  iface,
 			mac:    ifi.HardwareAddr,
 			seed:   [2]uint64{rand.Uint64(), rand.Uint64()},
-			sendRA: func(b []byte) molecule.Effect { return sock.SendEffect(allNodes, b) },
+			sendRA: func(b []byte) actor.Effect { return sock.SendEffect(allNodes, b) },
 			armRS:  sock.SetActiveEffect(socket.Once),
 		}
-		pid, err := genserver.Child(a, molecule.WithName(Name(iface))).StartLink(ctx, parent)
+		pid, err := genserver.Child(a, actor.WithName(Name(iface))).StartLink(ctx, parent)
 		if err == nil {
 			if err = sock.ControllingProcess(ctx, parent, pid); err == nil {
 				err = sock.SetActive(ctx, parent, socket.Once)

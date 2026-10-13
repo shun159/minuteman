@@ -24,7 +24,7 @@ import (
 	"log"
 	"time"
 
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/genserver"
 	"github.com/shun159/molecule/behaviours/supervisor"
 	"github.com/shun159/molecule/proc"
@@ -40,7 +40,7 @@ import (
 const PollInterval = 2 * time.Second
 
 // Name is the name of the process.
-const Name molecule.Local = "tunnel pmtu"
+const Name actor.Local = "tunnel pmtu"
 
 // Datapath is what the process reads the learned path MTU from, and
 // applies the fragment size to: pkg/datapath's Loader.
@@ -69,10 +69,10 @@ type Config struct {
 func Spec(cfg Config) supervisor.Spec {
 	w := watcher{cfg: cfg, logf: log.Printf}
 	return supervisor.Spec{
-		Name:     molecule.Local("tunnelpmtu"),
+		Name:     actor.Local("tunnelpmtu"),
 		Strategy: supervisor.OneForOne,
 		Children: []supervisor.ChildSpec{
-			{ID: "tunnel pmtu", Start: genserver.Child(w, molecule.WithName(Name))},
+			{ID: "tunnel pmtu", Start: genserver.Child(w, actor.WithName(Name))},
 		},
 	}
 }
@@ -102,11 +102,11 @@ type watcher struct {
 	logf func(format string, args ...any)
 }
 
-func (w watcher) Init(proc.PID) (state, []molecule.Effect, error) {
-	return state{reported: w.cfg.WANMTU}, molecule.Do(w.next(0)), nil
+func (w watcher) Init(proc.PID) (state, []actor.Effect, error) {
+	return state{reported: w.cfg.WANMTU}, actor.Do(w.next(0)), nil
 }
 
-func (w watcher) HandleInfo(st state, msg any) (state, []molecule.Effect) {
+func (w watcher) HandleInfo(st state, msg any) (state, []actor.Effect) {
 	if _, ok := msg.(tick); !ok {
 		return st, nil
 	}
@@ -138,11 +138,11 @@ func (w watcher) HandleInfo(st state, msg any) (state, []molecule.Effect) {
 			w.logf("softwire path MTU: back to the WAN MTU (%d)", w.cfg.WANMTU)
 		}
 	}
-	return st, molecule.Do(w.next(PollInterval))
+	return st, actor.Do(w.next(PollInterval))
 }
 
-func (w watcher) next(after time.Duration) molecule.Effect {
-	return molecule.StartTimer{Key: tick{}, After: after, Msg: tick{}}
+func (w watcher) next(after time.Duration) actor.Effect {
+	return actor.StartTimer{Key: tick{}, After: after, Msg: tick{}}
 }
 
 // effective is the path MTU to apply: the learned one, if any and narrower

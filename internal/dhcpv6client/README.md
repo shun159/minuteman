@@ -43,8 +43,8 @@ only while an exchange waits.
 
 ## Giving up
 
-`Client.Exchange` is a `molecule.Call` with the caller's `ctx`. When that is done first, the Call
-tells the machine with a `molecule.CallAbandoned`: genstatem drops the exchange if it is still
+`Client.Exchange` is a `actor.Call` with the caller's `ctx`. When that is done first, the Call
+tells the machine with a `actor.CallAbandoned`: genstatem drops the exchange if it is still
 waiting its turn, postponed; if it is the one running, the machine gets the `CallAbandoned` and
 drops it, which frees the client for the next. This is how the callers' deadlines work as they
 did: a Renew bounded by T2, an Information-Request by `aftrdiscovery`'s `replyTimeout`.

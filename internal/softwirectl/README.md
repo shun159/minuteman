@@ -65,6 +65,6 @@ whole, for whatever supervises minuteman to start it cleanly.
 ## Discovery
 
 A discovery attempt blocks, for up to 2 minutes, which a callback must not: the controller runs it
-as a `molecule.Async`, its outcome arriving as an `AsyncResult`, and a hard switch cancels it with
+as a `actor.Async`, its outcome arriving as an `AsyncResult`, and a hard switch cancels it with
 `CancelAsync` -- its ctx done, its outcome never delivered. `hb46pp.RetryDelay`'s backoff is
 random, so it is drawn in the Async too, and the controller stays deterministic.

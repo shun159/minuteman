@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/shun159/miniteman/pkg/dhcpv4"
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/genserver"
 	"github.com/shun159/molecule/behaviours/supervisor"
 	"github.com/shun159/molecule/kvs"
@@ -49,7 +49,7 @@ func Spec(cfgs []dhcpv4.InterfaceConfig, leases map[string]*Leases) (supervisor.
 			Start: supervisor.StartFunc(starter(cfg, leases[cfg.Iface])),
 		})
 	}
-	return supervisor.Spec{Name: molecule.Local("dhcpv4"), Strategy: supervisor.OneForOne, Children: children}, nil
+	return supervisor.Spec{Name: actor.Local("dhcpv4"), Strategy: supervisor.OneForOne, Children: children}, nil
 }
 
 // Leases is the table of an interface's committed leases, by client ID.
@@ -148,7 +148,7 @@ func starter(cfg dhcpv4.InterfaceConfig, leases *Leases) supervisor.StartFunc {
 // replies framed by dhcpv4.Frame to the client's link-layer address. Its
 // state is the interface's lease pool, a new one for each request that
 // changes it. now is the clock leases are kept by: the process's, given by
-// molecule (molecule.Clocked).
+// molecule (actor.Clocked).
 //
 // With leases, a request changing a client's committed lease writes it to
 // the table, and a reply granting it waits until it is on disk: an ACK is
@@ -171,28 +171,28 @@ type held struct {
 	frame []byte
 }
 
-var _ molecule.Clocked = server{}
+var _ actor.Clocked = server{}
 
 func (s server) WithClock(now func() time.Time) any { s.now = now; return s }
 
-func (s server) Init(proc.PID) (*dhcpv4.Pool, []molecule.Effect, error) {
+func (s server) Init(proc.PID) (*dhcpv4.Pool, []actor.Effect, error) {
 	if s.leases == nil {
 		return s.pool, nil, nil
 	}
-	return s.pool, molecule.Do(nextExpire()), nil
+	return s.pool, actor.Do(nextExpire()), nil
 }
 
-func nextExpire() molecule.Effect {
-	return molecule.StartTimer{Key: expire{}, After: expireEvery, Msg: expire{}}
+func nextExpire() actor.Effect {
+	return actor.StartTimer{Key: expire{}, After: expireEvery, Msg: expire{}}
 }
 
-func (s server) HandleInfo(pool *dhcpv4.Pool, msg any) (*dhcpv4.Pool, []molecule.Effect) {
+func (s server) HandleInfo(pool *dhcpv4.Pool, msg any) (*dhcpv4.Pool, []actor.Effect) {
 	switch m := msg.(type) {
 	case socket.DataMsg:
 		next, to, frame, id := s.answer(pool, m.Bytes)
 		if put, del := s.keep(pool, next, id); put != nil && frame != nil {
 			// The next request is taken at once; the reply waits.
-			return next, molecule.Do(s.sock.SetActiveEffect(socket.Once), s.leases.PutEffect(id, *put, &held{to, frame}))
+			return next, actor.Do(s.sock.SetActiveEffect(socket.Once), s.leases.PutEffect(id, *put, &held{to, frame}))
 		} else if put != nil {
 			return next, s.reply(to, frame, s.leases.PutEffect(id, *put, nil))
 		} else if del {
@@ -206,22 +206,22 @@ func (s server) HandleInfo(pool *dhcpv4.Pool, msg any) (*dhcpv4.Pool, []molecule
 			s.logf("dhcpv4: keeping a lease on %s: %v", s.cfg.Iface, m.Err)
 		}
 		h := m.Tag.(*held)
-		return pool, molecule.Do(s.sock.SendEffect(h.to, h.frame))
+		return pool, actor.Do(s.sock.SendEffect(h.to, h.frame))
 	case expire:
-		return pool, molecule.Do(s.leases.ExpireEffect(s.now(), nil), nextExpire())
+		return pool, actor.Do(s.leases.ExpireEffect(s.now(), nil), nextExpire())
 	case socket.SendErrorMsg:
 		s.logf("dhcpv4: sending a reply on %s: %v", s.cfg.Iface, m.Err)
 	case socket.ErrorMsg:
-		return pool, molecule.Do(molecule.Stop{Reason: fmt.Errorf("dhcpv4: reading on %s: %w", s.cfg.Iface, m.Err)})
+		return pool, actor.Do(actor.Stop{Reason: fmt.Errorf("dhcpv4: reading on %s: %w", s.cfg.Iface, m.Err)})
 	case socket.ClosedMsg:
-		return pool, molecule.Do(molecule.Stop{Reason: fmt.Errorf("dhcpv4: socket on %s closed", s.cfg.Iface)})
+		return pool, actor.Do(actor.Stop{Reason: fmt.Errorf("dhcpv4: socket on %s closed", s.cfg.Iface)})
 	}
 	return pool, nil
 }
 
 // reply is effs, then the effect sending frame to to if any, which also
 // asks for the next request -- or only asks for it.
-func (s server) reply(to syscall.Sockaddr, frame []byte, effs ...molecule.Effect) []molecule.Effect {
+func (s server) reply(to syscall.Sockaddr, frame []byte, effs ...actor.Effect) []actor.Effect {
 	if frame == nil {
 		return append(effs, s.sock.SetActiveEffect(socket.Once))
 	}

@@ -26,7 +26,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/supervisor"
 	"github.com/shun159/molecule/net/gentcpacceptor"
 )
@@ -95,7 +95,7 @@ func Spec(cfg Config) (supervisor.Spec, error) {
 		children = append(children, tcp.ChildSpec("tcp "+ap.String()))
 	}
 	return supervisor.Spec{
-		Name:     molecule.Local("dnsproxy"),
+		Name:     actor.Local("dnsproxy"),
 		Strategy: supervisor.OneForOne,
 		Children: children,
 	}, nil

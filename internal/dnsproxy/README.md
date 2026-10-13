@@ -52,7 +52,7 @@ once. Any other bind error fails at once.
 ## UDP (`udp.go`)
 
 The listener is a genserver owning a `genudp` socket. Each query it forwards in a
-**`molecule.Async`** of its own, so one slow or unresponsive upstream never holds up the next
+**`actor.Async`** of its own, so one slow or unresponsive upstream never holds up the next
 query; the answer comes back as the Async's `AsyncResult`, and the listener relays it to the client
 through its socket. The listener itself stays pure: forwarding blocks, and it is the Async's.
 

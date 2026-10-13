@@ -8,7 +8,7 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/genserver"
 	"github.com/shun159/molecule/net/genudp"
 	"github.com/shun159/molecule/proc"
@@ -118,19 +118,19 @@ type answer struct {
 	data []byte
 }
 
-func (l listener) HandleInfo(next uint64, msg any) (uint64, []molecule.Effect) {
+func (l listener) HandleInfo(next uint64, msg any) (uint64, []actor.Effect) {
 	switch m := msg.(type) {
 	case genudp.DataMsg:
-		return next + 1, molecule.Do(molecule.Async{Key: next, Run: l.forward(m.From, m.Bytes)})
-	case molecule.AsyncResult:
+		return next + 1, actor.Do(actor.Async{Key: next, Run: l.forward(m.From, m.Bytes)})
+	case actor.AsyncResult:
 		if a, ok := m.Value.(answer); ok {
-			return next, molecule.Do(l.sock.SendActiveEffect(a.to, a.data, genudp.N(1)))
+			return next, actor.Do(l.sock.SendActiveEffect(a.to, a.data, genudp.N(1)))
 		}
-		return next, molecule.Do(l.sock.SetActiveEffect(genudp.N(1)))
+		return next, actor.Do(l.sock.SetActiveEffect(genudp.N(1)))
 	case genudp.ErrorMsg:
-		return next, molecule.Do(molecule.Stop{Reason: fmt.Errorf("dnsproxy: reading %s: %w", l.sock.LocalAddr, m.Err)})
+		return next, actor.Do(actor.Stop{Reason: fmt.Errorf("dnsproxy: reading %s: %w", l.sock.LocalAddr, m.Err)})
 	case genudp.ClosedMsg:
-		return next, molecule.Do(molecule.Stop{Reason: fmt.Errorf("dnsproxy: %s closed", l.sock.LocalAddr)})
+		return next, actor.Do(actor.Stop{Reason: fmt.Errorf("dnsproxy: %s closed", l.sock.LocalAddr)})
 	}
 	// A SendErrorMsg is an answer lost, as a datagram may be: the client's
 	// resolver retries.

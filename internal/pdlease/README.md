@@ -23,7 +23,7 @@ and `Apply`. The tree applies every lease **after** that one.
 
 A genstatem, pure: each wait is a state timeout, at an absolute time, so the behaviour never reads
 the clock; each exchange — which blocks, retransmitting until answered or its deadline passes — is a
-`molecule.Async`, whose outcome moves it along:
+`actor.Async`, whose outcome moves it along:
 
 ```
 Bound ──(RenewAt, T1)──► Renewing ──fail──► Rebinding ──fail──► Soliciting

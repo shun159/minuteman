@@ -4,14 +4,14 @@ import (
 	"log"
 	"net/netip"
 
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/genserver"
 	"github.com/shun159/molecule/behaviours/supervisor"
 	"github.com/shun159/molecule/proc"
 )
 
 // WatchName is the name of the watch process.
-const WatchName molecule.Local = "wanextend watch"
+const WatchName actor.Local = "wanextend watch"
 
 // Config is what the WAN prefix is extended onto, and how.
 type Config struct {
@@ -49,10 +49,10 @@ func Spec(cfg Config, prefix netip.Prefix) supervisor.Spec {
 		read: func() (netip.Prefix, error) { return discoverPrefixOnce(cfg.WANIndex) },
 	}
 	return supervisor.Spec{
-		Name:     molecule.Local("wanextend"),
+		Name:     actor.Local("wanextend"),
 		Strategy: supervisor.OneForOne,
 		Children: []supervisor.ChildSpec{
-			{ID: "wanextend watch", Start: genserver.Child(w, molecule.WithName(WatchName))},
+			{ID: "wanextend watch", Start: genserver.Child(w, actor.WithName(WatchName))},
 		},
 	}
 }
@@ -77,11 +77,11 @@ type watcher struct {
 	logf    func(format string, args ...any)
 }
 
-func (w watcher) Init(proc.PID) (netip.Prefix, []molecule.Effect, error) {
-	return w.initial, molecule.Do(molecule.StartTimer{Key: tick{}, Msg: tick{}}), nil
+func (w watcher) Init(proc.PID) (netip.Prefix, []actor.Effect, error) {
+	return w.initial, actor.Do(actor.StartTimer{Key: tick{}, Msg: tick{}}), nil
 }
 
-func (w watcher) HandleInfo(current netip.Prefix, msg any) (netip.Prefix, []molecule.Effect) {
+func (w watcher) HandleInfo(current netip.Prefix, msg any) (netip.Prefix, []actor.Effect) {
 	if _, ok := msg.(tick); !ok {
 		return current, nil
 	}
@@ -91,5 +91,5 @@ func (w watcher) HandleInfo(current netip.Prefix, msg any) (netip.Prefix, []mole
 		w.cfg.Extend(updated)
 		current = updated
 	}
-	return current, molecule.Do(molecule.StartTimer{Key: tick{}, After: watchPollInterval, Msg: tick{}})
+	return current, actor.Do(actor.StartTimer{Key: tick{}, After: watchPollInterval, Msg: tick{}})
 }

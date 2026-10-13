@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/shun159/miniteman/pkg/ndproxy"
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/genserver"
 	"github.com/shun159/molecule/net/socket"
 	"github.com/shun159/molecule/proc"
@@ -31,7 +31,7 @@ type sweep struct{}
 // confirms. Its state is pkg/ndproxy's State, a new one for each event
 // that changes it; it sweeps it every SweepInterval, retransmitting probes
 // and letting hosts gone quiet expire. now is the clock the State is kept
-// by: the process's, given by molecule (molecule.Clocked).
+// by: the process's, given by molecule (actor.Clocked).
 //
 // Its effects -- datagrams to send, sockets to re-arm -- are made by send
 // and arm, which tests replace.
@@ -44,19 +44,19 @@ type proxy struct {
 
 	now  func() time.Time
 	logf func(format string, args ...any)
-	send func(s socket.Socket, to *syscall.SockaddrInet6, b []byte) molecule.Effect
-	arm  func(s socket.Socket) molecule.Effect
+	send func(s socket.Socket, to *syscall.SockaddrInet6, b []byte) actor.Effect
+	arm  func(s socket.Socket) actor.Effect
 }
 
-var _ molecule.Clocked = proxy{}
+var _ actor.Clocked = proxy{}
 
 func (p proxy) WithClock(now func() time.Time) any { p.now = now; return p }
 
-func (p proxy) Init(proc.PID) (*ndproxy.State, []molecule.Effect, error) {
-	return ndproxy.NewState(), molecule.Do(p.nextSweep()), nil
+func (p proxy) Init(proc.PID) (*ndproxy.State, []actor.Effect, error) {
+	return ndproxy.NewState(), actor.Do(p.nextSweep()), nil
 }
 
-func (p proxy) HandleInfo(st *ndproxy.State, msg any) (*ndproxy.State, []molecule.Effect) {
+func (p proxy) HandleInfo(st *ndproxy.State, msg any) (*ndproxy.State, []actor.Effect) {
 	switch m := msg.(type) {
 	case socket.DataMsg:
 		if m.Sock.PID == p.wanRX.PID {
@@ -76,23 +76,23 @@ func (p proxy) HandleInfo(st *ndproxy.State, msg any) (*ndproxy.State, []molecul
 		// gets another chance.
 		p.logf("ndppd: sending to %v: %v", m.To, m.Err)
 	case socket.ErrorMsg:
-		return st, molecule.Do(molecule.Stop{Reason: fmt.Errorf("ndppd: reading: %w", m.Err)})
+		return st, actor.Do(actor.Stop{Reason: fmt.Errorf("ndppd: reading: %w", m.Err)})
 	case socket.ClosedMsg:
-		return st, molecule.Do(molecule.Stop{Reason: fmt.Errorf("ndppd: a socket closed")})
+		return st, actor.Do(actor.Stop{Reason: fmt.Errorf("ndppd: a socket closed")})
 	}
 	return st, nil
 }
 
 // solicited handles a packet from the WAN: a Neighbor Solicitation is
 // answered at once for a host confirmed recently, or has the LANs probed.
-func (p proxy) solicited(st *ndproxy.State, packet []byte) (*ndproxy.State, []molecule.Effect) {
+func (p proxy) solicited(st *ndproxy.State, packet []byte) (*ndproxy.State, []actor.Effect) {
 	target, source, ok := ndproxy.ParseSolicitationPacket(packet)
 	if !ok {
 		return st, nil
 	}
 	next := st.Clone()
 	reply, probe := next.OnWANSolicit(p.now(), target, source)
-	var effs []molecule.Effect
+	var effs []actor.Effect
 	if reply != nil {
 		effs = append(effs, p.advertise(reply))
 	}
@@ -105,7 +105,7 @@ func (p proxy) solicited(st *ndproxy.State, packet []byte) (*ndproxy.State, []mo
 // advertised handles a message from a LAN: a Neighbor Advertisement
 // answering a probe confirms its host -- the WAN answered, its route
 // installed.
-func (p proxy) advertised(st *ndproxy.State, l lan, msg []byte) (*ndproxy.State, []molecule.Effect) {
+func (p proxy) advertised(st *ndproxy.State, l lan, msg []byte) (*ndproxy.State, []actor.Effect) {
 	target, ok := ndproxy.ParseAdvertisement(msg)
 	if !ok {
 		return st, nil
@@ -115,36 +115,36 @@ func (p proxy) advertised(st *ndproxy.State, l lan, msg []byte) (*ndproxy.State,
 	if !ok {
 		return st, nil // not answering a probe of ours
 	}
-	return next, molecule.Do(
+	return next, actor.Do(
 		p.advertise(reply),
-		molecule.Cast{To: RoutesName, Req: install{Target: reply.Target, Iface: reply.Iface}},
+		actor.Cast{To: RoutesName, Req: install{Target: reply.Target, Iface: reply.Iface}},
 	)
 }
 
 // swept retransmits the probes due, and has the routes of hosts gone quiet
 // removed.
-func (p proxy) swept(st *ndproxy.State) (*ndproxy.State, []molecule.Effect) {
+func (p proxy) swept(st *ndproxy.State) (*ndproxy.State, []actor.Effect) {
 	next := st.Clone()
 	retransmit, _, expired := next.Sweep(p.now())
-	var effs []molecule.Effect
+	var effs []actor.Effect
 	for _, target := range retransmit {
 		effs = append(effs, p.probe(target)...)
 	}
 	for _, e := range expired {
-		effs = append(effs, molecule.Cast{To: RoutesName, Req: remove{Target: e.Target, Iface: e.Iface}})
+		effs = append(effs, actor.Cast{To: RoutesName, Req: remove{Target: e.Target, Iface: e.Iface}})
 	}
 	return next, append(effs, p.nextSweep())
 }
 
 // advertise is the proxy's Neighbor Advertisement of reply on the WAN.
-func (p proxy) advertise(reply *ndproxy.Reply) molecule.Effect {
+func (p proxy) advertise(reply *ndproxy.Reply) actor.Effect {
 	msg, dst := ndproxy.Advertisement(reply.Target, reply.Solicitor, p.wanMAC)
 	return p.send(p.wanTX, sockaddr(dst, p.wanIndex), msg)
 }
 
 // probe is a Neighbor Solicitation for target out every LAN.
-func (p proxy) probe(target netip.Addr) []molecule.Effect {
-	effs := make([]molecule.Effect, 0, len(p.lans))
+func (p proxy) probe(target netip.Addr) []actor.Effect {
+	effs := make([]actor.Effect, 0, len(p.lans))
 	for _, l := range p.lans {
 		msg, dst := ndproxy.Solicitation(target, l.mac)
 		effs = append(effs, p.send(l.sock, sockaddr(dst, l.index), msg))
@@ -152,8 +152,8 @@ func (p proxy) probe(target netip.Addr) []molecule.Effect {
 	return effs
 }
 
-func (p proxy) nextSweep() molecule.Effect {
-	return molecule.StartTimer{Key: sweep{}, After: ndproxy.SweepInterval, Msg: sweep{}}
+func (p proxy) nextSweep() actor.Effect {
+	return actor.StartTimer{Key: sweep{}, After: ndproxy.SweepInterval, Msg: sweep{}}
 }
 
 func sockaddr(addr netip.Addr, ifindex int) *syscall.SockaddrInet6 {

@@ -30,7 +30,7 @@ client's link-layer address, a `syscall.SockaddrLinklayer`. The reply goes out w
 waiting in the kernel. A pool clone costs the size of a home LAN's leases, a few hundred at most.
 
 Leases are kept by the clock: `now` is a field, which molecule fills with the process's clock
-(`molecule.Clocked`) -- `time.Now`, or gensim's virtual one -- and tests set.
+(`actor.Clocked`) -- `time.Now`, or gensim's virtual one -- and tests set.
 
 A failed send is logged (the client retransmits); a failed read stops the server, and its supervisor
 starts it again, with a fresh pool -- holding the leases kept, if any.
