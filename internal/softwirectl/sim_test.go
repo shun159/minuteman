@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/shun159/miniteman/pkg/datapath"
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/genstatem"
 	"github.com/shun159/molecule/behaviours/supervisor"
 	"github.com/shun159/molecule/gensim"
@@ -256,7 +256,7 @@ func TestWANChangeWhileDraining(t *testing.T) {
 func TestWANChangeWhileDiscovering(t *testing.T) {
 	c := Controller{DynamicAFTR: true, DynamicB4: true, Logf: t.Logf}
 	d := Data{B4: b4A, Current: Discovery{AFTR: aftr1, Refresh: day}}
-	st, d, effs := c.HandleEvent(Discovering, d, genstatem.Info{Msg: molecule.Response{
+	st, d, effs := c.HandleEvent(Discovering, d, genstatem.Info{Msg: actor.Response{
 		Tag: tag{opSource, d.Gen}, Value: sourceRep{Addr: b4B, OK: true},
 	}})
 	if st != Switching {
@@ -264,14 +264,14 @@ func TestWANChangeWhileDiscovering(t *testing.T) {
 	}
 	cancelled := false
 	for _, e := range effs {
-		if ca, ok := e.(molecule.CancelAsync); ok && ca.Key == (discoverKey{}) {
+		if ca, ok := e.(actor.CancelAsync); ok && ca.Key == (discoverKey{}) {
 			cancelled = true
 		}
 	}
 	if !cancelled {
 		t.Errorf("the discovery attempt was not cancelled: %v", effs)
 	}
-	st, d, _ = c.HandleEvent(st, d, genstatem.Info{Msg: molecule.Response{
+	st, d, _ = c.HandleEvent(st, d, genstatem.Info{Msg: actor.Response{
 		Tag: tag{opSwitch, d.Gen}, Value: doneRep{},
 	}})
 	if st != Steady || d.B4 != b4B || d.Current.AFTR != aftr1 || d.Wait != 0 {
@@ -307,7 +307,7 @@ func TestControllerCrashWhileDraining(t *testing.T) {
 func TestStaleResponseDropped(t *testing.T) {
 	c := Controller{DynamicAFTR: true, Logf: t.Logf}
 	d := Data{Gen: 2, Current: Discovery{AFTR: aftr1}}
-	st, d2, effs := c.HandleEvent(Steady, d, genstatem.Info{Msg: molecule.Response{
+	st, d2, effs := c.HandleEvent(Steady, d, genstatem.Info{Msg: actor.Response{
 		Tag: tag{opDiscover, 1}, Value: discoverRep{Disc: Discovery{AFTR: aftr2}},
 	}})
 	if st != Steady || d2.Current.AFTR != aftr1 || effs != nil {

@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"github.com/shun159/miniteman/pkg/dhcpv6"
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/genstatem"
 	"github.com/shun159/molecule/behaviours/supervisor"
 	"github.com/shun159/molecule/net/genudp"
@@ -38,7 +38,7 @@ const (
 )
 
 // Name is the name of the client process of iface.
-func Name(iface string) molecule.Local { return molecule.Local("dhcpv6 client " + iface) }
+func Name(iface string) actor.Local { return actor.Local("dhcpv6 client " + iface) }
 
 // Config is a client's configuration.
 type Config struct {
@@ -79,7 +79,7 @@ func (cfg Config) start(ctx context.Context, parent *proc.Self) (proc.PID, error
 		clientID: cfg.clientID,
 		seed:     [2]uint64{binary.LittleEndian.Uint64(seed[:8]), binary.LittleEndian.Uint64(seed[8:])},
 	}
-	pid, err := genstatem.Child(m, molecule.WithName(Name(cfg.Iface))).StartLink(ctx, parent)
+	pid, err := genstatem.Child(m, actor.WithName(Name(cfg.Iface))).StartLink(ctx, parent)
 	if err != nil {
 		sock.Close(context.Background(), parent)
 		return proc.PID{}, err
@@ -167,7 +167,7 @@ func (cfg Config) open(ctx context.Context, parent *proc.Self) (genudp.Socket, e
 // goroutine.
 type Client struct {
 	node *proc.Node
-	name molecule.Local
+	name actor.Local
 }
 
 // NewClient returns the handle on the client of iface, on node.
@@ -177,9 +177,9 @@ func NewClient(node *proc.Node, iface string) Client {
 
 // Exchange runs x, after the exchanges before it, and returns its answer.
 // When ctx is done first, the exchange is abandoned -- running or waiting its
-// turn, the client told by molecule.Call -- and Exchange returns ctx's error.
+// turn, the client told by actor.Call -- and Exchange returns ctx's error.
 func (c Client) Exchange(ctx context.Context, x dhcpv6.Exchange) (*dhcpv6.Message, error) {
-	v, err := molecule.Call(ctx, c.node, c.name, exchangeReq{X: x})
+	v, err := actor.Call(ctx, c.node, c.name, exchangeReq{X: x})
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()

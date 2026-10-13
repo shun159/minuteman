@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/shun159/miniteman/pkg/ndproxy"
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/net/socket"
 	"github.com/shun159/molecule/proc"
 )
@@ -16,14 +16,14 @@ import (
 // Effects the proxy under test returns in place of sending and arming.
 type (
 	sent struct {
-		molecule.Extension
+		actor.Extension
 		sock proc.PID
 		to   netip.Addr
 		zone uint32
 		msg  []byte
 	}
 	armed struct {
-		molecule.Extension
+		actor.Extension
 		sock proc.PID
 	}
 )
@@ -51,10 +51,10 @@ func newRig(t *testing.T) *rig {
 		},
 		now:  func() time.Time { return r.now },
 		logf: t.Logf,
-		send: func(s socket.Socket, to *syscall.SockaddrInet6, b []byte) molecule.Effect {
+		send: func(s socket.Socket, to *syscall.SockaddrInet6, b []byte) actor.Effect {
 			return sent{sock: s.PID, to: netip.AddrFrom16(to.Addr), zone: to.ZoneId, msg: b}
 		},
-		arm: func(s socket.Socket) molecule.Effect { return armed{sock: s.PID} },
+		arm: func(s socket.Socket) actor.Effect { return armed{sock: s.PID} },
 	}
 	return r
 }
@@ -79,7 +79,7 @@ func advertisement(target netip.Addr) []byte {
 	return b
 }
 
-func sends(effs []molecule.Effect) []sent {
+func sends(effs []actor.Effect) []sent {
 	var ss []sent
 	for _, e := range effs {
 		if s, ok := e.(sent); ok {
@@ -89,10 +89,10 @@ func sends(effs []molecule.Effect) []sent {
 	return ss
 }
 
-func casts(effs []molecule.Effect) []any {
+func casts(effs []actor.Effect) []any {
 	var cs []any
 	for _, e := range effs {
-		if c, ok := e.(molecule.Cast); ok && c.To == RoutesName {
+		if c, ok := e.(actor.Cast); ok && c.To == RoutesName {
 			cs = append(cs, c.Req)
 		}
 	}
@@ -179,7 +179,7 @@ func TestSweep(t *testing.T) {
 	if ss := sends(effs); len(ss) != 2 {
 		t.Errorf("retransmitted probes %+v, want one per LAN", ss)
 	}
-	if _, ok := effs[len(effs)-1].(molecule.StartTimer); !ok {
+	if _, ok := effs[len(effs)-1].(actor.StartTimer); !ok {
 		t.Errorf("no next sweep: %v", effs)
 	}
 

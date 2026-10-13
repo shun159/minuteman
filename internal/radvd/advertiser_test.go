@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/shun159/miniteman/pkg/routeradvert"
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/net/socket"
 	"github.com/shun159/molecule/proc"
 )
@@ -19,10 +19,10 @@ import (
 // arming its socket.
 type (
 	sentRA struct {
-		molecule.Extension
+		actor.Extension
 		ra []byte
 	}
-	armed struct{ molecule.Extension }
+	armed struct{ actor.Extension }
 )
 
 var cfg = routeradvert.Config{
@@ -37,7 +37,7 @@ func testAdvertiser() advertiser {
 		iface:  "lan0",
 		mac:    net.HardwareAddr{2, 0, 0, 0, 0, 1},
 		seed:   [2]uint64{1, 2},
-		sendRA: func(b []byte) molecule.Effect { return sentRA{ra: b} },
+		sendRA: func(b []byte) actor.Effect { return sentRA{ra: b} },
 		armRS:  armed{},
 	}
 }
@@ -52,7 +52,7 @@ func start(t *testing.T, a advertiser) state {
 }
 
 // lifetimes are the RouterLifetimes of the RAs effs send.
-func lifetimes(effs []molecule.Effect) []time.Duration {
+func lifetimes(effs []actor.Effect) []time.Duration {
 	var ls []time.Duration
 	for _, e := range effs {
 		if s, ok := e.(sentRA); ok {
@@ -63,13 +63,13 @@ func lifetimes(effs []molecule.Effect) []time.Duration {
 }
 
 // timer is the StartTimer of key in effs.
-func timer(effs []molecule.Effect, key any) (molecule.StartTimer, bool) {
+func timer(effs []actor.Effect, key any) (actor.StartTimer, bool) {
 	for _, e := range effs {
-		if st, ok := e.(molecule.StartTimer); ok && st.Key == key {
+		if st, ok := e.(actor.StartTimer); ok && st.Key == key {
 			return st, true
 		}
 	}
-	return molecule.StartTimer{}, false
+	return actor.StartTimer{}, false
 }
 
 var rs = socket.DataMsg{Bytes: []byte{133, 0, 0, 0, 0, 0, 0, 0}}
@@ -159,7 +159,7 @@ func TestCadenceVaries(t *testing.T) {
 	s.sent = 10 // steady state
 	seen := map[time.Duration]bool{}
 	for range 5 {
-		var effs []molecule.Effect
+		var effs []actor.Effect
 		s, effs = a.HandleInfo(s, unsolicited{})
 		st, _ := timer(effs, unsolicited{})
 		seen[st.After] = true
@@ -183,7 +183,7 @@ func TestSendErrors(t *testing.T) {
 	if len(effs) != 1 {
 		t.Fatalf("send failure: %v", effs)
 	}
-	if _, ok := effs[0].(molecule.Stop); !ok {
+	if _, ok := effs[0].(actor.Stop); !ok {
 		t.Errorf("send failure: %v", effs)
 	}
 }

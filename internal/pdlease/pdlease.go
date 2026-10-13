@@ -14,7 +14,7 @@ import (
 
 	"github.com/shun159/miniteman/pkg/dhcpv6"
 	"github.com/shun159/miniteman/pkg/prefixdelegation"
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/genserver"
 	"github.com/shun159/molecule/behaviours/genstatem"
 	"github.com/shun159/molecule/behaviours/supervisor"
@@ -22,8 +22,8 @@ import (
 
 // Names of the processes.
 const (
-	LeaseName molecule.Local = "dhcpv6-pd lease"
-	ApplyName molecule.Local = "dhcpv6-pd apply"
+	LeaseName actor.Local = "dhcpv6-pd lease"
+	ApplyName actor.Local = "dhcpv6-pd apply"
 )
 
 // releaseTimeout bounds the Release on shutdown: a client stops using the
@@ -75,11 +75,11 @@ func Spec(cfg Config) supervisor.Spec {
 		logf: log.Printf,
 	}
 	return supervisor.Spec{
-		Name:     molecule.Local("dhcpv6-pd"),
+		Name:     actor.Local("dhcpv6-pd"),
 		Strategy: supervisor.OneForOne,
 		Children: []supervisor.ChildSpec{
-			{ID: "dhcpv6-pd apply", Start: genserver.Child(applier{apply: cfg.Apply}, molecule.WithName(ApplyName))},
-			{ID: "dhcpv6-pd lease", Start: genstatem.Child(l, molecule.WithName(LeaseName))},
+			{ID: "dhcpv6-pd apply", Start: genserver.Child(applier{apply: cfg.Apply}, actor.WithName(ApplyName))},
+			{ID: "dhcpv6-pd lease", Start: genstatem.Child(l, actor.WithName(LeaseName))},
 		},
 	}
 }
@@ -96,7 +96,7 @@ type applier struct {
 	apply func(*prefixdelegation.Lease)
 }
 
-func (a applier) HandleCast(st struct{}, msg any) (struct{}, []molecule.Effect) {
+func (a applier) HandleCast(st struct{}, msg any) (struct{}, []actor.Effect) {
 	if m, ok := msg.(applied); ok {
 		a.apply(m.Lease)
 	}

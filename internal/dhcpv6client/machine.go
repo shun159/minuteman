@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/shun159/miniteman/pkg/dhcpv6"
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/genstatem"
 	"github.com/shun159/molecule/net/genudp"
 	"github.com/shun159/molecule/proc"
@@ -75,7 +75,7 @@ type data struct {
 }
 
 type exchange struct {
-	from    molecule.From
+	from    actor.From
 	x       dhcpv6.Exchange
 	xid     dhcpv6.TransactionID
 	rt      time.Duration // the current retransmission timeout
@@ -83,11 +83,11 @@ type exchange struct {
 	sent    int           // transmissions so far
 }
 
-func (m machine) Init(proc.PID) (Phase, data, []molecule.Effect, error) {
+func (m machine) Init(proc.PID) (Phase, data, []actor.Effect, error) {
 	return Idle, data{rng: *rand.NewPCG(m.seed[0], m.seed[1])}, nil, nil
 }
 
-func (m machine) HandleEvent(st Phase, d data, ev genstatem.Event) (Phase, data, []molecule.Effect) {
+func (m machine) HandleEvent(st Phase, d data, ev genstatem.Event) (Phase, data, []actor.Effect) {
 	switch e := ev.(type) {
 	case genstatem.Call:
 		req, ok := e.Req.(exchangeReq)
@@ -95,9 +95,9 @@ func (m machine) HandleEvent(st Phase, d data, ev genstatem.Event) (Phase, data,
 			break
 		}
 		// One at a time: the others wait, postponed. One whose caller
-		// gives up meanwhile is dropped (see molecule.CallAbandoned).
+		// gives up meanwhile is dropped (see actor.CallAbandoned).
 		if st != Idle {
-			return st, d, molecule.Do(genstatem.Postpone{})
+			return st, d, actor.Do(genstatem.Postpone{})
 		}
 		return m.start(d, req, e.From)
 
@@ -117,7 +117,7 @@ func (m machine) HandleEvent(st Phase, d data, ev genstatem.Event) (Phase, data,
 
 	case genstatem.Info:
 		switch msg := e.Msg.(type) {
-		case molecule.CallAbandoned:
+		case actor.CallAbandoned:
 			// The caller of the exchange running gave up: on to the next.
 			if st != Idle && msg.From == d.cur.from {
 				d.cur = exchange{}
@@ -132,11 +132,11 @@ func (m machine) HandleEvent(st Phase, d data, ev genstatem.Event) (Phase, data,
 				return m.finish(d, reply, nil)
 			}
 			// Not ours, or malformed: keep waiting.
-			return st, d, molecule.Do(m.sock.SetActiveEffect(genudp.Once))
+			return st, d, actor.Do(m.sock.SetActiveEffect(genudp.Once))
 		case genudp.ErrorMsg:
-			return st, d, molecule.Do(molecule.Stop{Reason: msg.Err})
+			return st, d, actor.Do(actor.Stop{Reason: msg.Err})
 		case genudp.ClosedMsg:
-			return st, d, molecule.Do(molecule.Stop{Reason: genudp.ErrClosed})
+			return st, d, actor.Do(actor.Stop{Reason: genudp.ErrClosed})
 		}
 		// A SendErrorMsg -- the address not usable yet, say -- is a
 		// transmission lost: the retransmission covers it.
@@ -146,7 +146,7 @@ func (m machine) HandleEvent(st Phase, d data, ev genstatem.Event) (Phase, data,
 
 // start starts the exchange of req: after its random delay, if any, or at
 // once.
-func (m machine) start(d data, req exchangeReq, from molecule.From) (Phase, data, []molecule.Effect) {
+func (m machine) start(d data, req exchangeReq, from actor.From) (Phase, data, []actor.Effect) {
 	r := rand.New(&d.rng)
 	d.cur = exchange{
 		from: from,
@@ -155,28 +155,28 @@ func (m machine) start(d data, req exchangeReq, from molecule.From) (Phase, data
 		rt:   dhcpv6.FirstRT(req.X.Timing.IRT, r),
 	}
 	if delay := dhcpv6.InitialDelay(req.X.Timing.InitialDelayMax, r); delay > 0 {
-		return Delaying, d, molecule.Do(genstatem.StartStateTimeout{After: delay, Msg: transmit{}})
+		return Delaying, d, actor.Do(genstatem.StartStateTimeout{After: delay, Msg: transmit{}})
 	}
 	return m.send(d)
 }
 
 // send transmits the running exchange's message, and waits rt for an
 // answer.
-func (m machine) send(d data) (Phase, data, []molecule.Effect) {
+func (m machine) send(d data) (Phase, data, []actor.Effect) {
 	b, err := d.cur.x.Message(d.cur.xid, m.clientID, d.cur.elapsed).MarshalBinary()
 	if err != nil {
 		return m.finish(d, nil, err)
 	}
 	d.cur.sent++
-	return Waiting, d, molecule.Do(
+	return Waiting, d, actor.Do(
 		m.sock.SendActiveEffect(m.server, b, genudp.Once),
 		genstatem.StartStateTimeout{After: d.cur.rt, Msg: retransmit{}},
 	)
 }
 
 // finish answers the running exchange, and takes the next.
-func (m machine) finish(d data, msg *dhcpv6.Message, err error) (Phase, data, []molecule.Effect) {
+func (m machine) finish(d data, msg *dhcpv6.Message, err error) (Phase, data, []actor.Effect) {
 	from := d.cur.from
 	d.cur = exchange{}
-	return Idle, d, molecule.Do(molecule.Reply{To: from, Value: exchangeRep{Msg: msg, Err: err}})
+	return Idle, d, actor.Do(actor.Reply{To: from, Value: exchangeRep{Msg: msg, Err: err}})
 }

@@ -13,7 +13,7 @@ import (
 	"syscall"
 
 	"github.com/shun159/miniteman/pkg/ndproxy"
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/genserver"
 	"github.com/shun159/molecule/behaviours/supervisor"
 	"github.com/shun159/molecule/net/socket"
@@ -22,7 +22,7 @@ import (
 )
 
 // RoutesName is the name of the process owning the host routes.
-const RoutesName molecule.Local = "ndppd routes"
+const RoutesName actor.Local = "ndppd routes"
 
 // Routes installs and removes the /128 host route of a LAN host the proxy
 // has confirmed, so the kernel forwards its traffic out the interface it
@@ -52,10 +52,10 @@ type Config struct {
 // re-confirming hosts as the WAN asks for them.
 func Spec(cfg Config) supervisor.Spec {
 	return supervisor.Spec{
-		Name:     molecule.Local("ndppd"),
+		Name:     actor.Local("ndppd"),
 		Strategy: supervisor.RestForOne,
 		Children: []supervisor.ChildSpec{
-			{ID: "ndppd routes", Start: genserver.Child(routes{open: cfg.OpenRoutes, logf: log.Printf}, molecule.WithName(RoutesName))},
+			{ID: "ndppd routes", Start: genserver.Child(routes{open: cfg.OpenRoutes, logf: log.Printf}, actor.WithName(RoutesName))},
 			{ID: "ndppd proxy", Start: supervisor.StartFunc(cfg.startProxy)},
 		},
 	}
@@ -115,10 +115,10 @@ func (cfg Config) startProxy(ctx context.Context, parent *proc.Self) (pid proc.P
 	p := proxy{
 		wanRX: wanRX, wanTX: wanTX, wanIndex: wan.Index, wanMAC: wan.HardwareAddr,
 		logf: log.Printf,
-		send: func(s socket.Socket, to *syscall.SockaddrInet6, b []byte) molecule.Effect {
+		send: func(s socket.Socket, to *syscall.SockaddrInet6, b []byte) actor.Effect {
 			return s.SendEffect(to, b)
 		},
-		arm: func(s socket.Socket) molecule.Effect { return s.SetActiveEffect(socket.Once) },
+		arm: func(s socket.Socket) actor.Effect { return s.SetActiveEffect(socket.Once) },
 	}
 	for _, name := range cfg.LANs {
 		ifi, err := net.InterfaceByName(name)

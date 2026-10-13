@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/shun159/miniteman/pkg/dhcpv4"
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/genserver"
 	"github.com/shun159/molecule/gensim"
 	"github.com/shun159/molecule/kvs"
@@ -53,24 +53,24 @@ func TestKeepEffects(t *testing.T) {
 	pool, to, frame, _ := s.answer(pool, request(discover()))
 	reply, _ := dhcpv4.Parse(frame[28:])
 	ip := reply.YIAddr
-	if _, effs := s.HandleInfo(pool, socket.DataMsg{Bytes: request(discover())}); !reflect.DeepEqual(effs, molecule.Do(s.sock.SendActiveEffect(to, frame, socket.Once))) {
+	if _, effs := s.HandleInfo(pool, socket.DataMsg{Bytes: request(discover())}); !reflect.DeepEqual(effs, actor.Do(s.sock.SendActiveEffect(to, frame, socket.Once))) {
 		t.Errorf("an offer: %v", effs)
 	}
 
 	next, to, frame, id := s.answer(pool, request(selecting(ip)))
 	l, _ := next.Committed(id, s.now())
 	got, effs := s.HandleInfo(pool, socket.DataMsg{Bytes: request(selecting(ip))})
-	want := molecule.Do(s.sock.SetActiveEffect(socket.Once), s.leases.PutEffect(id, l, &held{to, frame}))
+	want := actor.Do(s.sock.SetActiveEffect(socket.Once), s.leases.PutEffect(id, l, &held{to, frame}))
 	if !reflect.DeepEqual(effs, want) {
 		t.Errorf("the commit: %v, want %v", effs, want)
 	}
-	if _, effs := s.HandleInfo(got, durable(&held{to, frame})); !reflect.DeepEqual(effs, molecule.Do(s.sock.SendEffect(to, frame))) {
+	if _, effs := s.HandleInfo(got, durable(&held{to, frame})); !reflect.DeepEqual(effs, actor.Do(s.sock.SendEffect(to, frame))) {
 		t.Errorf("once durable: %v", effs)
 	}
 
 	release := withType(discover(), dhcpv4.Release, dhcpv4.Option{Code: dhcpv4.OptServerID, Data: serverIP.AsSlice()})
 	release.CIAddr = ip
-	if _, effs := s.HandleInfo(got, socket.DataMsg{Bytes: request(release)}); !reflect.DeepEqual(effs, molecule.Do(s.leases.DeleteEffect(id, nil), s.sock.SetActiveEffect(socket.Once))) {
+	if _, effs := s.HandleInfo(got, socket.DataMsg{Bytes: request(release)}); !reflect.DeepEqual(effs, actor.Do(s.leases.DeleteEffect(id, nil), s.sock.SetActiveEffect(socket.Once))) {
 		t.Errorf("a release: %v", effs)
 	}
 }
@@ -80,7 +80,7 @@ type recorder struct {
 	genserver.Default[[]any]
 }
 
-func (recorder) HandleInfo(msgs []any, msg any) ([]any, []molecule.Effect) {
+func (recorder) HandleInfo(msgs []any, msg any) ([]any, []actor.Effect) {
 	return append(msgs, msg), nil
 }
 

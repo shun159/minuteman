@@ -643,7 +643,7 @@ orphaned the running kernel's module directory — reboot to fix that).
   `gentcpacceptor` raw TCP listener, each bound before the tree's start returns (so `cmd/minuteman` fails
   fast, and only advertises one of these addresses as an RDNSS DNS server once it's actually bound — see
   `startDNSProxy`/`routeradvert`). The UDP listener (`udp.go`, a genserver) owns a `genudp` socket in
-  `N(maxInFlight)` mode, forwards each query in a `molecule.Async`, and re-arms the socket by one as each
+  `N(maxInFlight)` mode, forwards each query in a `actor.Async`, and re-arms the socket by one as each
   ends, so queries in flight are bounded and the rest wait in the kernel; its start waits out a link-local
   address still DAD-tentative (`EADDRNOTAVAIL`, `bindRetries`) before its TCP sibling binds. Each query tries
   `Config.Upstreams` in order over a fresh one-shot connected UDP socket (deliberately not pooled: a dedicated
@@ -680,7 +680,7 @@ orphaned the running kernel's module directory — reboot to fix that).
   filter for UDP dport 67, the same cooked-`SOCK_DGRAM` approach `pkg/ndproxy`'s `packet.go` uses. All of it
   is unit-tested with no sockets; the package holds none. `internal/dhcpv4server` runs the server: a molecule
   supervision tree, one genserver per LAN interface owning its `net/socket` AF_PACKET socket (read `Once` per
-  request) and its `Pool` (cloned per request, so the behaviour stays pure; the clock given by molecule, `molecule.Clocked`), the
+  request) and its `Pool` (cloned per request, so the behaviour stays pure; the clock given by molecule, `actor.Clocked`), the
   tree's start validating every pool and opening every socket so a bad subnet or socket failure fails
   `cmd/minuteman`'s startup. With `-state-dir` it keeps each interface's committed leases in a kvs table
   (restored into the pool at start, written with `PutEffect`/`DeleteEffect`, an ACK held until its
@@ -798,7 +798,7 @@ orphaned the running kernel's module directory — reboot to fix that).
   cleanly) then re-triggers AFTR discovery. A switch can happen in any phase, so a WAN change interrupts
   even a multi-hour drain; it bumps a generation that makes every response still in flight stale. The
   datapath, tunnel and netlink calls are made by the tree's `softwire` server, discovery in a
-  `molecule.Async` of the controller's; see `internal/softwirectl/README.md`. `internal/tunnelpmtu`'s tree (always started, the `tunnel PMTU` application) polls the path MTU the datapath learns from inbound
+  `actor.Async` of the controller's; see `internal/softwirectl/README.md`. `internal/tunnelpmtu`'s tree (always started, the `tunnel PMTU` application) polls the path MTU the datapath learns from inbound
   ICMPv6 Packet Too Big messages and applies it to the two things userspace owns — the fragmenter's
   `frag_unit` and the companion ip6tnl's MTU — including the widening direction, since a reading that ages
   out simply stops being reported. When `-dhcpv6-pd` is set, `runPrefixDelegation()` similarly blocks
@@ -860,7 +860,7 @@ orphaned the running kernel's module directory — reboot to fix that).
   proxy` genserver owning the sockets (`net/socket`): the WAN's `AF_PACKET` receiver (`NSFilter`,
   `ALLMULTI`), a raw ICMPv6 socket on the WAN for its Advertisements (filtered to nothing), and one per
   LAN for the probes and their Advertisements, each socket `active once`. The proxy is pure: its state is
-  `*ndproxy.State`, `Clone()`d per event, the clock `now`, given by molecule (`molecule.Clocked`), its sends and re-arms effects made by injectable functions so `proxy_test.go` reads them; a
+  `*ndproxy.State`, `Clone()`d per event, the clock `now`, given by molecule (`actor.Clocked`), its sends and re-arms effects made by injectable functions so `proxy_test.go` reads them; a
   `sweep` timer every `SweepInterval`; a confirmed host is a `Cast` to the routes process. rest_for_one
   because the proxy tells the routes process what to do: a restarted routes process takes the proxy with
   it, which starts afresh, re-confirming hosts as the WAN asks for them. `cmd/minuteman` starts it as the `NDProxy` application.
@@ -869,7 +869,7 @@ orphaned the running kernel's module directory — reboot to fix that).
   is cast (netlink and RAs, kept out of the lease process so its timers aren't held up), and the
   `dhcpv6-pd lease` genstatem climbing `pkg/prefixdelegation`'s ladder: `Bound` (a state timeout at
   `RenewAt`, absolute, so the behaviour never reads a clock) → `Renewing` → `Rebinding` → `Soliciting`, each
-  exchange a `molecule.Async` (they block, retransmitting to their deadlines) whose outcome moves it up or
+  exchange a `actor.Async` (they block, retransmitting to their deadlines) whose outcome moves it up or
   down. Pure; the exchanges and the release are injectable for `lease_test.go`. It traps exits: on shutdown
   `Terminate` releases the lease (bounded 5s), unless it expired (`Soliciting`); a crash doesn't, and the
   restarted process starts from the lease cmd acquired again — before its T1 still current, past it renewed

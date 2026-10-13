@@ -5,7 +5,7 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/genstatem"
 	"github.com/shun159/molecule/proc"
 )
@@ -234,11 +234,11 @@ func (c Controller) logf(format string, args ...any) {
 
 func (Controller) StateEnter() bool { return true }
 
-func (Controller) Init(proc.PID) (Phase, Data, []molecule.Effect, error) {
-	return Recovering, Data{}, molecule.Do(softwire(opRecover, 0, recoverReq{})), nil
+func (Controller) Init(proc.PID) (Phase, Data, []actor.Effect, error) {
+	return Recovering, Data{}, actor.Do(softwire(opRecover, 0, recoverReq{})), nil
 }
 
-func (c Controller) HandleEvent(st Phase, d Data, ev genstatem.Event) (Phase, Data, []molecule.Effect) {
+func (c Controller) HandleEvent(st Phase, d Data, ev genstatem.Event) (Phase, Data, []actor.Effect) {
 	switch e := ev.(type) {
 	case genstatem.Enter[Phase]:
 		return c.enter(st, d)
@@ -246,11 +246,11 @@ func (c Controller) HandleEvent(st Phase, d Data, ev genstatem.Event) (Phase, Da
 	case genstatem.StateTimeout:
 		switch e.Msg.(type) {
 		case refresh:
-			return Discovering, d, molecule.Do(c.discover(d.Current.HB46PPToken))
+			return Discovering, d, actor.Do(c.discover(d.Current.HB46PPToken))
 		case primed:
-			return st, d, molecule.Do(softwire(opCounts, d.Gen, countsReq{}))
+			return st, d, actor.Do(softwire(opCounts, d.Gen, countsReq{}))
 		case drainTick:
-			return st, d, molecule.Do(softwire(opGC, d.Gen, gcReq{}))
+			return st, d, actor.Do(softwire(opGC, d.Gen, gcReq{}))
 		}
 
 	case genstatem.Timeout:
@@ -259,9 +259,9 @@ func (c Controller) HandleEvent(st Phase, d Data, ev genstatem.Event) (Phase, Da
 			if st == Switching {
 				// Compared against a B4 not yet applied, the source would
 				// look like a change again.
-				return st, d, molecule.Do(genstatem.Postpone{})
+				return st, d, actor.Do(genstatem.Postpone{})
 			}
-			return st, d, molecule.Do(
+			return st, d, actor.Do(
 				softwire(opSource, d.Gen, sourceReq{AFTR: d.Current.AFTR}),
 				genstatem.StartTimeout{Name: b4PollTimer, After: b4PollInterval, Msg: b4Poll{}},
 			)
@@ -273,11 +273,11 @@ func (c Controller) HandleEvent(st Phase, d Data, ev genstatem.Event) (Phase, Da
 		}
 
 	case genstatem.Info:
-		if a, ok := e.Msg.(molecule.AsyncResult); ok {
+		if a, ok := e.Msg.(actor.AsyncResult); ok {
 			// Never stale: a hard switch cancels the attempt running.
-			return c.response(st, d, opDiscover, molecule.Response{Value: a.Value, Err: a.Err})
+			return c.response(st, d, opDiscover, actor.Response{Value: a.Value, Err: a.Err})
 		}
-		r, ok := e.Msg.(molecule.Response)
+		r, ok := e.Msg.(actor.Response)
 		if !ok {
 			break
 		}
@@ -290,15 +290,15 @@ func (c Controller) HandleEvent(st Phase, d Data, ev genstatem.Event) (Phase, Da
 	return st, d, nil
 }
 
-func (c Controller) enter(st Phase, d Data) (Phase, Data, []molecule.Effect) {
+func (c Controller) enter(st Phase, d Data) (Phase, Data, []actor.Effect) {
 	switch st {
 	case Steady:
 		if c.DynamicAFTR {
-			return st, d, molecule.Do(genstatem.StartStateTimeout{After: d.Wait, Msg: refresh{}})
+			return st, d, actor.Do(genstatem.StartStateTimeout{After: d.Wait, Msg: refresh{}})
 		}
 	case Draining:
 		d.CapReached = false
-		return st, d, molecule.Do(
+		return st, d, actor.Do(
 			genstatem.StartStateTimeout{After: drainInterval, Msg: drainTick{}},
 			genstatem.StartTimeout{Name: drainCapTimer, After: maxDrainDuration, Msg: drainCap{d.Migration}},
 		)
@@ -306,7 +306,7 @@ func (c Controller) enter(st Phase, d Data) (Phase, Data, []molecule.Effect) {
 	return st, d, nil
 }
 
-func (c Controller) response(st Phase, d Data, o op, r molecule.Response) (Phase, Data, []molecule.Effect) {
+func (c Controller) response(st Phase, d Data, o op, r actor.Response) (Phase, Data, []actor.Effect) {
 	switch o {
 	case opRecover:
 		rep, err := reply[recovered](r)
@@ -316,7 +316,7 @@ func (c Controller) response(st Phase, d Data, o op, r molecule.Response) (Phase
 		if err != nil {
 			// Without knowing the endpoints there is nothing safe to do; the
 			// supervisor tries again.
-			return st, d, molecule.Do(molecule.Stop{Reason: err})
+			return st, d, actor.Do(actor.Stop{Reason: err})
 		}
 		return c.recovered(d, rep.Endpoints)
 
@@ -366,7 +366,7 @@ func (c Controller) response(st Phase, d Data, o op, r molecule.Response) (Phase
 		}
 		d.Next = next
 		d.Migration++
-		return Priming, d, molecule.Do(softwire(opBegin, d.Gen, beginReq{To: Endpoints{d.B4, next.AFTR}}))
+		return Priming, d, actor.Do(softwire(opBegin, d.Gen, beginReq{To: Endpoints{d.B4, next.AFTR}}))
 
 	case opBegin:
 		counts, err := reply[countsRep](r)
@@ -378,7 +378,7 @@ func (c Controller) response(st Phase, d Data, o op, r molecule.Response) (Phase
 		}
 		d.Baseline = counts.Counts
 		c.logf("AFTR migration: priming %v on %s before moving to %s", primingDuration, d.Current.AFTR, d.Next.AFTR)
-		return st, d, molecule.Do(genstatem.StartStateTimeout{After: primingDuration, Msg: primed{}})
+		return st, d, actor.Do(genstatem.StartStateTimeout{After: primingDuration, Msg: primed{}})
 
 	case opCounts:
 		counts, err := reply[countsRep](r)
@@ -398,7 +398,7 @@ func (c Controller) response(st Phase, d Data, o op, r molecule.Response) (Phase
 			return c.abort(d, "")
 		}
 		d.Recorded = counts.AffinityInsert - d.Baseline.AffinityInsert
-		return st, d, molecule.Do(softwire(opCutover, d.Gen, cutoverReq{}))
+		return st, d, actor.Do(softwire(opCutover, d.Gen, cutoverReq{}))
 
 	case opCutover:
 		if err := done(r); err != nil {
@@ -434,28 +434,28 @@ func (c Controller) response(st Phase, d Data, o op, r molecule.Response) (Phase
 				c.logf("AFTR migration: drain cap of %v reached with %d flow(s) still on %s; retiring it anyway",
 					maxDrainDuration, rep.Remaining, d.Current.AFTR)
 			}
-			return st, d, molecule.Do(softwire(opComplete, d.Gen, completeReq{}))
+			return st, d, actor.Do(softwire(opComplete, d.Gen, completeReq{}))
 		}
-		return st, d, molecule.Do(genstatem.StartStateTimeout{After: drainInterval, Msg: drainTick{}})
+		return st, d, actor.Do(genstatem.StartStateTimeout{After: drainInterval, Msg: drainTick{}})
 
 	case opComplete:
 		if err := done(r); err != nil {
 			// Retried rather than given up: leaving the datapath mid-drain
 			// would block every later migration.
 			c.logf("AFTR migration: retiring %s: %v (retrying)", d.Current.AFTR, err)
-			return st, d, molecule.Do(genstatem.StartStateTimeout{After: drainInterval, Msg: drainTick{}})
+			return st, d, actor.Do(genstatem.StartStateTimeout{After: drainInterval, Msg: drainTick{}})
 		}
 		c.logf("AFTR migration: complete, %s retired", d.Current.AFTR)
 		c.logf("AFTR re-discovery: now on %s (next refresh in %v)", d.Next.AFTR, nextRefreshWait(d.Next.Refresh).Round(time.Second))
 		d.Current, d.Next = d.Next, Discovery{}
 		d.Wait = nextRefreshWait(d.Current.Refresh)
-		return Steady, d, molecule.Do(genstatem.CancelTimeout{Name: drainCapTimer})
+		return Steady, d, actor.Do(genstatem.CancelTimeout{Name: drainCapTimer})
 	}
 	return st, d, nil
 }
 
 // recovered starts the controller on the endpoints the softwire carries.
-func (c Controller) recovered(d Data, ep Endpoints) (Phase, Data, []molecule.Effect) {
+func (c Controller) recovered(d Data, ep Endpoints) (Phase, Data, []actor.Effect) {
 	d.B4 = ep.B4
 	if ep.AFTR == c.Initial.AFTR {
 		d.Current = c.Initial
@@ -466,7 +466,7 @@ func (c Controller) recovered(d Data, ep Endpoints) (Phase, Data, []molecule.Eff
 		d.Current = Discovery{AFTR: ep.AFTR}
 		d.Wait = 0
 	}
-	var effs []molecule.Effect
+	var effs []actor.Effect
 	if c.DynamicB4 {
 		effs = append(effs, genstatem.StartTimeout{Name: b4PollTimer, After: b4PollInterval, Msg: b4Poll{}})
 	}
@@ -478,12 +478,12 @@ func (c Controller) recovered(d Data, ep Endpoints) (Phase, Data, []molecule.Eff
 // flight is dropped: a migration ends (SwitchAFTR ends one in any phase), and a
 // discovery is cancelled, to run again once the switch has landed, as the VNE
 // may map the new prefix to a different AFTR.
-func (c Controller) hardSwitch(st Phase, d Data, b4 netip.Addr) (Phase, Data, []molecule.Effect) {
-	var effs []molecule.Effect
+func (c Controller) hardSwitch(st Phase, d Data, b4 netip.Addr) (Phase, Data, []actor.Effect) {
+	var effs []actor.Effect
 	to := d.Current
 	switch st {
 	case Discovering:
-		effs = append(effs, molecule.CancelAsync{Key: discoverKey{}})
+		effs = append(effs, actor.CancelAsync{Key: discoverKey{}})
 	case Draining:
 		// New flows are on the new AFTR already: stay there.
 		to = d.Next
@@ -498,33 +498,33 @@ func (c Controller) hardSwitch(st Phase, d Data, b4 netip.Addr) (Phase, Data, []
 
 // abort rolls a primed migration back to the AFTR still carrying traffic.
 // why is logged once the rollback is done, unless empty.
-func (c Controller) abort(d Data, why string) (Phase, Data, []molecule.Effect) {
+func (c Controller) abort(d Data, why string) (Phase, Data, []actor.Effect) {
 	d.AbortWhy = why
-	return Priming, d, molecule.Do(softwire(opAbort, d.Gen, abortReq{}))
+	return Priming, d, actor.Do(softwire(opAbort, d.Gen, abortReq{}))
 }
 
 // migrationFailed stays on the AFTR still carrying traffic, and tries the
 // whole move again later.
-func (c Controller) migrationFailed(d Data, why string) (Phase, Data, []molecule.Effect) {
+func (c Controller) migrationFailed(d Data, why string) (Phase, Data, []actor.Effect) {
 	c.logf("AFTR migration to %s failed: %s (staying on %s)", d.Next.AFTR, why, d.Current.AFTR)
 	d.Next = Discovery{}
 	d.Wait = switchRetry
 	return Steady, d, nil
 }
 
-func softwire(o op, gen uint64, req request) molecule.Effect {
-	return molecule.SendRequest{To: SoftwireName, Req: req, Tag: tag{o, gen}}
+func softwire(o op, gen uint64, req request) actor.Effect {
+	return actor.SendRequest{To: SoftwireName, Req: req, Tag: tag{o, gen}}
 }
 
 // reply returns the value of a response, or the error of a request that got
 // none, the server having died.
-func reply[T any](r molecule.Response) (T, error) {
+func reply[T any](r actor.Response) (T, error) {
 	v, _ := r.Value.(T)
 	return v, r.Err
 }
 
 // done returns the error of a request answered with a doneRep.
-func done(r molecule.Response) error {
+func done(r actor.Response) error {
 	rep, err := reply[doneRep](r)
 	if err != nil {
 		return err

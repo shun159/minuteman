@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 )
 
 // rediscoveryTimeout bounds one re-discovery attempt. Unlike the initial
@@ -35,8 +35,8 @@ type discoverRep struct {
 // controller must be able to abandon it on a WAN-address change
 // (CancelAsync). The backoff after a failure is random, so it is drawn here
 // too, and the controller stays deterministic.
-func (c Controller) discover(token string) molecule.Effect {
-	return molecule.Async{Key: discoverKey{}, Run: func(ctx context.Context) (any, error) {
+func (c Controller) discover(token string) actor.Effect {
+	return actor.Async{Key: discoverKey{}, Run: func(ctx context.Context) (any, error) {
 		ctx, cancel := context.WithTimeout(ctx, rediscoveryTimeout)
 		defer cancel()
 		disc, err := c.Discover(ctx, token)

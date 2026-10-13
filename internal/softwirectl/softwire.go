@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/shun159/miniteman/pkg/datapath"
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/genserver"
 )
 
@@ -114,8 +114,8 @@ type server struct {
 	sw *Softwire
 }
 
-func (s server) HandleCall(st struct{}, req request, from genserver.From[any]) (struct{}, []molecule.Effect) {
-	return st, molecule.Do(from.Reply(s.sw.handle(req)))
+func (s server) HandleCall(st struct{}, req request, from genserver.From[any]) (struct{}, []actor.Effect) {
+	return st, actor.Do(from.Reply(s.sw.handle(req)))
 }
 
 func (sw *Softwire) handle(req request) any {

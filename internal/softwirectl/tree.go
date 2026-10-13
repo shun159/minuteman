@@ -1,7 +1,7 @@
 package softwirectl
 
 import (
-	"github.com/shun159/molecule"
+	"github.com/shun159/molecule/actor"
 	"github.com/shun159/molecule/behaviours/genserver"
 	"github.com/shun159/molecule/behaviours/genstatem"
 	"github.com/shun159/molecule/behaviours/supervisor"
@@ -9,9 +9,9 @@ import (
 
 // Names of the processes of the tree.
 const (
-	SoftwireName   molecule.Local = "softwire"
-	ControllerName molecule.Local = "softwirectl"
-	SupervisorName molecule.Local = "softwirectl-sup"
+	SoftwireName   actor.Local = "softwire"
+	ControllerName actor.Local = "softwirectl"
+	SupervisorName actor.Local = "softwirectl-sup"
 )
 
 // Config configures the tree.
@@ -36,11 +36,11 @@ func Spec(cfg Config) supervisor.Spec {
 		Children: []supervisor.ChildSpec{
 			{
 				ID:    "softwire",
-				Start: genserver.Child(server{sw: cfg.Softwire}, molecule.WithName(SoftwireName)),
+				Start: genserver.Child(server{sw: cfg.Softwire}, actor.WithName(SoftwireName)),
 			},
 			{
 				ID:    "softwirectl",
-				Start: genstatem.Child(cfg.Controller, molecule.WithName(ControllerName)),
+				Start: genstatem.Child(cfg.Controller, actor.WithName(ControllerName)),
 			},
 		},
 	}
